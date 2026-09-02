@@ -1,0 +1,317 @@
+diff --git a/compiler.go b/compiler.go
+index d2d7cfe..1dd8a9f 100644
+--- a/compiler.go
++++ b/compiler.go
+@@ -48,7 +48,29 @@ func (c *Code) RunWithContext(ctx context.Context, v any, values ...any) Iter {
+ 	} else if len(values) < len(c.variables) {
+ 		return NewIter(&expectedVariableError{c.variables[len(values)]})
+ 	}
+-	return newEnv(ctx).execute(c, v, values...)
++	return newEnv(ctx, nil).execute(c, v, values...)
++}
++
++// RunWithOptions runs the code with context and run options, in addition to
++// the variable values (as in [*Code.Run]). Currently the only run options
++// are [WithRunFunction] and [WithRunIterFunction], which let a custom
++// function registered at compile time (with [WithFunction],
++// [WithIterFunction], [WithFunctionWithContext], or
++// [WithIterFunctionWithContext]) be overridden for this run only, without
++// recompiling the query. A run option for a name that was not registered at
++// compile time has no effect, since the query would not have compiled a call
++// to that name in the first place.
++func (c *Code) RunWithOptions(ctx context.Context, v any, values []any, opts ...RunOption) Iter {
++	if len(values) > len(c.variables) {
++		return NewIter(&tooManyVariableValuesError{})
++	} else if len(values) < len(c.variables) {
++		return NewIter(&expectedVariableError{c.variables[len(values)]})
++	}
++	var ro runOptions
++	for _, opt := range opts {
++		opt(&ro)
++	}
++	return newEnv(ctx, ro.funcs).execute(c, v, values...)
+ }
+ 
+ type scopeinfo struct {
+@@ -1012,7 +1034,7 @@ func (c *compiler) compileFunc(e *Func) error {
+ 	}
+ 	if fn, ok := c.customFuncs[e.Name]; ok && fn.accept(len(e.Args)) {
+ 		if err := c.compileCallInternal(
+-			[3]any{fn.callback, len(e.Args), e.Name},
++			[3]any{overridableCallback{e.Name, fn.callback}, len(e.Args), e.Name},
+ 			e.Args,
+ 			true,
+ 			-1,
+diff --git a/env.go b/env.go
+index 3ba44ad..31f203f 100644
+--- a/env.go
++++ b/env.go
+@@ -17,14 +17,16 @@ type env struct {
+ 	label     int
+ 	args      [32]any // len(env.args) > maxarity
+ 	ctx       context.Context
++	runFuncs  map[string]function
+ }
+ 
+-func newEnv(ctx context.Context) *env {
++func newEnv(ctx context.Context, runFuncs map[string]function) *env {
+ 	return &env{
+-		stack:  newStack(),
+-		paths:  newStack(),
+-		scopes: newScopeStack(),
+-		ctx:    ctx,
++		stack:    newStack(),
++		paths:    newStack(),
++		scopes:   newScopeStack(),
++		ctx:      ctx,
++		runFuncs: runFuncs,
+ 	}
+ }
+ 
+diff --git a/execute.go b/execute.go
+index cd76bb4..633ae73 100644
+--- a/execute.go
++++ b/execute.go
+@@ -182,7 +182,16 @@ loop:
+ 				for i := range argcnt {
+ 					args[i] = env.pop()
+ 				}
+-				w := v[0].(func(any, []any) any)(x, args)
++				callback := v[0]
++				if oc, ok := callback.(overridableCallback); ok {
++					callback = oc.fallback
++					if env.runFuncs != nil {
++						if fn, ok := env.runFuncs[oc.name]; ok && fn.accept(argcnt) {
++							callback = fn.callback
++						}
++					}
++				}
++				w := callFunctionCallback(callback, env.ctx, x, args)
+ 				if e, ok := w.(error); ok {
+ 					err = e
+ 					break loop
+diff --git a/func.go b/func.go
+index 34a02f5..0f8ed85 100644
+--- a/func.go
++++ b/func.go
+@@ -1,6 +1,7 @@
+ package gojq
+ 
+ import (
++	"context"
+ 	"encoding/base64"
+ 	"encoding/json"
+ 	"errors"
+@@ -38,13 +39,43 @@ const (
+ type function struct {
+ 	argcount int
+ 	iter     bool
+-	callback func(any, []any) any
++	// callback is either func(any, []any) any (internal functions and
++	// functions registered with WithFunction/WithIterFunction), or
++	// func(context.Context, any, []any) any (functions registered with
++	// WithFunctionWithContext/WithIterFunctionWithContext). Invoke it
++	// through callFunctionCallback rather than calling it directly.
++	callback any
+ }
+ 
+ func (fn function) accept(cnt int) bool {
+ 	return fn.argcount&(1<<cnt) != 0
+ }
+ 
++// overridableCallback marks a call site compiled from a custom function
++// (registered with WithFunction, WithIterFunction, WithFunctionWithContext,
++// or WithIterFunctionWithContext) as eligible to be overridden for a single
++// run by a matching RunOption (WithRunFunction/WithRunIterFunction). It is
++// never used for the opcall sites the compiler emits for its own internal
++// functions (getpath, setpath, and so on), so a run option can never
++// accidentally shadow gojq's own use of those names.
++type overridableCallback struct {
++	name     string
++	fallback any
++}
++
++// callFunctionCallback invokes callback, threading ctx through when the
++// callback is context-aware and discarding it otherwise.
++func callFunctionCallback(callback any, ctx context.Context, x any, xs []any) any {
++	switch f := callback.(type) {
++	case func(any, []any) any:
++		return f(x, xs)
++	case func(context.Context, any, []any) any:
++		return f(ctx, x, xs)
++	default:
++		panic(fmt.Sprintf("gojq: invalid function callback type %T", callback))
++	}
++}
++
+ var internalFuncs map[string]function
+ 
+ func init() {
+@@ -862,7 +893,7 @@ func funcFormat(v, x any) any {
+ 	if f == nil {
+ 		return &formatNotFoundError{format}
+ 	}
+-	return internalFuncs[f.Name].callback(v, nil)
++	return callFunctionCallback(internalFuncs[f.Name].callback, context.Background(), v, nil)
+ }
+ 
+ var htmlEscaper = strings.NewReplacer(
+diff --git a/option.go b/option.go
+index 801e9a9..42e34a8 100644
+--- a/option.go
++++ b/option.go
+@@ -1,6 +1,9 @@
+ package gojq
+ 
+-import "fmt"
++import (
++	"context"
++	"fmt"
++)
+ 
+ // CompilerOption is a compiler option.
+ type CompilerOption func(*compiler)
+@@ -56,7 +59,40 @@ func WithIterFunction(name string, minarity, maxarity int, f func(any, []any) It
+ 	)
+ }
+ 
+-func withFunction(name string, minarity, maxarity int, iter bool, f func(any, []any) any) CompilerOption {
++// WithFunctionWithContext is a compiler option for adding a custom internal
++// function, like [WithFunction], except the callback also receives the
++// context.Context passed to [*Code.RunWithContext] (or context.Background()
++// when [*Code.Run] is used). This lets library embedders propagate
++// request-scoped values, such as deadlines or trace identifiers, into custom
++// functions without threading them through the query itself. A function
++// cannot be registered with both WithFunction and WithFunctionWithContext
++// under the same name; the arity-merging behavior described in [WithFunction]
++// applies regardless of which of the two options each arity was registered
++// with.
++func WithFunctionWithContext(name string, minarity, maxarity int, f func(context.Context, any, []any) any) CompilerOption {
++	return withFunction(name, minarity, maxarity, false, f)
++}
++
++// WithIterFunctionWithContext is a compiler option for adding a custom
++// iterator function, combining [WithIterFunction] and
++// [WithFunctionWithContext]: the callback receives the context.Context and
++// may return an Iter to emit multiple values.
++func WithIterFunctionWithContext(name string, minarity, maxarity int, f func(context.Context, any, []any) Iter) CompilerOption {
++	return withFunction(name, minarity, maxarity, true,
++		func(ctx context.Context, v any, args []any) any {
++			return f(ctx, v, args)
++		},
++	)
++}
++
++// withFunction registers callback under name. callback must be either
++// func(any, []any) any or func(context.Context, any, []any) any; it is
++// invoked through callFunctionCallback, which dispatches on its concrete
++// type. When a function of the same name is already registered with a
++// disjoint arity range, the two callbacks are merged into a single
++// context-aware callback that dispatches by argument count, regardless of
++// which of the two forms either original callback used.
++func withFunction(name string, minarity, maxarity int, iter bool, callback any) CompilerOption {
+ 	if !(0 <= minarity && minarity <= maxarity && maxarity <= 30) {
+ 		panic(fmt.Sprintf("invalid arity for %q: %d, %d", name, minarity, maxarity))
+ 	}
+@@ -69,17 +105,18 @@ func withFunction(name string, minarity, maxarity int, iter bool, f func(any, []
+ 			if fn.iter != iter {
+ 				panic(fmt.Sprintf("cannot define both iterator and non-iterator functions for %q", name))
+ 			}
++			newArgcount, prevCallback := argcount, fn.callback
+ 			c.customFuncs[name] = function{
+ 				argcount | fn.argcount, iter,
+-				func(x any, xs []any) any {
+-					if argcount&(1<<len(xs)) != 0 {
+-						return f(x, xs)
++				func(ctx context.Context, x any, xs []any) any {
++					if newArgcount&(1<<len(xs)) != 0 {
++						return callFunctionCallback(callback, ctx, x, xs)
+ 					}
+-					return fn.callback(x, xs)
++					return callFunctionCallback(prevCallback, ctx, x, xs)
+ 				},
+ 			}
+ 		} else {
+-			c.customFuncs[name] = function{argcount, iter, f}
++			c.customFuncs[name] = function{argcount, iter, callback}
+ 		}
+ 	}
+ }
+diff --git a/run_option.go b/run_option.go
+new file mode 100644
+index 0000000..ca9bca9
+--- /dev/null
++++ b/run_option.go
+@@ -0,0 +1,72 @@
++package gojq
++
++import (
++	"context"
++	"fmt"
++)
++
++// RunOption is a run option, passed to [*Code.RunWithOptions]. It only
++// affects a single run and is discarded afterward; it does not change the
++// compiled [*Code] itself, so the same *Code can still be reused
++// concurrently with different run options (or none) in other calls.
++type RunOption func(*runOptions)
++
++type runOptions struct {
++	funcs map[string]function
++}
++
++// WithRunFunction is a run option that overrides, for this run only, the
++// callback of a custom function previously registered at compile time with
++// [WithFunction], [WithIterFunction], [WithFunctionWithContext], or
++// [WithIterFunctionWithContext]. This lets a compiled query be reused across
++// many runs while varying what a named function does from run to run,
++// without recompiling the query or discarding the parsed bytecode. A
++// WithRunFunction for a name that no compile-time option registered has no
++// effect, because the query could not have compiled a call to that name in
++// the first place. As with [WithFunction], specify the minimum and maximum
++// count of the function arguments; a run option only overrides the arities
++// it covers, so calls to other arities of the same name keep using whatever
++// was registered at compile time.
++func WithRunFunction(name string, minarity, maxarity int, f func(context.Context, any, []any) any) RunOption {
++	return runFunction(name, minarity, maxarity, false, f)
++}
++
++// WithRunIterFunction is a run option like [WithRunFunction], but for a
++// function which returns an [Iter] to emit multiple values, as in
++// [WithIterFunctionWithContext].
++func WithRunIterFunction(name string, minarity, maxarity int, f func(context.Context, any, []any) Iter) RunOption {
++	return runFunction(name, minarity, maxarity, true,
++		func(ctx context.Context, v any, args []any) any {
++			return f(ctx, v, args)
++		},
++	)
++}
++
++func runFunction(name string, minarity, maxarity int, iter bool, callback any) RunOption {
++	if !(0 <= minarity && minarity <= maxarity && maxarity <= 30) {
++		panic(fmt.Sprintf("invalid arity for %q: %d, %d", name, minarity, maxarity))
++	}
++	argcount := 1<<(maxarity+1) - 1<<minarity
++	return func(o *runOptions) {
++		if o.funcs == nil {
++			o.funcs = make(map[string]function)
++		}
++		if fn, ok := o.funcs[name]; ok {
++			if fn.iter != iter {
++				panic(fmt.Sprintf("cannot define both iterator and non-iterator run functions for %q", name))
++			}
++			newArgcount, prevCallback := argcount, fn.callback
++			o.funcs[name] = function{
++				argcount | fn.argcount, iter,
++				func(ctx context.Context, x any, xs []any) any {
++					if newArgcount&(1<<len(xs)) != 0 {
++						return callFunctionCallback(callback, ctx, x, xs)
++					}
++					return callFunctionCallback(prevCallback, ctx, x, xs)
++				},
++			}
++		} else {
++			o.funcs[name] = function{argcount, iter, callback}
++		}
++	}
++}

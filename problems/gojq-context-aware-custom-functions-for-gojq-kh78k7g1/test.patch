@@ -1,0 +1,468 @@
+diff --git a/contextfunc_163415/context_function_test.go b/contextfunc_163415/context_function_test.go
+new file mode 100644
+index 0000000..0f48e8f
+--- /dev/null
++++ b/contextfunc_163415/context_function_test.go
+@@ -0,0 +1,230 @@
++package contextfunc_test
++
++import (
++	"context"
++	"testing"
++
++	"github.com/itchyny/gojq"
++)
++
++type contextFuncTestKey struct{}
++
++// TestFunctionWithContext_PropagatesValue verifies that a custom function
++// registered with WithFunctionWithContext receives the same context.Context
++// that was passed to RunWithContext, including values stored on it.
++func TestFunctionWithContext_PropagatesValue(t *testing.T) {
++	query, err := gojq.Parse(".[] | tag")
++	if err != nil {
++		t.Fatal(err)
++	}
++	code, err := gojq.Compile(query,
++		gojq.WithFunctionWithContext("tag", 0, 0, func(ctx context.Context, _ any, _ []any) any {
++			s, ok := ctx.Value(contextFuncTestKey{}).(string)
++			if !ok {
++				return "missing"
++			}
++			return s
++		}),
++	)
++	if err != nil {
++		t.Fatal(err)
++	}
++	ctx := context.WithValue(context.Background(), contextFuncTestKey{}, "request-42")
++	iter := code.RunWithContext(ctx, []any{"a", "b", "c"})
++	var got []any
++	for {
++		v, ok := iter.Next()
++		if !ok {
++			break
++		}
++		if err, ok := v.(error); ok {
++			t.Fatal(err)
++		}
++		got = append(got, v)
++	}
++	want := []any{"request-42", "request-42", "request-42"}
++	if len(got) != len(want) {
++		t.Fatalf("got %v, want %v", got, want)
++	}
++	for i := range got {
++		if got[i] != want[i] {
++			t.Fatalf("got %v, want %v", got, want)
++		}
++	}
++}
++
++// TestFunctionWithContext_RunUsesBackground verifies that calling Run (which
++// does not take an explicit context) still invokes a context-aware custom
++// function, passing context.Background() rather than a nil context.
++func TestFunctionWithContext_RunUsesBackground(t *testing.T) {
++	query, err := gojq.Parse("probe")
++	if err != nil {
++		t.Fatal(err)
++	}
++	code, err := gojq.Compile(query,
++		gojq.WithFunctionWithContext("probe", 0, 0, func(ctx context.Context, _ any, _ []any) any {
++			if ctx == nil {
++				return "nil"
++			}
++			if _, hasValue := ctx.Value(contextFuncTestKey{}).(string); hasValue {
++				return "unexpected-value"
++			}
++			return "ok"
++		}),
++	)
++	if err != nil {
++		t.Fatal(err)
++	}
++	iter := code.Run(nil)
++	v, ok := iter.Next()
++	if !ok {
++		t.Fatal("expected a value")
++	}
++	if err, ok := v.(error); ok {
++		t.Fatal(err)
++	}
++	if v != "ok" {
++		t.Fatalf("got %v, want ok", v)
++	}
++}
++
++// TestFunctionWithContext_CancellationObservable verifies that a context
++// canceled before the query runs is observable as Done from inside a
++// context-aware custom function, so embedders can bail out of expensive work
++// started by their own callback.
++func TestFunctionWithContext_CancellationObservable(t *testing.T) {
++	query, err := gojq.Parse("probe")
++	if err != nil {
++		t.Fatal(err)
++	}
++	code, err := gojq.Compile(query,
++		gojq.WithFunctionWithContext("probe", 0, 0, func(ctx context.Context, _ any, _ []any) any {
++			select {
++			case <-ctx.Done():
++				return "canceled"
++			default:
++				return "live"
++			}
++		}),
++	)
++	if err != nil {
++		t.Fatal(err)
++	}
++	ctx, cancel := context.WithCancel(context.Background())
++	cancel()
++	iter := code.RunWithContext(ctx, nil)
++	v, ok := iter.Next()
++	if !ok {
++		t.Fatal("expected a value")
++	}
++	if err, ok := v.(error); ok {
++		if err != context.Canceled {
++			t.Fatalf("got error %v, want context.Canceled or the probe result", err)
++		}
++		return
++	}
++	if v != "canceled" {
++		t.Fatalf("got %v, want canceled", v)
++	}
++}
++
++// TestIterFunctionWithContext_PropagatesValue verifies that
++// WithIterFunctionWithContext threads the context through to an iterator
++// function and that it can still emit multiple values.
++func TestIterFunctionWithContext_PropagatesValue(t *testing.T) {
++	query, err := gojq.Parse("repeatTag")
++	if err != nil {
++		t.Fatal(err)
++	}
++	code, err := gojq.Compile(query,
++		gojq.WithIterFunctionWithContext("repeatTag", 0, 0, func(ctx context.Context, _ any, _ []any) gojq.Iter {
++			s, _ := ctx.Value(contextFuncTestKey{}).(string)
++			return gojq.NewIter(s, s)
++		}),
++	)
++	if err != nil {
++		t.Fatal(err)
++	}
++	ctx := context.WithValue(context.Background(), contextFuncTestKey{}, "dup")
++	iter := code.RunWithContext(ctx, nil)
++	var got []any
++	for {
++		v, ok := iter.Next()
++		if !ok {
++			break
++		}
++		if err, ok := v.(error); ok {
++			t.Fatal(err)
++		}
++		got = append(got, v)
++	}
++	want := []any{"dup", "dup"}
++	if len(got) != len(want) || got[0] != want[0] || got[1] != want[1] {
++		t.Fatalf("got %v, want %v", got, want)
++	}
++}
++
++// TestFunctionWithContext_ArityMergeWithPlainFunction verifies that a
++// context-aware registration and a plain registration can share the same
++// function name across disjoint arities, and that each arity dispatches to
++// the correct callback (and, for the context-aware arity, still receives the
++// context).
++func TestFunctionWithContext_ArityMergeWithPlainFunction(t *testing.T) {
++	query, err := gojq.Parse(".[] | mixed, mixed(1)")
++	if err != nil {
++		t.Fatal(err)
++	}
++	code, err := gojq.Compile(query,
++		gojq.WithFunctionWithContext("mixed", 0, 0, func(ctx context.Context, _ any, _ []any) any {
++			s, _ := ctx.Value(contextFuncTestKey{}).(string)
++			return "ctx:" + s
++		}),
++		gojq.WithFunction("mixed", 1, 1, func(_ any, args []any) any {
++			return "plain"
++		}),
++	)
++	if err != nil {
++		t.Fatal(err)
++	}
++	ctx := context.WithValue(context.Background(), contextFuncTestKey{}, "v")
++	iter := code.RunWithContext(ctx, []any{0})
++	var got []any
++	for {
++		v, ok := iter.Next()
++		if !ok {
++			break
++		}
++		if err, ok := v.(error); ok {
++			t.Fatal(err)
++		}
++		got = append(got, v)
++	}
++	want := []any{"ctx:v", "plain"}
++	if len(got) != len(want) || got[0] != want[0] || got[1] != want[1] {
++		t.Fatalf("got %v, want %v", got, want)
++	}
++}
++
++// TestFunctionWithContext_IteratorMismatchPanics verifies that mixing an
++// iterator registration and a non-iterator registration under the same name
++// still panics regardless of which of WithFunction/WithFunctionWithContext/
++// WithIterFunction/WithIterFunctionWithContext each side used.
++func TestFunctionWithContext_IteratorMismatchPanics(t *testing.T) {
++	defer func() {
++		if recover() == nil {
++			t.Fatal("expected a panic")
++		}
++	}()
++	query, err := gojq.Parse("dummy")
++	if err != nil {
++		t.Fatal(err)
++	}
++	_, _ = gojq.Compile(query,
++		gojq.WithFunctionWithContext("dummy", 0, 0, func(context.Context, any, []any) any {
++			return nil
++		}),
++		gojq.WithIterFunction("dummy", 1, 1, func(_ any, _ []any) gojq.Iter {
++			return gojq.NewIter[any]()
++		}),
++	)
++}
+diff --git a/contextfunc_163415/run_option_test.go b/contextfunc_163415/run_option_test.go
+new file mode 100644
+index 0000000..22a75a8
+--- /dev/null
++++ b/contextfunc_163415/run_option_test.go
+@@ -0,0 +1,184 @@
++package contextfunc_test
++
++import (
++	"context"
++	"testing"
++
++	"github.com/itchyny/gojq"
++)
++
++// TestRunFunction_OverridesCompileTimeCallback verifies that WithRunFunction
++// replaces, for a single run, the callback of a function that was registered
++// at compile time, without needing to recompile the query.
++func TestRunFunction_OverridesCompileTimeCallback(t *testing.T) {
++	query, err := gojq.Parse(".[] | f")
++	if err != nil {
++		t.Fatal(err)
++	}
++	code, err := gojq.Compile(query,
++		gojq.WithFunctionWithContext("f", 0, 0, func(_ context.Context, _ any, _ []any) any {
++			return "compile-time"
++		}),
++	)
++	if err != nil {
++		t.Fatal(err)
++	}
++
++	iter := code.RunWithOptions(context.Background(), []any{0}, nil,
++		gojq.WithRunFunction("f", 0, 0, func(_ context.Context, _ any, _ []any) any {
++			return "run-override"
++		}),
++	)
++	v, ok := iter.Next()
++	if !ok {
++		t.Fatal("expected a value")
++	}
++	if err, ok := v.(error); ok {
++		t.Fatal(err)
++	}
++	if v != "run-override" {
++		t.Fatalf("got %v, want run-override", v)
++	}
++}
++
++// TestRunFunction_DoesNotLeakAcrossRuns verifies that a compiled *Code can be
++// reused across multiple runs with different (or no) run functions, and that
++// one run's override never affects another run's result, even when they
++// interleave results from the same *Code value.
++func TestRunFunction_DoesNotLeakAcrossRuns(t *testing.T) {
++	query, err := gojq.Parse("f")
++	if err != nil {
++		t.Fatal(err)
++	}
++	code, err := gojq.Compile(query,
++		gojq.WithFunctionWithContext("f", 0, 0, func(_ context.Context, _ any, _ []any) any {
++			return "default"
++		}),
++	)
++	if err != nil {
++		t.Fatal(err)
++	}
++
++	overridden := code.RunWithOptions(context.Background(), nil, nil,
++		gojq.WithRunFunction("f", 0, 0, func(_ context.Context, _ any, _ []any) any {
++			return "overridden"
++		}),
++	)
++	plain := code.RunWithOptions(context.Background(), nil, nil)
++
++	v, _ := plain.Next()
++	if v != "default" {
++		t.Fatalf("got %v, want default", v)
++	}
++	v, _ = overridden.Next()
++	if v != "overridden" {
++		t.Fatalf("got %v, want overridden", v)
++	}
++
++	plainAgain := code.RunWithOptions(context.Background(), nil, nil)
++	v, _ = plainAgain.Next()
++	if v != "default" {
++		t.Fatalf("got %v, want default (no leak from the overridden run)", v)
++	}
++}
++
++// TestRunFunction_UnregisteredNameHasNoEffect verifies that a run function
++// for a name the query never calls (and which was therefore never compiled
++// as a call site) simply has no effect, rather than erroring or panicking.
++func TestRunFunction_UnregisteredNameHasNoEffect(t *testing.T) {
++	query, err := gojq.Parse(".")
++	if err != nil {
++		t.Fatal(err)
++	}
++	code, err := gojq.Compile(query)
++	if err != nil {
++		t.Fatal(err)
++	}
++	iter := code.RunWithOptions(context.Background(), "input", nil,
++		gojq.WithRunFunction("neverCalled", 0, 0, func(_ context.Context, _ any, _ []any) any {
++			return "should not appear"
++		}),
++	)
++	v, ok := iter.Next()
++	if !ok {
++		t.Fatal("expected a value")
++	}
++	if v != "input" {
++		t.Fatalf("got %v, want input", v)
++	}
++}
++
++// TestRunFunction_DoesNotShadowInternalFunctions verifies that registering a
++// run function under a name gojq uses internally for its own path
++// operations (setpath, in this case, used to implement assignment) does not
++// hijack that internal use. Only opcall sites compiled from a user-defined
++// custom function are eligible for a run override.
++func TestRunFunction_DoesNotShadowInternalFunctions(t *testing.T) {
++	query, err := gojq.Parse(`{a: 1} | .a = 2`)
++	if err != nil {
++		t.Fatal(err)
++	}
++	code, err := gojq.Compile(query)
++	if err != nil {
++		t.Fatal(err)
++	}
++	iter := code.RunWithOptions(context.Background(), nil, nil,
++		gojq.WithRunFunction("setpath", 2, 2, func(_ context.Context, _ any, _ []any) any {
++			return "hijacked"
++		}),
++	)
++	v, ok := iter.Next()
++	if !ok {
++		t.Fatal("expected a value")
++	}
++	if err, ok := v.(error); ok {
++		t.Fatal(err)
++	}
++	m, ok := v.(map[string]any)
++	if !ok || m["a"] != 2 {
++		t.Fatalf("got %#v, want map[a:2]; internal setpath must not be overridable", v)
++	}
++}
++
++// TestRunFunction_RespectsArity verifies that a run function only overrides
++// the arities it was registered for, leaving other arities of the same
++// custom function name dispatching to whatever was registered at compile
++// time, exactly like the compile-time arity-merging behavior of
++// WithFunction.
++func TestRunFunction_RespectsArity(t *testing.T) {
++	query, err := gojq.Parse(".[] | g, g(1)")
++	if err != nil {
++		t.Fatal(err)
++	}
++	code, err := gojq.Compile(query,
++		gojq.WithFunctionWithContext("g", 0, 0, func(_ context.Context, _ any, _ []any) any {
++			return "compiled-0"
++		}),
++		gojq.WithFunctionWithContext("g", 1, 1, func(_ context.Context, _ any, _ []any) any {
++			return "compiled-1"
++		}),
++	)
++	if err != nil {
++		t.Fatal(err)
++	}
++	iter := code.RunWithOptions(context.Background(), []any{0}, nil,
++		gojq.WithRunFunction("g", 0, 0, func(_ context.Context, _ any, _ []any) any {
++			return "overridden-0"
++		}),
++	)
++	var got []any
++	for {
++		v, ok := iter.Next()
++		if !ok {
++			break
++		}
++		if err, ok := v.(error); ok {
++			t.Fatal(err)
++		}
++		got = append(got, v)
++	}
++	want := []any{"overridden-0", "compiled-1"}
++	if len(got) != len(want) || got[0] != want[0] || got[1] != want[1] {
++		t.Fatalf("got %v, want %v", got, want)
++	}
++}
+diff --git a/test.sh b/test.sh
+new file mode 100755
+index 0000000..f6d2061
+--- /dev/null
++++ b/test.sh
+@@ -0,0 +1,36 @@
++#!/usr/bin/env bash
++set -u
++set -o pipefail
++
++output_path=""
++if [ "${1:-}" = "--output_path" ]; then
++  output_path="$2"
++  shift 2
++fi
++
++mode="${1:-}"
++
++case "$mode" in
++  base)
++    packages=". ./cli"
++    ;;
++  new)
++    packages="./contextfunc_163415/..."
++    ;;
++  *)
++    echo "usage: $0 [--output_path <file>] base|new" >&2
++    exit 2
++    ;;
++esac
++
++junit_report="$(go env GOPATH)/bin/go-junit-report"
++
++if [ -n "$output_path" ]; then
++  # shellcheck disable=SC2086
++  go test -v -json $packages | "$junit_report" -parser gojson -set-exit-code -out "$output_path"
++  exit $?
++fi
++
++# shellcheck disable=SC2086
++go test -v $packages
++exit $?

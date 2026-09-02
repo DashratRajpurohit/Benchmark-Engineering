@@ -1,0 +1,17 @@
+{
+  "problemId": "kh78k7g16m6qymeaas5jbmj0458dm4cy",
+  "title": "Context-aware custom functions for gojq",
+  "status": "draft",
+  "version": 0,
+  "versionId": "kd7bavztwjwewh337019c9z62n8dmn48",
+  "isLocked": false,
+  "language": "go",
+  "difficulty": "medium",
+  "category": "feature_request",
+  "repoUrl": "https://github.com/itchyny/gojq",
+  "commitHash": "86e392aeece0e75849c5c82567f1190525f4b28b",
+  "githubIssueUrl": "https://github.com/itchyny/gojq/issues/218",
+  "estimatedLOC": null,
+  "testOutputMode": null,
+  "downloadedAt": "2026-10-24T17:10:51.884Z"
+}
