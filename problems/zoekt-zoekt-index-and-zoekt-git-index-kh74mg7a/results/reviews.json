@@ -1,0 +1,144 @@
+[
+ {
+  "feedback": "Tests: The harness leaks challenge-facing wording and omits the required zoekt-index continuation case; it also swallows JUnit conversion failures and misses repository attribution.\n\nSolution & Code: IndexGitRepoInto can skip an unchanged shared-name member before grouped builder creation, letting a later changed sibling replace the shard with partial data.\n\nOther notes: The core design is strong, but two blocking review issues remain. test.sh still uses challenge-facing wording, and the suite never proves that zoekt-index continues to publish a later unrelated name after one shared-name group fails. Please remove the leakage, add that end-to-end continuation and rollback case, assert the intended repository name in zoekt-index results, and make JUnit generation fail closed. The new IndexGitRepoInto path should also make grouped incremental skipping safe within its public lifecycle instead of relying only on the CLI preflight.",
+  "fieldBands": {
+   "description": {
+    "band": 3
+   },
+   "solution": {
+    "band": 2,
+    "reasoning": "IndexGitRepoInto can skip an unchanged shared-name member before grouped builder creation, letting a later changed sibling replace the shard with partial data."
+   },
+   "tests": {
+    "band": 0,
+    "reasoning": "The harness leaks challenge-facing wording and omits the required zoekt-index continuation case; it also swallows JUnit conversion failures and misses repository attribution."
+   }
+  },
+  "internalNotes": null,
+  "otherNotes": "The core design is strong, but two blocking review issues remain. test.sh still uses challenge-facing wording, and the suite never proves that zoekt-index continues to publish a later unrelated name after one shared-name group fails. Please remove the leakage, add that end-to-end continuation and rollback case, assert the intended repository name in zoekt-index results, and make JUnit generation fail closed. The new IndexGitRepoInto path should also make grouped incremental skipping safe within its public lifecycle instead of relying only on the CLI preflight.",
+  "otherNotesTags": null,
+  "outcome": "revision_requested",
+  "overallQuality": 1.6666666666666665,
+  "qualityScore": 4,
+  "reasoning": null,
+  "reviewFormatVersion": 2,
+  "reviewId": "m57ek8y6w3k1dkntmfecmv9nqh8dpxwx",
+  "reviewerName": "Dhruv Mohata",
+  "submittedAt": 1788421802586,
+  "versionNumber": 2,
+  "submittedAtIST": "2026-09-03T13:20:02.586000+05:30"
+ },
+ {
+  "feedback": "Tests: The harness still leaks assessment-lifecycle wording, and both duplicate-path cases accept an uninformative nonzero failure.\n\nOther notes: The earlier continuation/rollback, repository-attribution, fail-closed JUnit, and grouped-lifecycle concerns appear resolved, and the implementation is strong. Two verifier issues still block approval: remove the phrase about applying the solution from test.sh, and make both duplicate-path CLI tests flexibly assert the conflicting file and affected repository name after the nonzero exit. The passing-run default-name and divergent-branch differences are minor or outside the stated data-loss contract.",
+  "fieldBands": {
+   "description": {
+    "band": 3
+   },
+   "solution": {
+    "band": 3
+   },
+   "tests": {
+    "band": 0,
+    "reasoning": "The harness still leaks assessment-lifecycle wording, and both duplicate-path cases accept an uninformative nonzero failure."
+   }
+  },
+  "internalNotes": null,
+  "otherNotes": "The earlier continuation/rollback, repository-attribution, fail-closed JUnit, and grouped-lifecycle concerns appear resolved, and the implementation is strong. Two verifier issues still block approval: remove the phrase about applying the solution from test.sh, and make both duplicate-path CLI tests flexibly assert the conflicting file and affected repository name after the nonzero exit. The passing-run default-name and divergent-branch differences are minor or outside the stated data-loss contract.",
+  "otherNotesTags": null,
+  "outcome": "revision_requested",
+  "overallQuality": 2,
+  "qualityScore": 5,
+  "reasoning": null,
+  "reviewFormatVersion": 2,
+  "reviewId": "m575je19s3dzq2e8rtc8a0cwe58dvdq8",
+  "reviewerName": "Dhruv Mohata",
+  "submittedAt": 1788610530508,
+  "versionNumber": 3,
+  "submittedAtIST": "2026-09-05T17:45:30.508000+05:30"
+ },
+ {
+  "feedback": "Tests: Duplicate-path and delta tests still permit non-specific failure or forbidden delta stacking to pass without proving the stated behavior.\n\nSolution & Code: Repeated positional inputs are collapsed by cleaned path or shared owner identity, bypassing the prompt's explicit conflict contract.\n\nOther notes: The v4 harness leakage is fixed, but the previous duplicate-path weakness remains and the current production patch has contract-level occurrence bugs. Both duplicate-path CLI tests accept any nonzero exit instead of asserting the conflicting file and repository name, while the delta success test does not prove a full non-delta replacement. More importantly, cleaned-path deduplication collapses repeated positional occurrences in zoekt-git-index and zoekt-index reuses one owner for the same directory, so repeated inputs can avoid the explicit same-relative-path conflict required by the prompt. Preserve occurrence identity, resolve effective repository names before delta-collision decisions, and tighten those regressions.",
+  "fieldBands": {
+   "description": {
+    "band": 3
+   },
+   "solution": {
+    "band": 1,
+    "reasoning": "Repeated positional inputs are collapsed by cleaned path or shared owner identity, bypassing the prompt's explicit conflict contract."
+   },
+   "tests": {
+    "band": 1,
+    "reasoning": "Duplicate-path and delta tests still permit non-specific failure or forbidden delta stacking to pass without proving the stated behavior."
+   }
+  },
+  "internalNotes": null,
+  "otherNotes": "The v4 harness leakage is fixed, but the previous duplicate-path weakness remains and the current production patch has contract-level occurrence bugs. Both duplicate-path CLI tests accept any nonzero exit instead of asserting the conflicting file and repository name, while the delta success test does not prove a full non-delta replacement. More importantly, cleaned-path deduplication collapses repeated positional occurrences in zoekt-git-index and zoekt-index reuses one owner for the same directory, so repeated inputs can avoid the explicit same-relative-path conflict required by the prompt. Preserve occurrence identity, resolve effective repository names before delta-collision decisions, and tighten those regressions.",
+  "otherNotesTags": null,
+  "outcome": "revision_requested",
+  "overallQuality": 1.6666666666666665,
+  "qualityScore": 4,
+  "reasoning": null,
+  "reviewFormatVersion": 2,
+  "reviewId": "m57c3f78m6pb91ga6nsjvg0hdx8dwa3x",
+  "reviewerName": "Dhruv Mohata",
+  "submittedAt": 1788674155598,
+  "versionNumber": 4,
+  "submittedAtIST": "2026-09-06T11:25:55.598000+05:30"
+ },
+ {
+  "feedback": "Tests: Two duplicate-conflict tests unfairly pin unpromised diagnostic operands, while both CLIs lack repeated-input and conflict-path rollback/continuation coverage.\n\nOther notes: The v5 production revision fixes the prior occurrence-identity defects, and the reference solution now looks clean. The remaining work is entirely in the verifier: remove the requirements that conflict output contain both the exact path basename and repository name unless the prompt promises that format; add same-path-twice positional cases for both CLIs; and extend duplicate-conflict cases with a seeded prior publication plus an unrelated name, checking old shard/sidecar hashes remain unchanged and the unrelated input still publishes.",
+  "fieldBands": {
+   "description": {
+    "band": 3
+   },
+   "solution": {
+    "band": 3
+   },
+   "tests": {
+    "band": 1,
+    "reasoning": "Two duplicate-conflict tests unfairly pin unpromised diagnostic operands, while both CLIs lack repeated-input and conflict-path rollback/continuation coverage."
+   }
+  },
+  "internalNotes": null,
+  "otherNotes": "The v5 production revision fixes the prior occurrence-identity defects, and the reference solution now looks clean. The remaining work is entirely in the verifier: remove the requirements that conflict output contain both the exact path basename and repository name unless the prompt promises that format; add same-path-twice positional cases for both CLIs; and extend duplicate-conflict cases with a seeded prior publication plus an unrelated name, checking old shard/sidecar hashes remain unchanged and the unrelated input still publishes.",
+  "otherNotesTags": null,
+  "outcome": "revision_requested",
+  "overallQuality": 2.333333333333333,
+  "qualityScore": 6,
+  "reasoning": null,
+  "reviewFormatVersion": 2,
+  "reviewId": "m572m2rpjz8ana8hrs1mzcd0kx8dwyrm",
+  "reviewerName": "Dhruv Mohata",
+  "submittedAt": 1788693683471,
+  "versionNumber": 5,
+  "submittedAtIST": "2026-09-06T16:51:23.471000+05:30"
+ },
+ {
+  "feedback": "Tests: One narrow hardening case is missing: differently derived Git inputs converging on one zoekt.name; the surrounding effective-name, merge, delta, rollback, and continuation behavior is already covered.\n\nOther notes: Approved with a minor test-coverage suggestion. The v6 revision fixes the previously reported repeated-input and rollback/continuation gaps, and the solution now resolves effective names before grouping while preserving prior state and unrelated-name progress. As optional hardening, add the converse of the existing configuration-divergence coverage: two repositories with different basenames but the same zoekt.name, including the corresponding -delta outcome.",
+  "fieldBands": {
+   "description": {
+    "band": 3
+   },
+   "solution": {
+    "band": 3
+   },
+   "tests": {
+    "band": 2,
+    "reasoning": "One narrow hardening case is missing: differently derived Git inputs converging on one zoekt.name; the surrounding effective-name, merge, delta, rollback, and continuation behavior is already covered."
+   }
+  },
+  "internalNotes": null,
+  "otherNotes": "Approved with a minor test-coverage suggestion. The v6 revision fixes the previously reported repeated-input and rollback/continuation gaps, and the solution now resolves effective names before grouping while preserving prior state and unrelated-name progress. As optional hardening, add the converse of the existing configuration-divergence coverage: two repositories with different basenames but the same zoekt.name, including the corresponding -delta outcome.",
+  "otherNotesTags": null,
+  "outcome": "approved",
+  "overallQuality": 2.6666666666666665,
+  "qualityScore": 6,
+  "reasoning": null,
+  "reviewFormatVersion": 2,
+  "reviewId": "m577xxzqnxz1qasv1nyhfjnss58dx90w",
+  "reviewerName": "Dhruv Mohata",
+  "submittedAt": 1788726466674,
+  "versionNumber": 6,
+  "submittedAtIST": "2026-09-07T01:57:46.674000+05:30"
+ }
+]

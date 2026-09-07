@@ -1,0 +1,2031 @@
+diff --git a/cmd/zoekt-git-index/main_multidir_ee2808_test.go b/cmd/zoekt-git-index/main_multidir_ee2808_test.go
+new file mode 100644
+index 00000000..b4b2bab9
+--- /dev/null
++++ b/cmd/zoekt-git-index/main_multidir_ee2808_test.go
+@@ -0,0 +1,1303 @@
++package main
++
++import (
++	"context"
++	"crypto/sha256"
++	"encoding/hex"
++	"os"
++	"os/exec"
++	"path"
++	"path/filepath"
++	"reflect"
++	"sort"
++	"strings"
++	"testing"
++
++	"github.com/sourcegraph/zoekt"
++	"github.com/sourcegraph/zoekt/query"
++	"github.com/sourcegraph/zoekt/search"
++)
++
++// TestMain lets this test binary re-exec itself as the zoekt-git-index CLI,
++// so the tests below drive the real command-line entry point (main) rather
++// than reaching into its internals.
++func TestMain(m *testing.M) {
++	if os.Getenv("ZOEKT_GIT_INDEX_TEST_HELPER") == "1" {
++		args := os.Args
++		for i, a := range args {
++			if a == "--" {
++				os.Args = append([]string{args[0]}, args[i+1:]...)
++				break
++			}
++		}
++		main()
++		os.Exit(0)
++	}
++	os.Exit(m.Run())
++}
++
++// runZoektGitIndexEe2808 runs the zoekt-git-index command (as main() would see
++// it) with the given arguments, by re-executing this test binary as a
++// subprocess, and returns its combined output and error without failing
++// the test (callers decide whether a given invocation is expected to
++// succeed).
++func runZoektGitIndexEe2808(t *testing.T, args ...string) ([]byte, error) {
++	t.Helper()
++	cmdArgs := append([]string{"--"}, args...)
++	cmd := exec.Command(os.Args[0], cmdArgs...)
++	cmd.Env = append(os.Environ(), "ZOEKT_GIT_INDEX_TEST_HELPER=1")
++	return cmd.CombinedOutput()
++}
++
++func gitTestEnvEe2808() []string {
++	return append(os.Environ(),
++		"GIT_CONFIG_GLOBAL=",
++		"GIT_CONFIG_SYSTEM=",
++		"GIT_COMMITTER_NAME=Test",
++		"GIT_COMMITTER_EMAIL=test@example.com",
++		"GIT_AUTHOR_NAME=Test",
++		"GIT_AUTHOR_EMAIL=test@example.com",
++	)
++}
++
++func runGitEe2808(t *testing.T, cwd string, args ...string) {
++	t.Helper()
++	cmd := exec.Command("git", args...)
++	cmd.Dir = cwd
++	cmd.Env = gitTestEnvEe2808()
++	if out, err := cmd.CombinedOutput(); err != nil {
++		t.Fatalf("git %v: %v\noutput:\n%s", args, err, out)
++	}
++}
++
++// initGitRepoEe2808 creates dir and a git repository in it, on branch "main",
++// containing one committed file named filename with the given content.
++// initGitRepoAtPathEe2808 is initGitRepoEe2808 for a relative path that may
++// contain directories.
++func initGitRepoAtPathEe2808(t *testing.T, dir, relPath, content string) {
++	t.Helper()
++	full := filepath.Join(dir, filepath.FromSlash(relPath))
++	if err := os.MkdirAll(filepath.Dir(full), 0o755); err != nil {
++		t.Fatal(err)
++	}
++	runGitEe2808(t, dir, "init", "-b", "main")
++	if err := os.WriteFile(full, []byte(content), 0o644); err != nil {
++		t.Fatal(err)
++	}
++	runGitEe2808(t, dir, "add", ".")
++	runGitEe2808(t, dir, "commit", "-m", "initial commit")
++}
++
++func initGitRepoEe2808(t *testing.T, dir, filename, content string) {
++	t.Helper()
++	if err := os.MkdirAll(dir, 0o755); err != nil {
++		t.Fatal(err)
++	}
++	runGitEe2808(t, dir, "init", "-b", "main")
++	if err := os.WriteFile(filepath.Join(dir, filename), []byte(content), 0o644); err != nil {
++		t.Fatal(err)
++	}
++	runGitEe2808(t, dir, "add", ".")
++	runGitEe2808(t, dir, "commit", "-m", "initial commit")
++}
++
++func searchNamesEe2808(t *testing.T, indexDir string, pattern string) []string {
++	t.Helper()
++	searcher, err := search.NewDirectorySearcher(indexDir)
++	if err != nil {
++		t.Fatal(err)
++	}
++	defer searcher.Close()
++
++	result, err := searcher.Search(
++		context.Background(),
++		&query.Substring{Pattern: pattern, Content: true},
++		&zoekt.SearchOptions{},
++	)
++	if err != nil {
++		t.Fatal(err)
++	}
++	var names []string
++	for _, f := range result.Files {
++		names = append(names, f.FileName)
++	}
++	return names
++}
++
++// searchRepoNamesEe2808 is searchNamesEe2808's counterpart for the
++// repository a match was indexed under, rather than the file it was found
++// in: it returns the (sorted, deduplicated) repository names of every
++// match for pattern. Asserting on these, and not just on whether content
++// is findable somewhere, is what distinguishes content that stayed
++// searchable under its own intended name from content that survived only
++// because it was quietly folded into some other repository's name.
++func searchRepoNamesEe2808(t *testing.T, indexDir string, pattern string) []string {
++	t.Helper()
++	searcher, err := search.NewDirectorySearcher(indexDir)
++	if err != nil {
++		t.Fatal(err)
++	}
++	defer searcher.Close()
++
++	result, err := searcher.Search(
++		context.Background(),
++		&query.Substring{Pattern: pattern, Content: true},
++		&zoekt.SearchOptions{},
++	)
++	if err != nil {
++		t.Fatal(err)
++	}
++	seen := map[string]bool{}
++	var repos []string
++	for _, f := range result.Files {
++		if !seen[f.Repository] {
++			seen[f.Repository] = true
++			repos = append(repos, f.Repository)
++		}
++	}
++	sort.Strings(repos)
++	return repos
++}
++
++// TestGitIndexDistinctReposWithoutMetaGetOwnNames reproduces a repository
++// name aliasing bug in zoekt-git-index: indexing more than one git
++// repository in a single invocation, without -meta, used to make every
++// repository after the first silently reuse whichever repository's name
++// happened to be derived first (map iteration order over multiple
++// positional repositories is unspecified), because the shared
++// *index.Options pointer's RepositoryDescription.Name field was only ever
++// set once, on whichever repository was processed first. Combined with
++// each repository getting its own builder, the second repository's Finish
++// call would then delete the first repository's freshly written shard -
++// the same data loss as issue #1133, but reachable even when the two
++// repositories' own names don't collide with each other at all.
++// shardSnapshotEe2808 records every shard file in indexDir by name and
++// content hash. "Completely untouched" is a statement about the files on
++// disk, not merely about what a query still returns: deleting a shard and
++// rebuilding an equivalent one would satisfy a search-only check while
++// having replaced the very artifact the earlier run published.
++func shardSnapshotEe2808(t *testing.T, indexDir string) map[string]string {
++	t.Helper()
++	entries, err := os.ReadDir(indexDir)
++	if err != nil {
++		t.Fatal(err)
++	}
++	snapshot := map[string]string{}
++	for _, entry := range entries {
++		// A published index is the shard plus its .zoekt.meta sidecar
++		// (see index/read.go's IndexFilePaths), so "completely untouched"
++		// has to cover both; hashing only the shard would let metadata
++		// change unnoticed.
++		if entry.IsDir() || (filepath.Ext(entry.Name()) != ".zoekt" && !strings.HasSuffix(entry.Name(), ".zoekt.meta")) {
++			continue
++		}
++		content, err := os.ReadFile(filepath.Join(indexDir, entry.Name()))
++		if err != nil {
++			t.Fatal(err)
++		}
++		digest := sha256.Sum256(content)
++		snapshot[entry.Name()] = hex.EncodeToString(digest[:])
++	}
++	if len(snapshot) == 0 {
++		t.Fatalf("expected at least one shard in %s", indexDir)
++	}
++	return snapshot
++}
++
++func TestGitIndexDistinctReposWithoutMetaGetOwnNames(t *testing.T) {
++	root := t.TempDir()
++	alphaDir := filepath.Join(root, "alpha-repo")
++	betaDir := filepath.Join(root, "beta-repo")
++	initGitRepoEe2808(t, alphaDir, "alpha.txt", "alphaneedle\n")
++	initGitRepoEe2808(t, betaDir, "beta.txt", "betaneedle\n")
++
++	indexDir := t.TempDir()
++	out, err := runZoektGitIndexEe2808(t, "-index", indexDir, "-disable_ctags", alphaDir, betaDir)
++	if err != nil {
++		t.Fatalf("zoekt-git-index: %v\noutput:\n%s", err, out)
++	}
++
++	if got := searchNamesEe2808(t, indexDir, "alphaneedle"); len(got) != 1 {
++		t.Errorf("alpha.txt should be searchable under its own repository name, got matches: %v", got)
++	}
++	if got := searchNamesEe2808(t, indexDir, "betaneedle"); len(got) != 1 {
++		t.Errorf("beta.txt should be searchable under its own repository name, got matches: %v", got)
++	}
++
++	// Being findable at all is not enough: each repository's content must
++	// be indexed under that repository's OWN name. Folding both
++	// repositories into whichever name happened to be derived first would
++	// still leave every needle searchable, so only checking the repository
++	// each match belongs to actually distinguishes the two.
++	if got := searchRepoNamesEe2808(t, indexDir, "alphaneedle"); len(got) != 1 || got[0] != "alpha-repo" {
++		t.Errorf("alphaneedle should be indexed under repository %q, got repositories: %v", "alpha-repo", got)
++	}
++	if got := searchRepoNamesEe2808(t, indexDir, "betaneedle"); len(got) != 1 || got[0] != "beta-repo" {
++		t.Errorf("betaneedle should be indexed under repository %q, got repositories: %v", "beta-repo", got)
++	}
++}
++
++// TestGitIndexSharedMetaNameMergesBothRepos covers the direct issue #1133
++// equivalent for zoekt-git-index: two different repositories deliberately
++// given the SAME name via -meta (a supported way to attach one logical
++// repository name to content assembled from more than one place) must
++// both remain searchable afterward, instead of the second repository's
++// Finish call deleting the first repository's shard.
++func TestGitIndexSharedMetaNameMergesBothRepos(t *testing.T) {
++	root := t.TempDir()
++	oneDir := filepath.Join(root, "one")
++	twoDir := filepath.Join(root, "two")
++	initGitRepoEe2808(t, oneDir, "one.txt", "oneneedle\n")
++	initGitRepoEe2808(t, twoDir, "two.txt", "twoneedle\n")
++
++	indexDir := t.TempDir()
++	metaFile := filepath.Join(indexDir, "repo.meta")
++	if err := os.WriteFile(metaFile, []byte(`{"Name":"shared-git-repo"}`), 0o644); err != nil {
++		t.Fatal(err)
++	}
++
++	out, err := runZoektGitIndexEe2808(t, "-index", indexDir, "-disable_ctags", "-meta", metaFile, oneDir, twoDir)
++	if err != nil {
++		t.Fatalf("zoekt-git-index: %v\noutput:\n%s", err, out)
++	}
++
++	if got := searchNamesEe2808(t, indexDir, "oneneedle"); len(got) != 1 {
++		t.Errorf("one.txt should still be searchable after indexing a second repository under the same name, got matches: %v", got)
++	}
++	if got := searchNamesEe2808(t, indexDir, "twoneedle"); len(got) != 1 {
++		t.Errorf("two.txt should be searchable, got matches: %v", got)
++	}
++
++	// Both repositories' content must be searchable under the one name
++	// they were deliberately given, not merely searchable somewhere.
++	for _, needle := range []string{"oneneedle", "twoneedle"} {
++		if got := searchRepoNamesEe2808(t, indexDir, needle); len(got) != 1 || got[0] != "shared-git-repo" {
++			t.Errorf("%s should be indexed under repository %q, got repositories: %v", needle, "shared-git-repo", got)
++		}
++	}
++}
++
++// TestGitIndexMultiBranchRepoMergedWithSiblingKeepsAllContent covers the
++// boundary of the duplicate relative-path policy: the conflict it
++// describes is between two DIFFERENT inputs merged under one name, so a
++// single input that legitimately produces the same relative path more
++// than once - a repository indexing one file on two branches, with
++// different content on each - must not be mistaken for that conflict just
++// because it is being merged with a sibling input.
++//
++// This is the merged counterpart to
++// TestGitIndexMultiBranchSamePathWithinOneRepoNotRejected: checking the
++// unmerged case alone does not catch an implementation that only compares
++// paths once merging is actually in play, and treats one input's own
++// repeated path as a conflict with itself - which rejects, and so drops,
++// every input sharing that name. Both repositories here carry the same
++// two branches, so no branch is missing for either input and the only
++// thing under test is the repeated path.
++func TestGitIndexMultiBranchRepoMergedWithSiblingKeepsAllContent(t *testing.T) {
++	root := t.TempDir()
++	multiDir := filepath.Join(root, "multi")
++	siblingDir := filepath.Join(root, "sibling")
++
++	// multiDir writes the same relative path (alpha.txt) on both of its
++	// branches with different content on each, so this one input alone
++	// contributes two documents at that path.
++	initGitRepoEe2808(t, multiDir, "alpha.txt", "mainalphaneedle\n")
++	runGitEe2808(t, multiDir, "checkout", "-b", "dev")
++	if err := os.WriteFile(filepath.Join(multiDir, "alpha.txt"), []byte("devalphaneedle\n"), 0o644); err != nil {
++		t.Fatal(err)
++	}
++	runGitEe2808(t, multiDir, "commit", "-am", "dev change")
++	runGitEe2808(t, multiDir, "checkout", "main")
++
++	// siblingDir carries the same branches but its own distinct relative
++	// path, so there is no genuine cross-input duplicate path here.
++	initGitRepoEe2808(t, siblingDir, "beta.txt", "mainbetaneedle\n")
++	runGitEe2808(t, siblingDir, "checkout", "-b", "dev")
++	if err := os.WriteFile(filepath.Join(siblingDir, "beta.txt"), []byte("devbetaneedle\n"), 0o644); err != nil {
++		t.Fatal(err)
++	}
++	runGitEe2808(t, siblingDir, "commit", "-am", "dev change")
++	runGitEe2808(t, siblingDir, "checkout", "main")
++
++	indexDir := t.TempDir()
++	metaFile := filepath.Join(indexDir, "repo.meta")
++	if err := os.WriteFile(metaFile, []byte(`{"Name":"multibranch-shared"}`), 0o644); err != nil {
++		t.Fatal(err)
++	}
++
++	out, err := runZoektGitIndexEe2808(t, "-index", indexDir, "-disable_ctags", "-branches", "main,dev", "-meta", metaFile, multiDir, siblingDir)
++	if err != nil {
++		t.Fatalf("zoekt-git-index should merge a multi-branch repository with a sibling under one name: %v\noutput:\n%s", err, out)
++	}
++
++	for _, needle := range []string{"mainalphaneedle", "devalphaneedle", "mainbetaneedle", "devbetaneedle"} {
++		if got := searchNamesEe2808(t, indexDir, needle); len(got) != 1 {
++			t.Errorf("%s should be searchable: one input repeating its own relative path across branches is not a cross-input duplicate, got matches: %v", needle, got)
++		}
++		if got := searchRepoNamesEe2808(t, indexDir, needle); len(got) != 1 || got[0] != "multibranch-shared" {
++			t.Errorf("%s should be indexed under repository %q, got repositories: %v", needle, "multibranch-shared", got)
++		}
++	}
++}
++
++// TestGitIndexRepeatedSharedNameInvocationKeepsBothRepos covers running
++// the very same shared-name invocation twice: re-indexing the same inputs
++// under the same name must leave every one of them searchable afterward,
++// exactly as the first run did, since re-indexing is the normal steady
++// state rather than a one-off.
++//
++// Publishing a merged result is not necessarily a single filesystem
++// operation, and an implementation that replaces what a previous run left
++// behind in more than one step can leave those steps inconsistent with
++// each other - retiring the old result while only partly installing the
++// new one, so that a second, apparently successful run reports no error
++// but silently hides everything under that name, including the content
++// the first run had already published.
++func TestGitIndexRepeatedSharedNameInvocationKeepsBothRepos(t *testing.T) {
++	root := t.TempDir()
++	oneDir := filepath.Join(root, "one")
++	twoDir := filepath.Join(root, "two")
++	initGitRepoEe2808(t, oneDir, "one.txt", "repeatoneneedle\n")
++	initGitRepoEe2808(t, twoDir, "two.txt", "repeattwoneedle\n")
++
++	indexDir := t.TempDir()
++	metaFile := filepath.Join(indexDir, "repo.meta")
++	if err := os.WriteFile(metaFile, []byte(`{"Name":"repeat-shared"}`), 0o644); err != nil {
++		t.Fatal(err)
++	}
++
++	for run := 1; run <= 2; run++ {
++		out, err := runZoektGitIndexEe2808(t, "-index", indexDir, "-disable_ctags", "-meta", metaFile, oneDir, twoDir)
++		if err != nil {
++			t.Fatalf("zoekt-git-index (run %d): %v\noutput:\n%s", run, err, out)
++		}
++		for _, needle := range []string{"repeatoneneedle", "repeattwoneedle"} {
++			if got := searchNamesEe2808(t, indexDir, needle); len(got) != 1 {
++				t.Errorf("run %d: %s should be searchable after re-indexing the same inputs under the same name, got matches: %v", run, needle, got)
++			}
++			if got := searchRepoNamesEe2808(t, indexDir, needle); len(got) != 1 || got[0] != "repeat-shared" {
++				t.Errorf("run %d: %s should be indexed under repository %q, got repositories: %v", run, needle, "repeat-shared", got)
++			}
++		}
++	}
++}
++
++// TestGitIndexUnrelatedNameStillFinishesWhenSharedGroupFails covers the
++// blast radius of a partial failure: when one name's inputs fail and that
++// whole name is rolled back, an unrelated name indexed in the same
++// invocation must still be finished and published, rather than being
++// dragged down with it.
++func TestGitIndexUnrelatedNameStillFinishesWhenSharedGroupFails(t *testing.T) {
++	root := t.TempDir()
++
++	// Two inputs whose derived names both come out as "dup": one real,
++	// and one that doesn't exist, so that name's group fails partway.
++	dupOK := filepath.Join(root, "a", "dup")
++	initGitRepoEe2808(t, dupOK, "dup.txt", "dupneedle\n")
++	dupMissing := filepath.Join(root, "b", "dup")
++
++	// A third input whose name collides with nothing, which must survive
++	// the failure above untouched.
++	soloDir := filepath.Join(root, "solo")
++	initGitRepoEe2808(t, soloDir, "solo.txt", "soloneedle\n")
++
++	indexDir := t.TempDir()
++	out, err := runZoektGitIndexEe2808(t, "-index", indexDir, "-disable_ctags", dupOK, dupMissing, soloDir)
++	if err == nil {
++		t.Fatalf("expected zoekt-git-index to report the missing repository, output:\n%s", out)
++	}
++
++	if got := searchNamesEe2808(t, indexDir, "dupneedle"); len(got) != 0 {
++		t.Errorf("dupneedle should NOT be published: its name had a failing sibling input, got matches: %v", got)
++	}
++	if got := searchNamesEe2808(t, indexDir, "soloneedle"); len(got) != 1 {
++		t.Errorf("soloneedle should still be indexed: an unrelated name in the same invocation must still finish, got matches: %v", got)
++	}
++	if got := searchRepoNamesEe2808(t, indexDir, "soloneedle"); len(got) != 1 || got[0] != "solo" {
++		t.Errorf("soloneedle should be indexed under repository %q, got repositories: %v", "solo", got)
++	}
++}
++
++// TestGitIndexPartialFailureLeavesOldSharedShardIntact covers the group's
++// partial-failure/error-cleanup semantics for zoekt-git-index: if one of
++// several repositories sharing a name fails partway through (here, because
++// it doesn't exist), none of that name's repositories from the current
++// invocation should end up published, and whatever previously existed
++// under that name from an earlier successful run must be left completely
++// untouched.
++func TestGitIndexPartialFailureLeavesOldSharedShardIntact(t *testing.T) {
++	root := t.TempDir()
++	origDir := filepath.Join(root, "orig")
++	initGitRepoEe2808(t, origDir, "orig.txt", "origneedle\n")
++
++	indexDir := t.TempDir()
++	metaFile := filepath.Join(indexDir, "repo.meta")
++	if err := os.WriteFile(metaFile, []byte(`{"Name":"mixed-git-repo"}`), 0o644); err != nil {
++		t.Fatal(err)
++	}
++
++	if out, err := runZoektGitIndexEe2808(t, "-index", indexDir, "-disable_ctags", "-meta", metaFile, origDir); err != nil {
++		t.Fatalf("zoekt-git-index (first run): %v\noutput:\n%s", err, out)
++	}
++	if got := searchNamesEe2808(t, indexDir, "origneedle"); len(got) != 1 {
++		t.Fatalf("origneedle should be searchable after the first run, got matches: %v", got)
++	}
++
++	before := shardSnapshotEe2808(t, indexDir)
++
++	newDir := filepath.Join(root, "new")
++	initGitRepoEe2808(t, newDir, "new.txt", "newneedle\n")
++	missingDir := filepath.Join(root, "does-not-exist")
++
++	out, err := runZoektGitIndexEe2808(t, "-index", indexDir, "-disable_ctags", "-meta", metaFile, newDir, missingDir)
++	if err == nil {
++		t.Fatalf("expected zoekt-git-index to fail when one of the merged repositories doesn't exist, output:\n%s", out)
++	}
++
++	if got := searchNamesEe2808(t, indexDir, "origneedle"); len(got) != 1 {
++		t.Errorf("origneedle should still be searchable after the failed second run (old shard must be untouched), got matches: %v", got)
++	}
++	if got := searchNamesEe2808(t, indexDir, "newneedle"); len(got) != 0 {
++		t.Errorf("newneedle should NOT be searchable: the whole name-group must not be published when a sibling input failed, got matches: %v", got)
++	}
++	if after := shardSnapshotEe2808(t, indexDir); !reflect.DeepEqual(before, after) {
++		t.Errorf("the shards published by the earlier successful run must be left completely untouched by the failed run: before %v, after %v", before, after)
++	}
++}
++
++// TestGitIndexIncrementalSkipDoesNotDropUnchangedSibling covers a
++// consequence of merging inputs under a shared name that only shows up
++// with -incremental: a repository whose content hasn't changed between
++// runs would, on its own, decide to skip reindexing entirely. If that
++// were still allowed for a name shared with another, changed repository,
++// the changed repository's Finish would replace all of the shared name's
++// shards, permanently losing the skipped repository's content, which was
++// never re-added because it decided there was nothing to do.
++func TestGitIndexIncrementalSkipDoesNotDropUnchangedSibling(t *testing.T) {
++	root := t.TempDir()
++	staticDir := filepath.Join(root, "static")
++	initGitRepoEe2808(t, staticDir, "static.txt", "staticneedle\n")
++
++	indexDir := t.TempDir()
++	metaFile := filepath.Join(indexDir, "repo.meta")
++	if err := os.WriteFile(metaFile, []byte(`{"Name":"incremental-shared"}`), 0o644); err != nil {
++		t.Fatal(err)
++	}
++
++	// Index only staticDir first, so the shard's recorded state reflects
++	// staticDir specifically, and a later incremental run against
++	// staticDir alone would decide to skip it.
++	if out, err := runZoektGitIndexEe2808(t, "-index", indexDir, "-disable_ctags", "-meta", metaFile, staticDir); err != nil {
++		t.Fatalf("zoekt-git-index (first run): %v\noutput:\n%s", err, out)
++	}
++	if got := searchNamesEe2808(t, indexDir, "staticneedle"); len(got) != 1 {
++		t.Fatalf("staticneedle should be searchable after the first run, got matches: %v", got)
++	}
++
++	changingDir := filepath.Join(root, "changing")
++	initGitRepoEe2808(t, changingDir, "changing.txt", "changingneedle\n")
++
++	out, err := runZoektGitIndexEe2808(t, "-index", indexDir, "-disable_ctags", "-meta", metaFile, staticDir, changingDir)
++	if err != nil {
++		t.Fatalf("zoekt-git-index (second run): %v\noutput:\n%s", err, out)
++	}
++
++	if got := searchNamesEe2808(t, indexDir, "staticneedle"); len(got) != 1 {
++		t.Errorf("staticneedle should still be searchable after reindexing its unchanged sibling under a shared name, got matches: %v", got)
++	}
++	if got := searchNamesEe2808(t, indexDir, "changingneedle"); len(got) != 1 {
++		t.Errorf("changingneedle should be searchable after being added under the shared name, got matches: %v", got)
++	}
++}
++
++// TestGitIndexRequestedDeltaWithMergedInputsDoesNotLoseData covers the
++// delta/compound-shard compatibility requirement: a delta build stacks
++// incremental changes onto one specific repository's shard, so a single
++// invocation must never end up merging more than one repository under a
++// shared name as a delta build.
++//
++// More than one resolution satisfies that, and this test accepts either.
++// The command may refuse the invocation, publishing nothing new and
++// leaving the shard from the earlier run exactly as it was; or it may
++// fall back to a normal, non-delta build, which this repository already
++// does for delta builds whose preconditions aren't met - but then that
++// full build has to genuinely index both inputs. What is not acceptable
++// is the outcome in between: reporting success while only one of the two
++// inputs survives.
++func TestGitIndexRequestedDeltaWithMergedInputsDoesNotLoseData(t *testing.T) {
++	root := t.TempDir()
++	oneDir := filepath.Join(root, "one")
++	twoDir := filepath.Join(root, "two")
++	initGitRepoEe2808(t, oneDir, "one.txt", "oneneedle\n")
++	initGitRepoEe2808(t, twoDir, "two.txt", "twoneedle\n")
++
++	// staleneedle exists only in oneDir's first commit and is deleted
++	// before the second invocation. A full replacement therefore drops it,
++	// while a build that stacked a delta on top of the earlier shard would
++	// still return it - which is what makes the success branch below able
++	// to tell those two outcomes apart.
++	if err := os.WriteFile(filepath.Join(oneDir, "stale.txt"), []byte("staleneedle\n"), 0o644); err != nil {
++		t.Fatal(err)
++	}
++	runGitEe2808(t, oneDir, "add", "-A")
++	runGitEe2808(t, oneDir, "commit", "-m", "add stale file")
++
++	indexDir := t.TempDir()
++	metaFile := filepath.Join(indexDir, "repo.meta")
++	if err := os.WriteFile(metaFile, []byte(`{"Name":"delta-shared"}`), 0o644); err != nil {
++		t.Fatal(err)
++	}
++
++	if out, err := runZoektGitIndexEe2808(t, "-index", indexDir, "-disable_ctags", "-meta", metaFile, oneDir); err != nil {
++		t.Fatalf("zoekt-git-index (first run): %v\noutput:\n%s", err, out)
++	}
++
++	// Remove the seeded file, so a genuine full rebuild can no longer find
++	// it while a delta stack still would.
++	if err := os.Remove(filepath.Join(oneDir, "stale.txt")); err != nil {
++		t.Fatal(err)
++	}
++	runGitEe2808(t, oneDir, "add", "-A")
++	runGitEe2808(t, oneDir, "commit", "-m", "remove stale file")
++
++	out, err := runZoektGitIndexEe2808(t, "-index", indexDir, "-disable_ctags", "-delta", "-meta", metaFile, oneDir, twoDir)
++
++	one := len(searchNamesEe2808(t, indexDir, "oneneedle"))
++	two := len(searchNamesEe2808(t, indexDir, "twoneedle"))
++	stale := len(searchNamesEe2808(t, indexDir, "staleneedle"))
++
++	if err != nil {
++		// Refused the invocation. Nothing from it may be published, and
++		// the shard the first run wrote must be left untouched.
++		if one != 1 {
++			t.Errorf("oneneedle should still be searchable after the refused delta merge (the earlier run's shard must be untouched), got %d matches\noutput:\n%s", one, out)
++		}
++		if two != 0 {
++			t.Errorf("twoneedle should NOT be searchable: a refused invocation must not publish any of its content, got %d matches\noutput:\n%s", two, out)
++		}
++		if stale != 1 {
++			t.Errorf("staleneedle should still be searchable after the refused delta merge: the earlier run's shard must be left exactly as it was, got %d matches\noutput:\n%s", stale, out)
++		}
++		return
++	}
++
++	// Reported success, so it must have fallen back to a full build that
++	// actually indexed both inputs under the shared name.
++	if one != 1 || two != 1 {
++		t.Errorf("zoekt-git-index reported success for a -delta invocation spanning two repositories under one name, so it must have fallen back to a build that indexes both; got oneneedle=%d twoneedle=%d\noutput:\n%s", one, two, out)
++	}
++	// A successful shared-name invocation must be a full replacement, not
++	// a delta stacked on the earlier shard: content deleted from the
++	// repository since that shard was written must be gone.
++	if stale != 0 {
++		t.Errorf("staleneedle was deleted from the repository before this invocation, so a successful shared-name build must have fully replaced the earlier shard rather than stacking a delta on it; got %d matches\noutput:\n%s", stale, out)
++	}
++}
++
++// TestGitIndexDuplicatePathAcrossMergedReposRejected covers the group's
++// duplicate relative-path policy for zoekt-git-index: if two repositories
++// merged under the same name both produce a file at the same relative
++// path, that must be an explicit, reported conflict, not a silent pick of
++// one side.
++func TestGitIndexDuplicatePathAcrossMergedReposRejected(t *testing.T) {
++	// The collision is exercised at a root path and at a nested one, so a
++	// fix cannot special-case a single well-known filename.
++	for _, collidingPath := range []string{"shared.txt", "nested/collision.go"} {
++		t.Run(collidingPath, func(t *testing.T) {
++			root := t.TempDir()
++			oneDir := filepath.Join(root, "one")
++			twoDir := filepath.Join(root, "two")
++			initGitRepoAtPathEe2808(t, oneDir, collidingPath, "firstcontent\n")
++			initGitRepoAtPathEe2808(t, twoDir, collidingPath, "secondcontent\n")
++
++			indexDir := t.TempDir()
++			metaFile := filepath.Join(indexDir, "repo.meta")
++			if err := os.WriteFile(metaFile, []byte(`{"Name":"dup-path-shared"}`), 0o644); err != nil {
++				t.Fatal(err)
++			}
++
++			out, err := runZoektGitIndexEe2808(t, "-index", indexDir, "-disable_ctags", "-meta", metaFile, oneDir, twoDir)
++			if err == nil {
++				t.Fatalf("expected zoekt-git-index to reject two merged repositories both writing %s, output:\n%s", collidingPath, out)
++			}
++
++			for _, needle := range []string{"firstcontent", "secondcontent"} {
++				if got := searchNamesEe2808(t, indexDir, needle); len(got) != 0 {
++					t.Errorf("%s should NOT be searchable: a duplicate path across merged inputs must reject the whole group, got matches: %v", needle, got)
++				}
++			}
++
++			// Control: the same merge with no colliding relative path must
++			// succeed and publish both inputs. This ties the rejection
++			// above to the duplicate relative path itself rather than to
++			// any incidental failure, without constraining how the
++			// conflict is reported.
++			threeDir := filepath.Join(root, "three")
++			initGitRepoAtPathEe2808(t, threeDir, path.Join(path.Dir(collidingPath), "distinct"+path.Ext(collidingPath)), "secondcontent\n")
++			controlOut, err := runZoektGitIndexEe2808(t, "-index", indexDir, "-disable_ctags", "-meta", metaFile, oneDir, threeDir)
++			if err != nil {
++				t.Fatalf("once the duplicate path is gone the same merge must succeed, got %v, output:\n%s", err, controlOut)
++			}
++			for _, needle := range []string{"firstcontent", "secondcontent"} {
++				if got := searchNamesEe2808(t, indexDir, needle); len(got) == 0 {
++					t.Errorf("%s should be searchable after the collision was removed, output:\n%s", needle, controlOut)
++				}
++			}
++		})
++	}
++}
++
++// TestGitIndexMultiBranchSamePathWithinOneRepoNotRejected guards against a
++// regression the duplicate-path policy could otherwise introduce: a single
++// repository indexing the same relative path with different content on two
++// different branches is normal, existing zoekt behavior, and must not be
++// treated as a cross-input conflict just because that repository always
++// goes through the same group machinery used to merge multiple inputs.
++func TestGitIndexMultiBranchSamePathWithinOneRepoNotRejected(t *testing.T) {
++	root := t.TempDir()
++	repoDir := filepath.Join(root, "repo")
++	initGitRepoEe2808(t, repoDir, "shared.txt", "main-content\n")
++	runGitEe2808(t, repoDir, "checkout", "-b", "dev")
++	if err := os.WriteFile(filepath.Join(repoDir, "shared.txt"), []byte("dev-content\n"), 0o644); err != nil {
++		t.Fatal(err)
++	}
++	runGitEe2808(t, repoDir, "commit", "-am", "dev change")
++	runGitEe2808(t, repoDir, "checkout", "main")
++
++	indexDir := t.TempDir()
++	out, err := runZoektGitIndexEe2808(t, "-index", indexDir, "-disable_ctags", "-branches", "main,dev", repoDir)
++	if err != nil {
++		t.Fatalf("zoekt-git-index: %v\noutput:\n%s", err, out)
++	}
++
++	if got := searchNamesEe2808(t, indexDir, "main-content"); len(got) != 1 {
++		t.Errorf("main-content should be searchable, got matches: %v", got)
++	}
++	if got := searchNamesEe2808(t, indexDir, "dev-content"); len(got) != 1 {
++		t.Errorf("dev-content should be searchable: the same path on two branches of one repository must not be treated as a cross-input duplicate, got matches: %v", got)
++	}
++}
++
++// createSubmoduleSuperRepoEe2808 creates a git repository at dir containing
++// mainFile, plus a submodule checked out at subPath pointing at a
++// separately created repository containing subFile. It mirrors the
++// no-repo-cache submodule setup already exercised by
++// gitindex.TestSubmoduleIndexWithoutRepocache, so a relative-path
++// submodule resolves without needing -repo_cache.
++func createSubmoduleSuperRepoEe2808(t *testing.T, dir, mainFile, mainContent, subPath, subFile, subContent string) {
++	t.Helper()
++	subDir := dir + "-sub"
++	initGitRepoEe2808(t, subDir, subFile, subContent)
++
++	if err := os.MkdirAll(dir, 0o755); err != nil {
++		t.Fatal(err)
++	}
++	runGitEe2808(t, dir, "init", "-b", "main")
++	if err := os.WriteFile(filepath.Join(dir, mainFile), []byte(mainContent), 0o644); err != nil {
++		t.Fatal(err)
++	}
++
++	cmd := exec.Command("git", "-c", "protocol.file.allow=always", "submodule", "add", "--name", subPath, "--", "../"+filepath.Base(subDir), subPath)
++	cmd.Dir = dir
++	cmd.Env = gitTestEnvEe2808()
++	if out, err := cmd.CombinedOutput(); err != nil {
++		t.Fatalf("git submodule add: %v\noutput:\n%s", err, out)
++	}
++
++	runGitEe2808(t, dir, "add", ".")
++	runGitEe2808(t, dir, "commit", "-m", "add submodule")
++}
++
++// TestGitIndexRepoWithSubmoduleMergesWithPlainSibling covers the group's
++// interaction with submodule metadata: when a repository with its own
++// submodule is merged under a shared name with a sibling repository,
++// reusing the builder created for whichever repository came first must
++// still end up with the submodule known to it, regardless of which of the
++// two repositories that turns out to be - otherwise the submodule's
++// documents would be rejected as referring to an unknown subrepo path
++// when the builder wasn't the one that originally discovered it.
++//
++// This deliberately merges a submoduled repository with a *plain* sibling
++// (no submodule of its own), rather than with a second, independently
++// submoduled repository: two repositories that each have any submodule
++// both have a .gitmodules file at their root, which is a genuine
++// duplicate-path conflict under the group's own duplicate-path policy,
++// not a submodule-metadata bug - that combination is correctly rejected
++// before it could reach this code at all.
++func TestGitIndexRepoWithSubmoduleMergesWithPlainSibling(t *testing.T) {
++	root := t.TempDir()
++	superADir := filepath.Join(root, "superA")
++	plainDir := filepath.Join(root, "plain")
++	createSubmoduleSuperRepoEe2808(t, superADir, "supera.txt", "supera-content\n", "asub-mount", "asub.txt", "asub-content\n")
++	initGitRepoEe2808(t, plainDir, "plain.txt", "plain-content\n")
++
++	indexDir := t.TempDir()
++	metaFile := filepath.Join(indexDir, "repo.meta")
++	if err := os.WriteFile(metaFile, []byte(`{"Name":"submodule-shared"}`), 0o644); err != nil {
++		t.Fatal(err)
++	}
++
++	out, err := runZoektGitIndexEe2808(t, "-index", indexDir, "-disable_ctags", "-meta", metaFile, superADir, plainDir)
++	if err != nil {
++		t.Fatalf("zoekt-git-index: %v\noutput:\n%s", err, out)
++	}
++
++	for _, needle := range []string{"supera-content", "asub-content", "plain-content"} {
++		if got := searchNamesEe2808(t, indexDir, needle); len(got) != 1 {
++			t.Errorf("%s should be searchable, got matches: %v", needle, got)
++		}
++	}
++}
++
++// TestGitIndexSubmoduleInputMergedAfterPlainSiblingKeepsSubmodule covers
++// the ordering half of the submodule-metadata requirement: a repository
++// carrying a submodule must contribute that submodule's content whether
++// it is the first input processed under a shared name or a later one.
++//
++// This matters because the submodule paths a merged name has to recognize
++// are only known once the repository carrying them has been examined. An
++// implementation that settles that set from whichever input happened to
++// come first, and then keeps reusing it, works when the submodule-bearing
++// repository leads and rejects that repository's own submodule documents
++// as an unrecognized path when it follows instead - failing the whole
++// invocation on nothing more than argument order.
++//
++// TestGitIndexRepoWithSubmoduleMergesWithPlainSibling lists the
++// submodule-bearing repository first and this one lists it last, so between
++// them both argument orders are covered. An implementation that settles the
++// recognized set from whichever input it examines first therefore fails at
++// least one of the pair, whatever order it examines arguments in.
++func TestGitIndexSubmoduleInputMergedAfterPlainSiblingKeepsSubmodule(t *testing.T) {
++	root := t.TempDir()
++	plainDir := filepath.Join(root, "plain")
++	superDir := filepath.Join(root, "super")
++	initGitRepoEe2808(t, plainDir, "plain.txt", "plain-content\n")
++	createSubmoduleSuperRepoEe2808(t, superDir, "super.txt", "super-content\n", "sub-mount", "sub.txt", "sub-content\n")
++
++	indexDir := t.TempDir()
++	metaFile := filepath.Join(indexDir, "repo.meta")
++	if err := os.WriteFile(metaFile, []byte(`{"Name":"submodule-trailing-shared"}`), 0o644); err != nil {
++		t.Fatal(err)
++	}
++
++	// The plain repository is deliberately listed first, so the
++	// submodule-bearing one is merged into a name that was already
++	// established without any submodule of its own.
++	out, err := runZoektGitIndexEe2808(t, "-index", indexDir, "-disable_ctags", "-submodules", "-meta", metaFile, plainDir, superDir)
++	if err != nil {
++		t.Fatalf("zoekt-git-index should merge a submodule-bearing repository listed after a plain sibling: %v\noutput:\n%s", err, out)
++	}
++
++	for _, needle := range []string{"plain-content", "super-content", "sub-content"} {
++		if got := searchNamesEe2808(t, indexDir, needle); len(got) != 1 {
++			t.Errorf("%s should be searchable, got matches: %v", needle, got)
++		}
++		if got := searchRepoNamesEe2808(t, indexDir, needle); len(got) != 1 || got[0] != "submodule-trailing-shared" {
++			t.Errorf("%s should be indexed under repository %q, got repositories: %v", needle, "submodule-trailing-shared", got)
++		}
++	}
++}
++
++// TestGitIndexDeltaRequestedWithDistinctConfigNamesBothIndexed guards
++// against a false collision: two repositories can share the same derived
++// basename (for example, both are checked out as a directory literally
++// named "src") while their own git config resolves them to two distinct,
++// non-colliding repository names. Since they don't actually end up
++// sharing a name, -delta must not reject either of them - only inputs
++// that really are merged under one shared name are restricted that way.
++func TestGitIndexDeltaRequestedWithDistinctConfigNamesBothIndexed(t *testing.T) {
++	root := t.TempDir()
++	aDir := filepath.Join(root, "groupA", "src")
++	bDir := filepath.Join(root, "groupB", "src")
++	initGitRepoEe2808(t, aDir, "a.txt", "aneedle\n")
++	initGitRepoEe2808(t, bDir, "b.txt", "bneedle\n")
++	runGitEe2808(t, aDir, "config", "zoekt.name", "repo-a")
++	runGitEe2808(t, bDir, "config", "zoekt.name", "repo-b")
++
++	indexDir := t.TempDir()
++	out, err := runZoektGitIndexEe2808(t, "-index", indexDir, "-disable_ctags", "-delta", aDir, bDir)
++	if err != nil {
++		t.Fatalf("zoekt-git-index: %v\noutput:\n%s", err, out)
++	}
++
++	if got := searchNamesEe2808(t, indexDir, "aneedle"); len(got) != 1 {
++		t.Errorf("aneedle should be searchable, got matches: %v", got)
++	}
++	if got := searchNamesEe2808(t, indexDir, "bneedle"); len(got) != 1 {
++		t.Errorf("bneedle should be searchable: two repositories sharing only a provisional derived basename, with distinct config-resolved names, must both be indexed even under -delta, got matches: %v", got)
++	}
++	// Each repository must land under the name its own git config
++	// resolves to, not under the shared provisional basename.
++	for needle, want := range map[string]string{"aneedle": "repo-a", "bneedle": "repo-b"} {
++		if got := searchRepoNamesEe2808(t, indexDir, needle); len(got) != 1 || got[0] != want {
++			t.Errorf("%s should be indexed under repository %q, got repositories: %v", needle, want, got)
++		}
++	}
++}
++
++// TestGitIndexDeltaWithExplicitMetaStillHonorsConfigResolvedNames covers
++// the same false-collision risk as
++// TestGitIndexDeltaRequestedWithDistinctConfigNamesBothIndexed, but with
++// an explicit -meta name supplied too: a repository's own git config
++// (zoekt.name) overrides even an explicit -meta name, so two repositories
++// invoked with the same -meta name can still resolve to two distinct,
++// non-colliding effective names, and -delta must not reject either of
++// them on that account.
++func TestGitIndexDeltaWithExplicitMetaStillHonorsConfigResolvedNames(t *testing.T) {
++	root := t.TempDir()
++	aDir := filepath.Join(root, "one")
++	bDir := filepath.Join(root, "two")
++	initGitRepoEe2808(t, aDir, "a.txt", "metaaneedle\n")
++	initGitRepoEe2808(t, bDir, "b.txt", "metabneedle\n")
++	runGitEe2808(t, aDir, "config", "zoekt.name", "meta-repo-a")
++	runGitEe2808(t, bDir, "config", "zoekt.name", "meta-repo-b")
++
++	indexDir := t.TempDir()
++	metaFile := filepath.Join(indexDir, "repo.meta")
++	if err := os.WriteFile(metaFile, []byte(`{"Name":"caller-supplied-shared-name"}`), 0o644); err != nil {
++		t.Fatal(err)
++	}
++
++	out, err := runZoektGitIndexEe2808(t, "-index", indexDir, "-disable_ctags", "-delta", "-meta", metaFile, aDir, bDir)
++	if err != nil {
++		t.Fatalf("zoekt-git-index: %v\noutput:\n%s", err, out)
++	}
++
++	if got := searchNamesEe2808(t, indexDir, "metaaneedle"); len(got) != 1 {
++		t.Errorf("metaaneedle should be searchable, got matches: %v", got)
++	}
++	if got := searchNamesEe2808(t, indexDir, "metabneedle"); len(got) != 1 {
++		t.Errorf("metabneedle should be searchable: an explicit -meta name shared by two repositories whose own config resolves them to distinct names must not be treated as a delta collision, got matches: %v", got)
++	}
++	// A repository's own git config outranks the caller-supplied -meta
++	// name, so neither input may be published under that shared name.
++	for needle, want := range map[string]string{"metaaneedle": "meta-repo-a", "metabneedle": "meta-repo-b"} {
++		if got := searchRepoNamesEe2808(t, indexDir, needle); len(got) != 1 || got[0] != want {
++			t.Errorf("%s should be indexed under repository %q, got repositories: %v", needle, want, got)
++		}
++	}
++}
++
++// TestGitIndexDivergentBranchSetsNeverSilentlyLoseData covers two inputs
++// merged under one repository name when the requested branch list is only
++// partly available in each: one input carries both branches, the other only
++// the default branch, indexed with -allow_missing_branches.
++//
++// How differing branch sets should be reconciled is a design choice, so this
++// accepts either faithful resolution - publishing every input's content, or
++// refusing the whole group and leaving the earlier successful publication
++// alone. What it rules out is the one outcome the task exists to prevent:
++// reporting success while quietly dropping one of the inputs.
++func TestGitIndexDivergentBranchSetsNeverSilentlyLoseData(t *testing.T) {
++	root := t.TempDir()
++	oldDir := filepath.Join(root, "old")
++	bothDir := filepath.Join(root, "both")
++	mainOnlyDir := filepath.Join(root, "mainonly")
++
++	initGitRepoEe2808(t, oldDir, "old.txt", "priorbranchneedle\n")
++
++	// bothDir has main and dev; dev carries a file of its own.
++	initGitRepoEe2808(t, bothDir, "alpha.txt", "mainalphabranchneedle\n")
++	runGitEe2808(t, bothDir, "checkout", "-b", "dev")
++	if err := os.WriteFile(filepath.Join(bothDir, "devonly.txt"), []byte("devalphabranchneedle\n"), 0o644); err != nil {
++		t.Fatal(err)
++	}
++	runGitEe2808(t, bothDir, "add", "-A")
++	runGitEe2808(t, bothDir, "commit", "-m", "dev only file")
++	runGitEe2808(t, bothDir, "checkout", "main")
++
++	// mainOnlyDir never grows a dev branch, so the two inputs resolve to
++	// different branch sets for the same requested list.
++	initGitRepoEe2808(t, mainOnlyDir, "beta.txt", "mainbetabranchneedle\n")
++
++	indexDir := t.TempDir()
++	metaFile := filepath.Join(indexDir, "repo.meta")
++	if err := os.WriteFile(metaFile, []byte(`{"Name":"divergent-shared"}`), 0o644); err != nil {
++		t.Fatal(err)
++	}
++
++	// Establish a prior successful publication under the shared name.
++	if out, err := runZoektGitIndexEe2808(t, "-index", indexDir, "-disable_ctags", "-meta", metaFile, oldDir); err != nil {
++		t.Fatalf("seeding the shared name should succeed: %v\noutput:\n%s", err, out)
++	}
++
++	out, err := runZoektGitIndexEe2808(t, "-index", indexDir, "-disable_ctags", "-branches", "main,dev", "-allow_missing_branches", "-meta", metaFile, bothDir, mainOnlyDir)
++
++	newNeedles := []string{"mainalphabranchneedle", "devalphabranchneedle", "mainbetabranchneedle"}
++	if err == nil {
++		// Reported success, so every input must have survived it.
++		for _, needle := range newNeedles {
++			if got := searchNamesEe2808(t, indexDir, needle); len(got) == 0 {
++				t.Errorf("%s is not searchable even though the invocation reported success: inputs merged under one name must not be dropped, output:\n%s", needle, out)
++				continue
++			}
++			// Surviving somewhere is not enough: reconciling the two
++			// branch sets must still leave every input searchable under
++			// the name it was given, not under some other one.
++			if got := searchRepoNamesEe2808(t, indexDir, needle); len(got) != 1 || got[0] != "divergent-shared" {
++				t.Errorf("%s should be indexed under repository %q, got repositories: %v\noutput:\n%s", needle, "divergent-shared", got, out)
++			}
++		}
++		return
++	}
++
++	// Refused the group, so nothing new may be published and the earlier
++	// successful publication must be left alone.
++	for _, needle := range newNeedles {
++		if got := searchNamesEe2808(t, indexDir, needle); len(got) != 0 {
++			t.Errorf("%s must not be published when the shared-name group was refused, got matches: %v", needle, got)
++		}
++	}
++	if got := searchNamesEe2808(t, indexDir, "priorbranchneedle"); len(got) == 0 {
++		t.Errorf("the earlier successful publication under this name must survive a refused merge, output:\n%s", out)
++	}
++}
++
++// TestGitIndexConflictRollsBackAndUnrelatedNameStillPublishes drives a
++// duplicate-path conflict against a name that already has a published shard,
++// in an invocation that also carries an unrelated name. The earlier
++// publication must survive byte for byte - shard and .zoekt.meta sidecar
++// alike - nothing new may appear under the failed name, and the unrelated
++// name must still finish.
++func TestGitIndexConflictRollsBackAndUnrelatedNameStillPublishes(t *testing.T) {
++	root := t.TempDir()
++	indexDir := t.TempDir()
++
++	priorDir := filepath.Join(root, "prior", "conflict-repo")
++	initGitRepoEe2808(t, priorDir, "prior.txt", "priorconflictneedle\n")
++	if out, err := runZoektGitIndexEe2808(t, "-index", indexDir, "-disable_ctags", priorDir); err != nil {
++		t.Fatalf("seeding the shared name should succeed: %v\noutput:\n%s", err, out)
++	}
++	before := shardSnapshotEe2808(t, indexDir)
++
++	oneDir := filepath.Join(root, "one", "conflict-repo")
++	twoDir := filepath.Join(root, "two", "conflict-repo")
++	soloDir := filepath.Join(root, "three", "conflict-solo")
++	initGitRepoEe2808(t, oneDir, "same.txt", "conflictoneneedle\n")
++	initGitRepoEe2808(t, twoDir, "same.txt", "conflicttwoneedle\n")
++	initGitRepoEe2808(t, soloDir, "solo.txt", "conflictsoloneedle\n")
++
++	out, err := runZoektGitIndexEe2808(t, "-index", indexDir, "-disable_ctags", oneDir, twoDir, soloDir)
++	if err == nil {
++		t.Fatalf("a duplicate relative path across merged inputs must fail the invocation, output:\n%s", out)
++	}
++
++	for _, needle := range []string{"conflictoneneedle", "conflicttwoneedle"} {
++		if got := searchNamesEe2808(t, indexDir, needle); len(got) != 0 {
++			t.Errorf("%s must not be published: its name group was rejected on a duplicate path, got matches: %v", needle, got)
++		}
++	}
++	if got := searchNamesEe2808(t, indexDir, "priorconflictneedle"); len(got) != 1 {
++		t.Errorf("the earlier publication under the failed name must survive, got matches: %v", got)
++	}
++	if after := shardSnapshotEe2808(t, indexDir); !mapsContainEe2808(after, before) {
++		t.Errorf("every artifact of the earlier publication must be byte-for-byte untouched by the failed run: before %v, after %v", before, after)
++	}
++	if got := searchNamesEe2808(t, indexDir, "conflictsoloneedle"); len(got) != 1 {
++		t.Errorf("an unrelated name in the same invocation must still finish even though another name failed on a duplicate path, got matches: %v", got)
++	}
++}
++
++// mapsContainEe2808 reports whether every entry of want is present in got
++// with the same value. The failed run may legitimately add artifacts for the
++// unrelated name, so the earlier publication's entries are required to
++// survive unchanged rather than requiring the directory to be identical.
++func mapsContainEe2808(got, want map[string]string) bool {
++	for k, v := range want {
++		if got[k] != v {
++			return false
++		}
++	}
++	return true
++}
++
++// TestGitIndexFailedFirstSharedGroupPublishesNothingLater lists the failing
++// input ahead of its valid same-name sibling. The required outcome does not
++// depend on which of the two the command happens to examine first: in either
++// order, a failure anywhere in the group must leave the later sibling
++// unpublished. Listing the failure first exercises the direction a partial
++// fix is most likely to miss - one that only declines to finish a group it
++// has already begun, and so still publishes a sibling when nothing was
++// started before it. The earlier publication for that name must also survive
++// the failed run byte for byte, while an unrelated name in the same
++// invocation still finishes.
++func TestGitIndexFailedFirstSharedGroupPublishesNothingLater(t *testing.T) {
++	root := t.TempDir()
++	indexDir := t.TempDir()
++
++	priorDir := filepath.Join(root, "prior", "failfirst")
++	initGitRepoEe2808(t, priorDir, "prior.txt", "failfirstpriorneedle\n")
++	if out, err := runZoektGitIndexEe2808(t, "-index", indexDir, "-disable_ctags", priorDir); err != nil {
++		t.Fatalf("seeding the shared name should succeed: %v\noutput:\n%s", err, out)
++	}
++	before := shardSnapshotEe2808(t, indexDir)
++
++	missingDir := filepath.Join(root, "missing", "failfirst")
++	validDir := filepath.Join(root, "valid", "failfirst")
++	soloDir := filepath.Join(root, "solo", "failfirst-solo")
++	initGitRepoEe2808(t, validDir, "valid.txt", "failfirstvalidneedle\n")
++	initGitRepoEe2808(t, soloDir, "solo.txt", "failfirstsoloneedle\n")
++
++	out, err := runZoektGitIndexEe2808(t, "-index", indexDir, "-disable_ctags", missingDir, validDir, soloDir)
++	if err == nil {
++		t.Fatalf("expected zoekt-git-index to fail when the first input of a shared name does not exist, output:\n%s", out)
++	}
++
++	if got := searchNamesEe2808(t, indexDir, "failfirstvalidneedle"); len(got) != 0 {
++		t.Errorf("the later sibling must not be published: its name group already failed on an earlier input, got matches: %v", got)
++	}
++	if got := searchNamesEe2808(t, indexDir, "failfirstpriorneedle"); len(got) != 1 {
++		t.Errorf("the earlier publication under the failed name must survive, got matches: %v", got)
++	}
++	if after := shardSnapshotEe2808(t, indexDir); !mapsContainEe2808(after, before) {
++		t.Errorf("every artifact of the earlier publication must be byte-for-byte untouched: before %v, after %v", before, after)
++	}
++	if got := searchNamesEe2808(t, indexDir, "failfirstsoloneedle"); len(got) != 1 {
++		t.Errorf("an unrelated name must still finish even though another name failed on its first input, got matches: %v", got)
++	}
++}
++
++// TestGitIndexIdenticalContentDuplicatePathRejected covers the duplicate
++// relative path rule for the case where the two merged repositories write
++// byte-identical files at that path. What the requirement turns on is the
++// path two merged inputs would each write, not whether their bytes happen
++// to agree: an implementation that only reports a conflict when the
++// contents differ still lets one input's file silently stand in for the
++// other's, which is exactly the substitution the explicit conflict exists
++// to prevent.
++func TestGitIndexIdenticalContentDuplicatePathRejected(t *testing.T) {
++	root := t.TempDir()
++	oneDir := filepath.Join(root, "one")
++	twoDir := filepath.Join(root, "two")
++	initGitRepoAtPathEe2808(t, oneDir, "shared.txt", "identicalcollisionneedle\n")
++	initGitRepoAtPathEe2808(t, twoDir, "shared.txt", "identicalcollisionneedle\n")
++
++	indexDir := t.TempDir()
++	metaFile := filepath.Join(indexDir, "repo.meta")
++	if err := os.WriteFile(metaFile, []byte(`{"Name":"identical-dup-shared"}`), 0o644); err != nil {
++		t.Fatal(err)
++	}
++
++	out, err := runZoektGitIndexEe2808(t, "-index", indexDir, "-disable_ctags", "-meta", metaFile, oneDir, twoDir)
++	if err == nil {
++		t.Fatalf("two merged repositories both writing shared.txt must be an explicit conflict for that name even when the two files hold identical bytes, output:\n%s", out)
++	}
++	if got := searchNamesEe2808(t, indexDir, "identicalcollisionneedle"); len(got) != 0 {
++		t.Errorf("a name group rejected on a duplicate relative path must publish none of its inputs, got matches: %v\noutput:\n%s", got, out)
++	}
++}
++
++// TestGitIndexDeltaWithMergedInputsAndNoPriorShardDoesNotLoseData exercises
++// a -delta build of several same-name inputs into an empty index directory.
++// TestGitIndexRequestedDeltaWithMergedInputsDoesNotLoseData always seeds an
++// earlier shard first, so an implementation could enforce the restriction
++// only as a side effect of inspecting previously published state and still
++// pass it. With nothing published yet there is no such state to consult,
++// and the outcome must be the same: either the invocation is refused and
++// publishes nothing, or it succeeds with every input searchable under the
++// shared name.
++func TestGitIndexDeltaWithMergedInputsAndNoPriorShardDoesNotLoseData(t *testing.T) {
++	root := t.TempDir()
++	oneDir := filepath.Join(root, "one")
++	twoDir := filepath.Join(root, "two")
++	initGitRepoEe2808(t, oneDir, "one.txt", "freshdeltaoneneedle\n")
++	initGitRepoEe2808(t, twoDir, "two.txt", "freshdeltatwoneedle\n")
++
++	indexDir := t.TempDir()
++	metaFile := filepath.Join(indexDir, "repo.meta")
++	if err := os.WriteFile(metaFile, []byte(`{"Name":"fresh-delta-shared"}`), 0o644); err != nil {
++		t.Fatal(err)
++	}
++
++	out, err := runZoektGitIndexEe2808(t, "-index", indexDir, "-disable_ctags", "-delta", "-meta", metaFile, oneDir, twoDir)
++
++	needles := []string{"freshdeltaoneneedle", "freshdeltatwoneedle"}
++	if err != nil {
++		// Refused the group, so none of it may reach the index.
++		for _, needle := range needles {
++			if got := searchNamesEe2808(t, indexDir, needle); len(got) != 0 {
++				t.Errorf("%s must not be published by a refused -delta invocation, got matches: %v\noutput:\n%s", needle, got, out)
++			}
++		}
++		return
++	}
++
++	// Reported success, so it must have built something that holds both
++	// inputs under the one name they were given.
++	for _, needle := range needles {
++		if got := searchNamesEe2808(t, indexDir, needle); len(got) != 1 {
++			t.Errorf("%s should be searchable after a -delta invocation that reported success for two inputs sharing a name, got matches: %v\noutput:\n%s", needle, got, out)
++			continue
++		}
++		if got := searchRepoNamesEe2808(t, indexDir, needle); len(got) != 1 || got[0] != "fresh-delta-shared" {
++			t.Errorf("%s should be indexed under repository %q, got repositories: %v\noutput:\n%s", needle, "fresh-delta-shared", got, out)
++		}
++	}
++}
++
++// TestGitIndexMergedSubmoduleBranchMetadataStaysSearchable merges a
++// repository whose only branch is dev with a submodule-bearing repository
++// whose only branch is main, under one name, with -allow_missing_branches.
++//
++// A match is reported by looking up the document's branch position in the
++// merged name's branch list and reading the entry at that same position
++// from the subrepository the document belongs to. Merging inputs that
++// contribute different branch sets is exactly what makes those two lists
++// disagree: the submodule arrives knowing only its own branch, while the
++// merged name ends up carrying both, so the submodule's own documents sit
++// at a position its metadata never grew an entry for. Searching then
++// reads past the end of that list, which is why this asserts on results
++// obtained from a real search rather than on the shard's mere existence.
++func TestGitIndexMergedSubmoduleBranchMetadataStaysSearchable(t *testing.T) {
++	root := t.TempDir()
++	devOnlyDir := filepath.Join(root, "devonly")
++	superDir := filepath.Join(root, "super")
++
++	// devOnlyDir carries dev and nothing else.
++	initGitRepoEe2808(t, devOnlyDir, "plain.txt", "devplainbranchneedle\n")
++	runGitEe2808(t, devOnlyDir, "branch", "-m", "dev")
++
++	// superDir carries main and nothing else, and owns a submodule.
++	createSubmoduleSuperRepoEe2808(t, superDir, "super.txt", "mainsuperbranchneedle\n", "vendor/lib", "lib.txt", "mainsubmodulebranchneedle\n")
++
++	indexDir := t.TempDir()
++	metaFile := filepath.Join(indexDir, "repo.meta")
++	if err := os.WriteFile(metaFile, []byte(`{"Name":"submodule-branch-shared"}`), 0o644); err != nil {
++		t.Fatal(err)
++	}
++
++	out, err := runZoektGitIndexEe2808(t, "-index", indexDir, "-disable_ctags", "-branches", "dev,main", "-allow_missing_branches", "-meta", metaFile, devOnlyDir, superDir)
++
++	needles := []string{"devplainbranchneedle", "mainsuperbranchneedle", "mainsubmodulebranchneedle"}
++	if err != nil {
++		// Refused the group, so none of it may be published.
++		for _, needle := range needles {
++			if got := searchNamesEe2808(t, indexDir, needle); len(got) != 0 {
++				t.Errorf("%s must not be published when the shared-name group was refused, got matches: %v\noutput:\n%s", needle, got, out)
++			}
++		}
++		return
++	}
++
++	// Reported success, so every input must be searchable under the one
++	// name they share - the submodule's own file included.
++	for _, needle := range needles {
++		if got := searchNamesEe2808(t, indexDir, needle); len(got) == 0 {
++			t.Errorf("%s is not searchable even though the invocation reported success, output:\n%s", needle, out)
++			continue
++		}
++		if got := searchRepoNamesEe2808(t, indexDir, needle); len(got) != 1 || got[0] != "submodule-branch-shared" {
++			t.Errorf("%s should be indexed under repository %q, got repositories: %v\noutput:\n%s", needle, "submodule-branch-shared", got, out)
++		}
++	}
++}
++
++// TestGitIndexDeltaEligibleSharedNameDoesNotStackOnOldShard exercises the
++// -delta restriction in the configuration where a delta build is actually
++// eligible rather than rejected for an unrelated reason: submodule
++// recursion off, an earlier shard already published for the name under the
++// same branches and options, and only the repository's contents changed
++// since. TestGitIndexRequestedDeltaWithMergedInputsDoesNotLoseData reaches
++// its conclusion from a build that was never delta-eligible in the first
++// place, so it cannot show what happens once the restriction is the only
++// thing standing between the invocation and a real delta build. Content
++// deleted from the repository after the seeded shard was written is what
++// separates the outcomes here: a full rebuild can no longer find it,
++// while a delta stacked on that shard still returns it.
++func TestGitIndexDeltaEligibleSharedNameDoesNotStackOnOldShard(t *testing.T) {
++	root := t.TempDir()
++	oneDir := filepath.Join(root, "one")
++	twoDir := filepath.Join(root, "two")
++	initGitRepoEe2808(t, oneDir, "one.txt", "deltaeligibleoneneedle\n")
++	initGitRepoEe2808(t, twoDir, "two.txt", "deltaeligibletwoneedle\n")
++
++	// Seeded into the first shard and deleted before the -delta run, so a
++	// genuine rebuild can no longer find it while a stack still would.
++	if err := os.WriteFile(filepath.Join(oneDir, "stale.txt"), []byte("deltaeligiblestaleneedle\n"), 0o644); err != nil {
++		t.Fatal(err)
++	}
++	runGitEe2808(t, oneDir, "add", "-A")
++	runGitEe2808(t, oneDir, "commit", "-m", "add stale file")
++
++	indexDir := t.TempDir()
++	metaFile := filepath.Join(indexDir, "repo.meta")
++	if err := os.WriteFile(metaFile, []byte(`{"Name":"delta-eligible-shared"}`), 0o644); err != nil {
++		t.Fatal(err)
++	}
++
++	if out, err := runZoektGitIndexEe2808(t, "-index", indexDir, "-disable_ctags", "-submodules=false", "-meta", metaFile, oneDir); err != nil {
++		t.Fatalf("seeding the shared name should succeed: %v\noutput:\n%s", err, out)
++	}
++
++	if err := os.Remove(filepath.Join(oneDir, "stale.txt")); err != nil {
++		t.Fatal(err)
++	}
++	runGitEe2808(t, oneDir, "add", "-A")
++	runGitEe2808(t, oneDir, "commit", "-m", "remove stale file")
++
++	out, err := runZoektGitIndexEe2808(t, "-index", indexDir, "-disable_ctags", "-submodules=false", "-delta", "-meta", metaFile, oneDir, twoDir)
++
++	one := len(searchNamesEe2808(t, indexDir, "deltaeligibleoneneedle"))
++	two := len(searchNamesEe2808(t, indexDir, "deltaeligibletwoneedle"))
++	stale := len(searchNamesEe2808(t, indexDir, "deltaeligiblestaleneedle"))
++
++	if err != nil {
++		// Refused, so the seeded shard must be exactly as it was and
++		// nothing from this invocation may appear.
++		if one != 1 || stale != 1 {
++			t.Errorf("the seeded shard must survive a refused -delta merge untouched, got deltaeligibleoneneedle=%d deltaeligiblestaleneedle=%d\noutput:\n%s", one, stale, out)
++		}
++		if two != 0 {
++			t.Errorf("deltaeligibletwoneedle must not be published by a refused invocation, got %d matches\noutput:\n%s", two, out)
++		}
++		return
++	}
++
++	// Reported success, so both inputs must be present under the name and
++	// the content deleted since the seeded shard must be gone.
++	if one != 1 || two != 1 {
++		t.Errorf("a -delta invocation that reported success for two inputs sharing a name must leave both searchable, got deltaeligibleoneneedle=%d deltaeligibletwoneedle=%d\noutput:\n%s", one, two, out)
++	}
++	if stale != 0 {
++		t.Errorf("deltaeligiblestaleneedle was deleted before this invocation, so a successful shared-name build must have replaced the seeded shard rather than stacked on it, got %d matches\noutput:\n%s", stale, out)
++	}
++
++	// Both inputs must also be attributed to the name they were given: a
++	// build that kept them searchable under some other name would satisfy
++	// the counts above while still losing them from the name that was
++	// asked for.
++	for _, needle := range []string{"deltaeligibleoneneedle", "deltaeligibletwoneedle"} {
++		if got := searchRepoNamesEe2808(t, indexDir, needle); len(got) != 1 || got[0] != "delta-eligible-shared" {
++			t.Errorf("%s should be indexed under repository %q, got repositories: %v\noutput:\n%s", needle, "delta-eligible-shared", got, out)
++		}
++	}
++}
++
++// TestGitIndexRepeatedPositionalInputWithSiblingLosesNothing lists one
++// repository twice alongside a second repository resolving to the same
++// name. Each positional argument is its own input, so the repeat writes
++// every one of that repository's relative paths under the name a second
++// time, and two inputs writing the same relative path is an explicit
++// conflict for that name. Collapsing the repeat instead would let a
++// repeated argument quietly escape the rule every other pair of inputs
++// is held to.
++func TestGitIndexRepeatedPositionalInputWithSiblingLosesNothing(t *testing.T) {
++	root := t.TempDir()
++	repeatedDir := filepath.Join(root, "a", "shared")
++	siblingDir := filepath.Join(root, "b", "shared")
++	initGitRepoEe2808(t, repeatedDir, "alpha.txt", "repeatalphaneedle\n")
++	initGitRepoEe2808(t, siblingDir, "beta.txt", "repeatbetaneedle\n")
++
++	indexDir := t.TempDir()
++	out, err := runZoektGitIndexEe2808(t, "-index", indexDir, "-disable_ctags", repeatedDir, repeatedDir, siblingDir)
++
++	alpha := len(searchNamesEe2808(t, indexDir, "repeatalphaneedle"))
++	beta := len(searchNamesEe2808(t, indexDir, "repeatbetaneedle"))
++
++	if err == nil {
++		t.Fatalf("listing the same input twice writes every one of its relative paths under the name a second time, which must be reported as an explicit conflict rather than silently collapsed, output:\n%s", out)
++	}
++	if alpha != 0 || beta != 0 {
++		t.Errorf("a name group rejected on a duplicate relative path must publish none of its inputs, got repeatalphaneedle=%d repeatbetaneedle=%d\noutput:\n%s", alpha, beta, out)
++	}
++}
+diff --git a/cmd/zoekt-index/main_multidir_09e2ba_test.go b/cmd/zoekt-index/main_multidir_09e2ba_test.go
+new file mode 100644
+index 00000000..8309301f
+--- /dev/null
++++ b/cmd/zoekt-index/main_multidir_09e2ba_test.go
+@@ -0,0 +1,626 @@
++package main
++
++import (
++	"context"
++	"crypto/sha256"
++	"encoding/hex"
++	"os"
++	"os/exec"
++	"path"
++	"path/filepath"
++	"reflect"
++	"sort"
++	"strings"
++	"testing"
++
++	"github.com/sourcegraph/zoekt"
++	"github.com/sourcegraph/zoekt/query"
++	"github.com/sourcegraph/zoekt/search"
++)
++
++// TestMain lets this test binary re-exec itself as the zoekt-index CLI, so
++// the tests below drive the real command-line entry point (main) rather
++// than reaching into its internals. The registered flags (including those
++// index.Options.Flags adds via the cmd package's init) are untouched; we
++// only rewrite os.Args so main()'s own flag.Parse() sees the simulated
++// zoekt-index command line instead of the test binary's own flags.
++func TestMain(m *testing.M) {
++	if os.Getenv("ZOEKT_INDEX_TEST_HELPER") == "1" {
++		args := os.Args
++		for i, a := range args {
++			if a == "--" {
++				os.Args = append([]string{args[0]}, args[i+1:]...)
++				break
++			}
++		}
++		main()
++		os.Exit(0)
++	}
++	os.Exit(m.Run())
++}
++
++// runZoektIndex09e2ba runs the zoekt-index command (as main() would see it) with
++// the given arguments, by re-executing this test binary as a subprocess.
++func runZoektIndex09e2ba(t *testing.T, args ...string) {
++	t.Helper()
++	if out, err := runZoektIndexAllowError09e2ba(t, args...); err != nil {
++		t.Fatalf("zoekt-index %v: %v\noutput:\n%s", args, err, out)
++	}
++}
++
++// runZoektIndexAllowError09e2ba is like runZoektIndex09e2ba, but returns the command's
++// combined output and error instead of failing the test, for callers that
++// expect (and want to inspect) a non-zero exit.
++func runZoektIndexAllowError09e2ba(t *testing.T, args ...string) ([]byte, error) {
++	t.Helper()
++	cmdArgs := append([]string{"--"}, args...)
++	cmd := exec.Command(os.Args[0], cmdArgs...)
++	cmd.Env = append(os.Environ(), "ZOEKT_INDEX_TEST_HELPER=1")
++	return cmd.CombinedOutput()
++}
++
++func searchNames09e2ba(t *testing.T, indexDir string, pattern string) []string {
++	t.Helper()
++	searcher, err := search.NewDirectorySearcher(indexDir)
++	if err != nil {
++		t.Fatal(err)
++	}
++	defer searcher.Close()
++
++	result, err := searcher.Search(
++		context.Background(),
++		&query.Substring{Pattern: pattern, Content: true},
++		&zoekt.SearchOptions{},
++	)
++	if err != nil {
++		t.Fatal(err)
++	}
++	var names []string
++	for _, f := range result.Files {
++		names = append(names, f.FileName)
++	}
++	return names
++}
++
++// searchRepoNames09e2ba is searchNames09e2ba's counterpart for the
++// repository a match was indexed under, rather than the file it was found
++// in: it returns the sorted, deduplicated repository names of every match
++// for pattern. Asserting on these, and not just on whether content is
++// findable somewhere, is what distinguishes content that stayed
++// searchable under its own intended name from content that survived only
++// because it was quietly folded into some other repository's name.
++func searchRepoNames09e2ba(t *testing.T, indexDir string, pattern string) []string {
++	t.Helper()
++	searcher, err := search.NewDirectorySearcher(indexDir)
++	if err != nil {
++		t.Fatal(err)
++	}
++	defer searcher.Close()
++
++	result, err := searcher.Search(
++		context.Background(),
++		&query.Substring{Pattern: pattern, Content: true},
++		&zoekt.SearchOptions{},
++	)
++	if err != nil {
++		t.Fatal(err)
++	}
++	seen := map[string]bool{}
++	var repos []string
++	for _, f := range result.Files {
++		if !seen[f.Repository] {
++			seen[f.Repository] = true
++			repos = append(repos, f.Repository)
++		}
++	}
++	sort.Strings(repos)
++	return repos
++}
++
++// TestIndexArgSharedNameMergesDirectories reproduces
++// https://github.com/sourcegraph/zoekt/issues/1133: indexing two
++// directories in one zoekt-index invocation under an explicitly shared
++// repository name (as -meta produces) must leave both directories' files
++// searchable afterward, instead of the later directory's shard build
++// silently deleting the earlier directory's shard.
++// shardSnapshot09e2ba records every shard file in indexDir by name and
++// content hash. "Completely untouched" is a statement about the files on
++// disk, not merely about what a query still returns: deleting a shard and
++// rebuilding an equivalent one would satisfy a search-only check while
++// having replaced the very artifact the earlier run published.
++func shardSnapshot09e2ba(t *testing.T, indexDir string) map[string]string {
++	t.Helper()
++	entries, err := os.ReadDir(indexDir)
++	if err != nil {
++		t.Fatal(err)
++	}
++	snapshot := map[string]string{}
++	for _, entry := range entries {
++		// A published index is the shard plus its .zoekt.meta sidecar
++		// (see index/read.go's IndexFilePaths), so "completely untouched"
++		// has to cover both; hashing only the shard would let metadata
++		// change unnoticed.
++		if entry.IsDir() || (filepath.Ext(entry.Name()) != ".zoekt" && !strings.HasSuffix(entry.Name(), ".zoekt.meta")) {
++			continue
++		}
++		content, err := os.ReadFile(filepath.Join(indexDir, entry.Name()))
++		if err != nil {
++			t.Fatal(err)
++		}
++		digest := sha256.Sum256(content)
++		snapshot[entry.Name()] = hex.EncodeToString(digest[:])
++	}
++	if len(snapshot) == 0 {
++		t.Fatalf("expected at least one shard in %s", indexDir)
++	}
++	return snapshot
++}
++
++func TestIndexArgSharedNameMergesDirectories(t *testing.T) {
++	alphaDir := t.TempDir()
++	betaDir := t.TempDir()
++	indexDir := t.TempDir()
++
++	if err := os.WriteFile(filepath.Join(alphaDir, "alpha.txt"), []byte("alphaneedle\n"), 0o644); err != nil {
++		t.Fatal(err)
++	}
++	if err := os.WriteFile(filepath.Join(betaDir, "beta.txt"), []byte("betaneedle\n"), 0o644); err != nil {
++		t.Fatal(err)
++	}
++
++	metaFile := filepath.Join(indexDir, "repo.meta")
++	if err := os.WriteFile(metaFile, []byte(`{"Name":"shared-repo","Branches":[{"Name":"main","Version":"0123456789abcdef0123456789abcdef01234567"}]}`), 0o644); err != nil {
++		t.Fatal(err)
++	}
++
++	runZoektIndex09e2ba(t, "-index", indexDir, "-disable_ctags", "-meta", metaFile, alphaDir, betaDir)
++
++	if got := searchNames09e2ba(t, indexDir, "alphaneedle"); len(got) != 1 {
++		t.Errorf("alpha.txt from the first directory should still be searchable after indexing a second directory under the same name, got matches: %v", got)
++	}
++	if got := searchNames09e2ba(t, indexDir, "betaneedle"); len(got) != 1 {
++		t.Errorf("beta.txt from the second directory should be searchable, got matches: %v", got)
++	}
++
++	// Both directories' content must be attributed to the one name they
++	// were deliberately given, not merely be findable somewhere.
++	for _, needle := range []string{"alphaneedle", "betaneedle"} {
++		if got := searchRepoNames09e2ba(t, indexDir, needle); len(got) != 1 || got[0] != "shared-repo" {
++			t.Errorf("%s should be indexed under repository %q, got repositories: %v", needle, "shared-repo", got)
++		}
++	}
++}
++
++// TestIndexArgDefaultNameCollisionMergesDirectories covers the no -meta
++// variant from the same issue: two directories that happen to share a
++// basename (so both fall back to the same default repository name) must
++// also both remain searchable, not just the last one indexed.
++func TestIndexArgDefaultNameCollisionMergesDirectories(t *testing.T) {
++	root := t.TempDir()
++	firstParent := filepath.Join(root, "first")
++	secondParent := filepath.Join(root, "second")
++	if err := os.MkdirAll(firstParent, 0o755); err != nil {
++		t.Fatal(err)
++	}
++	if err := os.MkdirAll(secondParent, 0o755); err != nil {
++		t.Fatal(err)
++	}
++
++	// Both directories are named "src", so zoekt-index's default naming
++	// (filepath.Base(dir)) collides even without an explicit -meta name.
++	firstSrc := filepath.Join(firstParent, "src")
++	secondSrc := filepath.Join(secondParent, "src")
++	if err := os.Mkdir(firstSrc, 0o755); err != nil {
++		t.Fatal(err)
++	}
++	if err := os.Mkdir(secondSrc, 0o755); err != nil {
++		t.Fatal(err)
++	}
++	if err := os.WriteFile(filepath.Join(firstSrc, "one.txt"), []byte("oneneedle\n"), 0o644); err != nil {
++		t.Fatal(err)
++	}
++	if err := os.WriteFile(filepath.Join(secondSrc, "two.txt"), []byte("twoneedle\n"), 0o644); err != nil {
++		t.Fatal(err)
++	}
++
++	indexDir := t.TempDir()
++	runZoektIndex09e2ba(t, "-index", indexDir, "-disable_ctags", firstSrc, secondSrc)
++
++	if got := searchNames09e2ba(t, indexDir, "oneneedle"); len(got) != 1 {
++		t.Errorf("one.txt from the first \"src\" directory should still be searchable, got matches: %v", got)
++	}
++	if got := searchNames09e2ba(t, indexDir, "twoneedle"); len(got) != 1 {
++		t.Errorf("two.txt from the second \"src\" directory should be searchable, got matches: %v", got)
++	}
++	// Surviving somewhere is not enough: both directories derive the name
++	// "src", so both must be searchable under exactly that name. Content
++	// preserved under some other name would still be lost to anyone
++	// querying the repository it belongs to.
++	for _, needle := range []string{"oneneedle", "twoneedle"} {
++		if got := searchRepoNames09e2ba(t, indexDir, needle); len(got) != 1 || got[0] != "src" {
++			t.Errorf("%s should be indexed under repository %q, got repositories: %v", needle, "src", got)
++		}
++	}
++}
++
++// TestIndexArgPartialFailureLeavesOldShardIntact covers the partial-failure
++// policy for a shared-name group: if one of several directories merged
++// under one repository name fails (here, because it does not exist), the
++// whole group must not be finished with only a partial result, and any
++// shard that already existed for that name from an earlier, successful
++// run must be left completely untouched rather than replaced by a
++// half-indexed one.
++func TestIndexArgPartialFailureLeavesOldShardIntact(t *testing.T) {
++	indexDir := t.TempDir()
++	metaFile := filepath.Join(indexDir, "repo.meta")
++	if err := os.WriteFile(metaFile, []byte(`{"Name":"mixed-repo","Branches":[{"Name":"main","Version":"0123456789abcdef0123456789abcdef01234567"}]}`), 0o644); err != nil {
++		t.Fatal(err)
++	}
++
++	// First, a normal successful run establishes a real shard for
++	// "mixed-repo".
++	originalDir := t.TempDir()
++	if err := os.WriteFile(filepath.Join(originalDir, "original.txt"), []byte("originalneedle\n"), 0o644); err != nil {
++		t.Fatal(err)
++	}
++	runZoektIndex09e2ba(t, "-index", indexDir, "-disable_ctags", "-meta", metaFile, originalDir)
++	if got := searchNames09e2ba(t, indexDir, "originalneedle"); len(got) != 1 {
++		t.Fatalf("original.txt should be searchable after the first run, got matches: %v", got)
++	}
++
++	// Now re-index "mixed-repo" from two directories, one of which does not
++	// exist: this should fail, and the fact that the OTHER directory in
++	// the same invocation indexed successfully before the failure must not
++	// cause a partial replacement of the existing shard.
++	before := shardSnapshot09e2ba(t, indexDir)
++
++	newDir := t.TempDir()
++	if err := os.WriteFile(filepath.Join(newDir, "new.txt"), []byte("newneedle\n"), 0o644); err != nil {
++		t.Fatal(err)
++	}
++	missingDir := filepath.Join(t.TempDir(), "does-not-exist")
++
++	out, err := runZoektIndexAllowError09e2ba(t, "-index", indexDir, "-disable_ctags", "-meta", metaFile, newDir, missingDir)
++	if err == nil {
++		t.Fatalf("expected zoekt-index to fail when one of the merged directories does not exist, output:\n%s", out)
++	}
++
++	if got := searchNames09e2ba(t, indexDir, "originalneedle"); len(got) != 1 {
++		t.Errorf("original.txt from the earlier successful run should still be searchable after the failed re-index, got matches: %v", got)
++	}
++	if got := searchNames09e2ba(t, indexDir, "newneedle"); len(got) != 0 {
++		t.Errorf("new.txt should NOT be searchable: its group was never finished because a sibling directory in the same invocation failed, got matches: %v", got)
++	}
++	if after := shardSnapshot09e2ba(t, indexDir); !reflect.DeepEqual(before, after) {
++		t.Errorf("the shards published by the earlier successful run must be left completely untouched by the failed run: before %v, after %v", before, after)
++	}
++}
++
++// TestIndexArgUnrelatedNameStillFinishesWhenSharedGroupFails covers the
++// blast radius of a partial failure for zoekt-index: when one name's
++// directories fail and that whole name is rolled back, an unrelated name
++// indexed later in the same invocation must still be finished and
++// published, rather than being dragged down with it or never being
++// reached at all.
++func TestIndexArgUnrelatedNameStillFinishesWhenSharedGroupFails(t *testing.T) {
++	root := t.TempDir()
++
++	// Two directories whose derived names both come out as "dup": one
++	// real, and one that doesn't exist, so that name's group fails
++	// partway through.
++	dupOK := filepath.Join(root, "a", "dup")
++	if err := os.MkdirAll(dupOK, 0o755); err != nil {
++		t.Fatal(err)
++	}
++	if err := os.WriteFile(filepath.Join(dupOK, "dup.txt"), []byte("dupneedle\n"), 0o644); err != nil {
++		t.Fatal(err)
++	}
++	dupMissing := filepath.Join(root, "b", "dup")
++
++	// A third directory whose name collides with nothing, listed after
++	// the failing one, which must survive the failure untouched.
++	soloDir := filepath.Join(root, "solo")
++	if err := os.MkdirAll(soloDir, 0o755); err != nil {
++		t.Fatal(err)
++	}
++	if err := os.WriteFile(filepath.Join(soloDir, "solo.txt"), []byte("soloneedle\n"), 0o644); err != nil {
++		t.Fatal(err)
++	}
++
++	indexDir := t.TempDir()
++	out, err := runZoektIndexAllowError09e2ba(t, "-index", indexDir, "-disable_ctags", dupOK, dupMissing, soloDir)
++	if err == nil {
++		t.Fatalf("expected zoekt-index to report the missing directory, output:\n%s", out)
++	}
++
++	if got := searchNames09e2ba(t, indexDir, "dupneedle"); len(got) != 0 {
++		t.Errorf("dupneedle should NOT be published: its name had a failing sibling directory, got matches: %v", got)
++	}
++	if got := searchNames09e2ba(t, indexDir, "soloneedle"); len(got) != 1 {
++		t.Errorf("soloneedle should still be indexed: an unrelated name in the same invocation must still finish, got matches: %v", got)
++	}
++	if got := searchRepoNames09e2ba(t, indexDir, "soloneedle"); len(got) != 1 || got[0] != "solo" {
++		t.Errorf("soloneedle should be indexed under repository %q, got repositories: %v", "solo", got)
++	}
++}
++
++// TestIndexArgDuplicatePathAcrossMergedDirectoriesRejected covers the
++// duplicate relative-path policy: when two directories merged under one
++// repository name both produce a document at the same relative path, the
++// whole group is rejected rather than silently keeping one version of the
++// file and dropping the other, or silently indexing both under the same
++// path.
++func TestIndexArgDuplicatePathAcrossMergedDirectoriesRejected(t *testing.T) {
++	// The collision is exercised at a root path and at a nested one, so a
++	// fix cannot special-case a single well-known filename.
++	for _, collidingPath := range []string{"shared.txt", "nested/collision.go"} {
++		t.Run(collidingPath, func(t *testing.T) {
++			indexDir := t.TempDir()
++			metaFile := filepath.Join(indexDir, "repo.meta")
++			if err := os.WriteFile(metaFile, []byte(`{"Name":"dup-repo","Branches":[{"Name":"main","Version":"0123456789abcdef0123456789abcdef01234567"}]}`), 0o644); err != nil {
++				t.Fatal(err)
++			}
++
++			firstDir := t.TempDir()
++			secondDir := t.TempDir()
++			for dir, content := range map[string]string{firstDir: "firstcontent\n", secondDir: "secondcontent\n"} {
++				full := filepath.Join(dir, filepath.FromSlash(collidingPath))
++				if err := os.MkdirAll(filepath.Dir(full), 0o755); err != nil {
++					t.Fatal(err)
++				}
++				if err := os.WriteFile(full, []byte(content), 0o644); err != nil {
++					t.Fatal(err)
++				}
++			}
++
++			out, err := runZoektIndexAllowError09e2ba(t, "-index", indexDir, "-disable_ctags", "-meta", metaFile, firstDir, secondDir)
++			if err == nil {
++				t.Fatalf("expected zoekt-index to fail when two merged directories both write %s, output:\n%s", collidingPath, out)
++			}
++
++			for _, needle := range []string{"firstcontent", "secondcontent"} {
++				if got := searchNames09e2ba(t, indexDir, needle); len(got) != 0 {
++					t.Errorf("%s should not be searchable: the whole group was rejected on the duplicate path, got matches: %v", needle, got)
++				}
++			}
++
++			// Control: remove the collision and change nothing else. The
++			// same invocation must now succeed and publish both inputs,
++			// which ties the rejection above to the duplicate relative
++			// path itself rather than to any incidental failure, without
++			// constraining how it is reported.
++			renamed := filepath.Join(secondDir, filepath.FromSlash(path.Dir(collidingPath)), "distinct"+path.Ext(collidingPath))
++			if err := os.Rename(filepath.Join(secondDir, filepath.FromSlash(collidingPath)), renamed); err != nil {
++				t.Fatal(err)
++			}
++			controlOut, err := runZoektIndexAllowError09e2ba(t, "-index", indexDir, "-disable_ctags", "-meta", metaFile, firstDir, secondDir)
++			if err != nil {
++				t.Fatalf("once the duplicate path is gone the same invocation must succeed, got %v, output:\n%s", err, controlOut)
++			}
++			for _, needle := range []string{"firstcontent", "secondcontent"} {
++				if got := searchNames09e2ba(t, indexDir, needle); len(got) == 0 {
++					t.Errorf("%s should be searchable after the collision was removed, output:\n%s", needle, controlOut)
++				}
++			}
++		})
++	}
++}
++
++// TestIndexArgConflictRollsBackAndUnrelatedNameStillPublishes drives a
++// duplicate-path conflict against a name that already has a published shard,
++// alongside an unrelated name in the same invocation. The earlier
++// publication must survive byte for byte (shard and .zoekt.meta sidecar),
++// nothing new may appear under the failed name, and the unrelated name must
++// still finish.
++func TestIndexArgConflictRollsBackAndUnrelatedNameStillPublishes(t *testing.T) {
++	root := t.TempDir()
++	indexDir := t.TempDir()
++
++	write := func(dir, name, content string) {
++		if err := os.MkdirAll(dir, 0o755); err != nil {
++			t.Fatal(err)
++		}
++		if err := os.WriteFile(filepath.Join(dir, name), []byte(content), 0o644); err != nil {
++			t.Fatal(err)
++		}
++	}
++
++	priorDir := filepath.Join(root, "prior", "conflict-repo")
++	write(priorDir, "prior.txt", "priorconflictneedle\n")
++	if out, err := runZoektIndexAllowError09e2ba(t, "-index", indexDir, "-disable_ctags", priorDir); err != nil {
++		t.Fatalf("seeding the shared name should succeed: %v\noutput:\n%s", err, out)
++	}
++	before := shardSnapshot09e2ba(t, indexDir)
++
++	oneDir := filepath.Join(root, "one", "conflict-repo")
++	twoDir := filepath.Join(root, "two", "conflict-repo")
++	soloDir := filepath.Join(root, "three", "conflict-solo")
++	write(oneDir, "same.txt", "conflictoneneedle\n")
++	write(twoDir, "same.txt", "conflicttwoneedle\n")
++	write(soloDir, "solo.txt", "conflictsoloneedle\n")
++
++	out, err := runZoektIndexAllowError09e2ba(t, "-index", indexDir, "-disable_ctags", oneDir, twoDir, soloDir)
++	if err == nil {
++		t.Fatalf("a duplicate relative path across merged inputs must fail the invocation, output:\n%s", out)
++	}
++
++	for _, needle := range []string{"conflictoneneedle", "conflicttwoneedle"} {
++		if got := searchNames09e2ba(t, indexDir, needle); len(got) != 0 {
++			t.Errorf("%s must not be published: its name group was rejected on a duplicate path, got matches: %v", needle, got)
++		}
++	}
++	if got := searchNames09e2ba(t, indexDir, "priorconflictneedle"); len(got) != 1 {
++		t.Errorf("the earlier publication under the failed name must survive, got matches: %v", got)
++	}
++	if after := shardSnapshot09e2ba(t, indexDir); !mapsContain09e2ba(after, before) {
++		t.Errorf("every artifact of the earlier publication must be byte-for-byte untouched by the failed run: before %v, after %v", before, after)
++	}
++	if got := searchNames09e2ba(t, indexDir, "conflictsoloneedle"); len(got) != 1 {
++		t.Errorf("an unrelated name in the same invocation must still finish even though another name failed on a duplicate path, got matches: %v", got)
++	}
++}
++
++// mapsContain09e2ba reports whether every entry of want survives unchanged in
++// got. The failed run may legitimately add artifacts for the unrelated name.
++func mapsContain09e2ba(got, want map[string]string) bool {
++	for k, v := range want {
++		if got[k] != v {
++			return false
++		}
++	}
++	return true
++}
++
++// TestIndexArgFailedFirstSharedGroupPublishesNothingLater is the zoekt-index
++// mirror: the nonexistent directory is listed before its valid same-name
++// sibling, so a failure that arrives first must still poison the whole name
++// group. The seeded prior publication must remain byte for byte, and an
++// unrelated name must still finish.
++func TestIndexArgFailedFirstSharedGroupPublishesNothingLater(t *testing.T) {
++	root := t.TempDir()
++	indexDir := t.TempDir()
++
++	write := func(dir, name, content string) {
++		if err := os.MkdirAll(dir, 0o755); err != nil {
++			t.Fatal(err)
++		}
++		if err := os.WriteFile(filepath.Join(dir, name), []byte(content), 0o644); err != nil {
++			t.Fatal(err)
++		}
++	}
++
++	priorDir := filepath.Join(root, "prior", "failfirst")
++	write(priorDir, "prior.txt", "failfirstpriorneedle\n")
++	if out, err := runZoektIndexAllowError09e2ba(t, "-index", indexDir, "-disable_ctags", priorDir); err != nil {
++		t.Fatalf("seeding the shared name should succeed: %v\noutput:\n%s", err, out)
++	}
++	before := shardSnapshot09e2ba(t, indexDir)
++
++	missingDir := filepath.Join(root, "missing", "failfirst")
++	validDir := filepath.Join(root, "valid", "failfirst")
++	soloDir := filepath.Join(root, "solo", "failfirst-solo")
++	write(validDir, "valid.txt", "failfirstvalidneedle\n")
++	write(soloDir, "solo.txt", "failfirstsoloneedle\n")
++
++	out, err := runZoektIndexAllowError09e2ba(t, "-index", indexDir, "-disable_ctags", missingDir, validDir, soloDir)
++	if err == nil {
++		t.Fatalf("expected zoekt-index to fail when the first input of a shared name does not exist, output:\n%s", out)
++	}
++
++	if got := searchNames09e2ba(t, indexDir, "failfirstvalidneedle"); len(got) != 0 {
++		t.Errorf("the later sibling must not be published: its name group already failed on an earlier input, got matches: %v", got)
++	}
++	if got := searchNames09e2ba(t, indexDir, "failfirstpriorneedle"); len(got) != 1 {
++		t.Errorf("the earlier publication under the failed name must survive, got matches: %v", got)
++	}
++	if after := shardSnapshot09e2ba(t, indexDir); !mapsContain09e2ba(after, before) {
++		t.Errorf("every artifact of the earlier publication must be byte-for-byte untouched: before %v, after %v", before, after)
++	}
++	if got := searchNames09e2ba(t, indexDir, "failfirstsoloneedle"); len(got) != 1 {
++		t.Errorf("an unrelated name must still finish even though another name failed on its first input, got matches: %v", got)
++	}
++}
++
++// TestIndexArgRepeatedSharedNameInvocationKeepsBothDirectories re-runs one
++// successful shared-name invocation unchanged. Only the git command has a
++// repeated-run test, so a fix that gets the first publication right but
++// corrupts the name on a later identical run would go unnoticed here. Both
++// directories are checked after each run, so a second-run regression cannot
++// hide behind the first run's result.
++func TestIndexArgRepeatedSharedNameInvocationKeepsBothDirectories(t *testing.T) {
++	alphaDir := t.TempDir()
++	betaDir := t.TempDir()
++	indexDir := t.TempDir()
++
++	if err := os.WriteFile(filepath.Join(alphaDir, "alpha.txt"), []byte("repeatixalphaneedle\n"), 0o644); err != nil {
++		t.Fatal(err)
++	}
++	if err := os.WriteFile(filepath.Join(betaDir, "beta.txt"), []byte("repeatixbetaneedle\n"), 0o644); err != nil {
++		t.Fatal(err)
++	}
++
++	metaFile := filepath.Join(indexDir, "repo.meta")
++	if err := os.WriteFile(metaFile, []byte(`{"Name":"repeat-ix-shared","Branches":[{"Name":"main","Version":"0123456789abcdef0123456789abcdef01234567"}]}`), 0o644); err != nil {
++		t.Fatal(err)
++	}
++
++	for run := 1; run <= 2; run++ {
++		runZoektIndex09e2ba(t, "-index", indexDir, "-disable_ctags", "-meta", metaFile, alphaDir, betaDir)
++
++		for _, needle := range []string{"repeatixalphaneedle", "repeatixbetaneedle"} {
++			if got := searchNames09e2ba(t, indexDir, needle); len(got) != 1 {
++				t.Errorf("run %d: %s should be searchable after re-indexing the same directories under the same name, got matches: %v", run, needle, got)
++				continue
++			}
++			if got := searchRepoNames09e2ba(t, indexDir, needle); len(got) != 1 || got[0] != "repeat-ix-shared" {
++				t.Errorf("run %d: %s should be indexed under repository %q, got repositories: %v", run, needle, "repeat-ix-shared", got)
++			}
++		}
++	}
++}
++
++// TestIndexArgIdenticalContentDuplicatePathRejected is the zoekt-index
++// mirror of the identical-bytes collision case: the conflict a merged name
++// owes its inputs is about the relative path they would each write, not
++// about whether the two files disagree, so a check that compares contents
++// before reporting one still lets a file silently stand in for another.
++func TestIndexArgIdenticalContentDuplicatePathRejected(t *testing.T) {
++	indexDir := t.TempDir()
++	metaFile := filepath.Join(indexDir, "repo.meta")
++	if err := os.WriteFile(metaFile, []byte(`{"Name":"identical-dup-ix","Branches":[{"Name":"main","Version":"0123456789abcdef0123456789abcdef01234567"}]}`), 0o644); err != nil {
++		t.Fatal(err)
++	}
++
++	firstDir := t.TempDir()
++	secondDir := t.TempDir()
++	for _, dir := range []string{firstDir, secondDir} {
++		if err := os.WriteFile(filepath.Join(dir, "shared.txt"), []byte("identicalcollisionneedle\n"), 0o644); err != nil {
++			t.Fatal(err)
++		}
++	}
++
++	out, err := runZoektIndexAllowError09e2ba(t, "-index", indexDir, "-disable_ctags", "-meta", metaFile, firstDir, secondDir)
++	if err == nil {
++		t.Fatalf("two merged directories both writing shared.txt must be an explicit conflict for that name even when the two files hold identical bytes, output:\n%s", out)
++	}
++	if got := searchNames09e2ba(t, indexDir, "identicalcollisionneedle"); len(got) != 0 {
++		t.Errorf("a name group rejected on a duplicate relative path must publish none of its inputs, got matches: %v\noutput:\n%s", got, out)
++	}
++}
++
++// TestIndexArgRepeatedPositionalInputWithSiblingLosesNothing is the
++// zoekt-index mirror of the git command's repeated-input case: one
++// directory listed twice alongside a second directory resolving to the
++// same name. Each positional argument is its own input, so the repeated
++// occurrence writes the same relative paths under the name a second time
++// and must be an explicit conflict for it, not a silent collapse.
++func TestIndexArgRepeatedPositionalInputWithSiblingLosesNothing(t *testing.T) {
++	root := t.TempDir()
++	repeatedDir := filepath.Join(root, "a", "shared")
++	siblingDir := filepath.Join(root, "b", "shared")
++	for dir, content := range map[string]string{repeatedDir: "repeatalphaneedle\n", siblingDir: "repeatbetaneedle\n"} {
++		if err := os.MkdirAll(dir, 0o755); err != nil {
++			t.Fatal(err)
++		}
++		name := "alpha.txt"
++		if dir == siblingDir {
++			name = "beta.txt"
++		}
++		if err := os.WriteFile(filepath.Join(dir, name), []byte(content), 0o644); err != nil {
++			t.Fatal(err)
++		}
++	}
++
++	indexDir := t.TempDir()
++	out, err := runZoektIndexAllowError09e2ba(t, "-index", indexDir, "-disable_ctags", repeatedDir, repeatedDir, siblingDir)
++
++	alpha := len(searchNames09e2ba(t, indexDir, "repeatalphaneedle"))
++	beta := len(searchNames09e2ba(t, indexDir, "repeatbetaneedle"))
++
++	if err == nil {
++		t.Fatalf("listing the same input twice writes every one of its relative paths under the name a second time, which must be reported as an explicit conflict rather than silently collapsed, output:\n%s", out)
++	}
++	if alpha != 0 || beta != 0 {
++		t.Errorf("a name group rejected on a duplicate relative path must publish none of its inputs, got repeatalphaneedle=%d repeatbetaneedle=%d\noutput:\n%s", alpha, beta, out)
++	}
++}
+diff --git a/test.sh b/test.sh
+new file mode 100755
+index 00000000..6a06cc4a
+--- /dev/null
++++ b/test.sh
+@@ -0,0 +1,84 @@
++#!/usr/bin/env bash
++# Test runner for zoekt-index and zoekt-git-index shard-loss and
++# repository-name collision regressions.
++#
++# Usage:
++#   ./test.sh [--output_path <junit.xml>] <base|new>
++#
++# base  runs the pre-existing regression suites for the areas this change
++#       touches (cmd/zoekt-index's own tests, plus the full gitindex and
++#       index package suites, since this change also touches production
++#       code there).
++# new   runs the regression tests for shared-name merging: partial failure
++#       and rollback, unrelated-name continuation, incremental skipping,
++#       delta rejection, duplicate paths, repeated invocations, submodule
++#       metadata, and per-repository name resolution, for both commands.
++set -uo pipefail
++
++cd /app
++
++OUTPUT_PATH=""
++if [ "${1:-}" = "--output_path" ]; then
++  OUTPUT_PATH="$2"
++  shift 2
++fi
++
++MODE="${1:-new}"
++
++TEST_LOG="$(mktemp)"
++STATUS=0
++
++run_tests() {
++  regex="$1"
++  shift
++  go test -count=1 -v -run "$regex" "$@" 2>&1 | tee -a "$TEST_LOG"
++  status=${PIPESTATUS[0]}
++  if [ "$status" -ne 0 ]; then
++    STATUS=$status
++  fi
++}
++
++case "$MODE" in
++  base)
++    run_tests '^(TestIndexArgAttachesConfiguredBranches|TestIndexArgIndexesSymlinkTarget)$' ./cmd/zoekt-index/...
++    # TestGitIndexMultiBranchSamePathWithinOneRepoNotRejected,
++    # TestGitIndexDeltaRequestedWithDistinctConfigNamesBothIndexed, and
++    # TestGitIndexDeltaWithExplicitMetaStillHonorsConfigResolvedNames are
++    # regression guards, not new-behavior tests: a single repository
++    # indexing the same path with different content on two branches, and
++    # two repositories that share only a provisional derived basename (or
++    # even an explicit -meta name) while their own git config resolves
++    # them to distinct names, are all pre-existing, unchanged-outcome
++    # scenarios that must keep working - these pass both before and after
++    # this change.
++    run_tests '^(TestGitIndexMultiBranchSamePathWithinOneRepoNotRejected|TestGitIndexDeltaRequestedWithDistinctConfigNamesBothIndexed|TestGitIndexDeltaWithExplicitMetaStillHonorsConfigResolvedNames)$' ./cmd/zoekt-git-index/...
++    run_tests '.*' ./gitindex/...
++    run_tests '.*' ./index/...
++    ;;
++  new)
++    run_tests '^(TestIndexArgSharedNameMergesDirectories|TestIndexArgDefaultNameCollisionMergesDirectories|TestIndexArgPartialFailureLeavesOldShardIntact|TestIndexArgDuplicatePathAcrossMergedDirectoriesRejected|TestIndexArgUnrelatedNameStillFinishesWhenSharedGroupFails|TestIndexArgConflictRollsBackAndUnrelatedNameStillPublishes|TestIndexArgFailedFirstSharedGroupPublishesNothingLater|TestIndexArgRepeatedSharedNameInvocationKeepsBothDirectories|TestIndexArgIdenticalContentDuplicatePathRejected|TestIndexArgRepeatedPositionalInputWithSiblingLosesNothing)$' ./cmd/zoekt-index/...
++    run_tests '^(TestGitIndexDistinctReposWithoutMetaGetOwnNames|TestGitIndexSharedMetaNameMergesBothRepos|TestGitIndexPartialFailureLeavesOldSharedShardIntact|TestGitIndexIncrementalSkipDoesNotDropUnchangedSibling|TestGitIndexRequestedDeltaWithMergedInputsDoesNotLoseData|TestGitIndexDuplicatePathAcrossMergedReposRejected|TestGitIndexRepoWithSubmoduleMergesWithPlainSibling|TestGitIndexMultiBranchRepoMergedWithSiblingKeepsAllContent|TestGitIndexUnrelatedNameStillFinishesWhenSharedGroupFails|TestGitIndexRepeatedSharedNameInvocationKeepsBothRepos|TestGitIndexSubmoduleInputMergedAfterPlainSiblingKeepsSubmodule|TestGitIndexDivergentBranchSetsNeverSilentlyLoseData|TestGitIndexConflictRollsBackAndUnrelatedNameStillPublishes|TestGitIndexFailedFirstSharedGroupPublishesNothingLater|TestGitIndexIdenticalContentDuplicatePathRejected|TestGitIndexDeltaWithMergedInputsAndNoPriorShardDoesNotLoseData|TestGitIndexMergedSubmoduleBranchMetadataStaysSearchable|TestGitIndexDeltaEligibleSharedNameDoesNotStackOnOldShard|TestGitIndexRepeatedPositionalInputWithSiblingLosesNothing)$' ./cmd/zoekt-git-index/...
++    ;;
++  *)
++    echo "unknown mode: $MODE (expected base or new)" >&2
++    exit 2
++    ;;
++esac
++
++if [ -n "$OUTPUT_PATH" ]; then
++  # Fail closed: if the JUnit report can't be produced, that's a real
++  # failure of this run, not something to swallow - a caller relying on
++  # $OUTPUT_PATH would otherwise read a missing or truncated report as
++  # "no failures".
++  go-junit-report -set-exit-code < "$TEST_LOG" > "$OUTPUT_PATH"
++  junit_status=$?
++  # -set-exit-code also reports non-zero when the log itself contains test
++  # failures, which STATUS has already recorded; only a conversion failure
++  # on an otherwise green run is new information.
++  if [ "$junit_status" -ne 0 ] && [ "$STATUS" -eq 0 ]; then
++    echo "go-junit-report failed to convert the test log (exit $junit_status)" >&2
++    STATUS=$junit_status
++  fi
++fi
++
++exit "$STATUS"

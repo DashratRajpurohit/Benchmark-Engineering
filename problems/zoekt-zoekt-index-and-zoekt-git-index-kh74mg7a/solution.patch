@@ -1,0 +1,1343 @@
+diff --git a/buildgroup/buildgroup.go b/buildgroup/buildgroup.go
+new file mode 100644
+index 00000000..4ef442b4
+--- /dev/null
++++ b/buildgroup/buildgroup.go
+@@ -0,0 +1,272 @@
++// Package buildgroup provides Group, a way to safely index several inputs
++// that may resolve to the same zoekt repository name into one
++// index.Builder per name, finishing (or abandoning) each builder exactly
++// once.
++//
++// It exists because index.Builder.Finish deletes every existing
++// (non-delta) shard for its repository name before writing new ones:
++// giving each input its own Builder for a shared name means the second
++// builder's Finish call destroys the first builder's freshly written
++// shard, silently losing that input's files. See
++// https://github.com/sourcegraph/zoekt/issues/1133.
++//
++// Group is used by both cmd/zoekt-index (whose positional directories can
++// collide on name, explicitly via -meta or implicitly via a shared
++// basename) and cmd/zoekt-git-index (whose repository arguments can
++// collide the same way).
++package buildgroup
++
++import (
++	"errors"
++	"fmt"
++
++	"github.com/sourcegraph/zoekt/index"
++)
++
++// Group indexes multiple inputs that may share a repository name into one
++// Builder per name.
++//
++// The zero value is not usable; construct one with New.
++type Group struct {
++	entries map[string]*entry
++}
++
++type entry struct {
++	builder        *index.Builder
++	requestedDelta bool
++	abandoned      bool
++	// declared counts the inputs a caller promised, up front, that it
++	// will process under this name (see Declare). reserved counts the
++	// inputs that have actually reached Reserve (or Builder) so far.
++	// They are tracked separately because Declare deliberately runs
++	// before any input is processed, and must not by itself look like a
++	// reservation - otherwise a single-input delta build would be
++	// rejected as colliding with its own declaration.
++	declared int
++	reserved int
++	// pathOwner maps a relative path already added under this name to the
++	// inputID that added it, so that CheckPath can tell a path repeated by
++	// the same input (allowed - for example the same git repository
++	// indexing the same path on two branches) from a path contributed by
++	// two different inputs merged under this name (a conflict).
++	pathOwner map[string]string
++}
++
++// New returns an empty Group.
++func New() *Group {
++	return &Group{entries: map[string]*entry{}}
++}
++
++// Reserve declares that a new input is about to be processed for name,
++// before any fallible per-input work happens (opening a directory,
++// opening a git repository, and so on). Callers should call Reserve for
++// every input before doing that fallible work, so that a failure which
++// happens before a Builder even exists can still be rolled back with
++// Abandon instead of leaving a previous input's builder to be finished
++// (and published) on its own with only a partial result.
++//
++// requestedDelta records whether this particular input was asked to run
++// as a delta build, before any internal fallback (for example, a delta
++// build whose preconditions aren't met and so runs as a normal build
++// instead) can change that. A delta build stacks incremental changes
++// onto one specific existing repository's shards, so it can never be
++// merged with another input under the same name - Reserve returns an
++// error if name already has an input in this group and either that
++// input or this one requested a delta build, even if a later fallback
++// would otherwise have made this particular input non-delta.
++//
++// Reserve also returns an error if name was already abandoned (see
++// Abandon) in this group.
++func (g *Group) Reserve(name string, requestedDelta bool) error {
++	e, ok := g.entries[name]
++	if !ok {
++		g.entries[name] = &entry{requestedDelta: requestedDelta, reserved: 1}
++		return nil
++	}
++	if e.abandoned {
++		return fmt.Errorf("buildgroup: %q was already abandoned in this group", name)
++	}
++	// Only an input that actually reached Reserve counts as a collision;
++	// a name that merely exists because it was Declare'd has no input
++	// behind it yet.
++	if e.reserved > 0 && (e.requestedDelta || requestedDelta) {
++		return fmt.Errorf("buildgroup: %q has more than one input in a delta build; delta builds cannot merge multiple inputs under one repository name", name)
++	}
++	e.reserved++
++	if requestedDelta {
++		e.requestedDelta = true
++	}
++	return nil
++}
++
++// Declare tells the group, before any input is processed, that the caller
++// intends to process one more input under name. Callers that can know
++// their full set of names up front should Declare every one of them
++// before indexing anything, which is what lets MayIncrementallySkip give
++// a safe answer.
++//
++// Declare is purely informational: it never reserves an input, never
++// conflicts with a delta build, and a caller that skips it entirely still
++// gets correct (merely more conservative) behavior.
++func (g *Group) Declare(name string) {
++	e, ok := g.entries[name]
++	if !ok {
++		e = &entry{}
++		g.entries[name] = e
++	}
++	e.declared++
++}
++
++// MayIncrementallySkip reports whether an input under name may safely
++// decide, on its own, that it has nothing to do and skip indexing
++// entirely.
++//
++// That is only safe when name has exactly one input in this group. If a
++// name has several, a skipped input contributes nothing to the shared
++// builder, while a changed sibling still finishes it - and because that
++// Finish replaces every shard for the name, the skipped input's content
++// is permanently lost even though nothing failed and nothing was
++// reported.
++//
++// The answer is deliberately conservative: a name the group was never
++// told about returns false, so a caller that passes a Group without
++// declaring its names gets no incremental skipping rather than silent
++// data loss. Skipping is a performance optimization; losing a shard is
++// not a tradeoff worth making by default.
++func (g *Group) MayIncrementallySkip(name string) bool {
++	e, ok := g.entries[name]
++	return ok && e.declared == 1
++}
++
++// Builder returns the Builder registered under
++// opts.RepositoryDescription.Name in g, creating it with
++// index.NewBuilder(opts) on first use. Later calls for the same name
++// return the same Builder; opts.SubRepositories and
++// opts.RepositoryDescription.Branches from every call are merged into
++// the builder so that submodules and branches discovered by a later
++// input are represented too, but other per-input differences (source,
++// and so on) belong on the data passed to Builder.Add, not on opts.
++//
++// Callers should call Reserve for name before Builder, so that a delta
++// collision or an abandoned name is caught before this call does any
++// work; Builder itself no longer decides whether a delta build may be
++// merged with another input, since by the time Builder runs a delta
++// build may already have silently fallen back to a normal build.
++func (g *Group) Builder(opts index.Options) (*index.Builder, error) {
++	name := opts.RepositoryDescription.Name
++	e, ok := g.entries[name]
++	if !ok {
++		// The caller skipped Reserve; there is nothing yet to collide
++		// with, so just reserve now.
++		e = &entry{requestedDelta: opts.IsDelta, reserved: 1}
++		g.entries[name] = e
++	}
++	if e.abandoned {
++		return nil, fmt.Errorf("buildgroup: %q was already abandoned in this group", name)
++	}
++	if e.builder == nil {
++		b, err := index.NewBuilder(opts)
++		if err != nil {
++			return nil, err
++		}
++		e.builder = b
++		return b, nil
++	}
++	if err := e.builder.MergeSubRepositories(opts.SubRepositories); err != nil {
++		return nil, err
++	}
++	if err := e.builder.MergeBranches(opts.RepositoryDescription.Branches); err != nil {
++		return nil, err
++	}
++	return e.builder, nil
++}
++
++// CheckPath records that path is about to be added as a document under
++// name by inputID, and returns an error if a document at the same
++// relative path was already recorded for name by a different inputID.
++// This is the group's duplicate relative-path policy for merged inputs:
++// two different inputs that resolve to the same repository name but
++// write to the same relative path (for example, both have a README.md at
++// their root) are treated as a conflict for that name, rather than
++// silently keeping one and dropping the other, or silently indexing both
++// under the same path. A single input revisiting its own path (for
++// example the same git repository indexing the same file on two
++// branches) is not a conflict and is not an error.
++//
++// inputID should identify the input a document came from (for example, a
++// directory argument, or a git repository's directory) - not the branch
++// or version a document came from within that input.
++//
++// Callers that may merge more than one input under a name should call
++// CheckPath for every document before adding it to the Builder returned
++// by Builder for that name. CheckPath itself does not touch the Builder;
++// on error, the caller decides how to respond (typically Abandon).
++func (g *Group) CheckPath(name, inputID, path string) error {
++	e, ok := g.entries[name]
++	if !ok {
++		return fmt.Errorf("buildgroup: CheckPath(%q, ...) called before Builder(%q, ...)", name, name)
++	}
++	if e.pathOwner == nil {
++		e.pathOwner = map[string]string{}
++	}
++	if owner, seen := e.pathOwner[path]; seen {
++		if owner != inputID {
++			return fmt.Errorf("buildgroup: path %q was added by more than one input merged under repository name %q", path, name)
++		}
++		return nil
++	}
++	e.pathOwner[path] = inputID
++	return nil
++}
++
++// Abandon gives up on the builder registered under name, if any: any
++// temporary shard data it already wrote is cleaned up (via
++// index.Builder.Abort), and the on-disk shards for name from a previous
++// index run are left completely untouched. Use this when one of several
++// inputs sharing name has failed, so the group's shards for that name are
++// not finished (and therefore not replaced) with only a partial result.
++// This also applies to a name that was Reserve'd but never got as far as
++// Builder, or to a name that was never even Reserve'd (for example, an
++// input that failed before it could resolve its own name and report it
++// accurately): there is no builder to abort in either case, but name is
++// still marked abandoned so a sibling input under the same name -
++// including one processed later that successfully Reserves it - can't be
++// finished (and published) on its own, leaving only a partial result for
++// a name that was supposed to be rolled back entirely.
++//
++// It is safe to call Abandon more than once, or for a name that was never
++// registered. After Abandon, further Reserve or Builder calls for the
++// same name return an error.
++func (g *Group) Abandon(name string) error {
++	e, ok := g.entries[name]
++	if !ok {
++		g.entries[name] = &entry{abandoned: true}
++		return nil
++	}
++	if e.abandoned {
++		return nil
++	}
++	e.abandoned = true
++	if e.builder == nil {
++		return nil
++	}
++	return e.builder.Abort()
++}
++
++// FinishAll calls Finish on every builder in the group that was not
++// abandoned, attempting every one even if an earlier one errors, and
++// returns every error encountered joined together (nil if there were
++// none). An entry that was Reserve'd but never reached Builder (and was
++// never abandoned either) has no builder and is skipped.
++func (g *Group) FinishAll() error {
++	var errs []error
++	for _, e := range g.entries {
++		if e.abandoned || e.builder == nil {
++			continue
++		}
++		if err := e.builder.Finish(); err != nil {
++			errs = append(errs, err)
++		}
++	}
++	return errors.Join(errs...)
++}
+diff --git a/cmd/zoekt-git-index/main.go b/cmd/zoekt-git-index/main.go
+index eb6df4fb..e88a0264 100644
+--- a/cmd/zoekt-git-index/main.go
++++ b/cmd/zoekt-git-index/main.go
+@@ -19,6 +19,7 @@ package main
+ import (
+ 	"encoding/json"
+ 	"flag"
++	"fmt"
+ 	"log"
+ 	"os"
+ 	"path/filepath"
+@@ -28,6 +29,7 @@ import (
+ 	"github.com/dustin/go-humanize"
+ 	"go.uber.org/automaxprocs/maxprocs"
+ 
++	"github.com/sourcegraph/zoekt/buildgroup"
+ 	"github.com/sourcegraph/zoekt/cmd"
+ 	"github.com/sourcegraph/zoekt/gitindex"
+ 	"github.com/sourcegraph/zoekt/internal/ctags"
+@@ -94,7 +96,16 @@ func run() int {
+ 		branches = strings.Split(*branchesStr, ",")
+ 	}
+ 
+-	gitRepos := map[string]string{}
++	// One entry per positional argument, in the order given. A map keyed
++	// by the cleaned path would silently collapse the same directory
++	// listed twice into a single input - hiding a repeated argument that
++	// must instead be reported as a same-relative-path conflict - and
++	// would also leave the processing order of the arguments undefined.
++	type gitInput struct {
++		dir         string
++		derivedName string
++	}
++	gitRepos := make([]gitInput, 0, len(flag.Args()))
+ 	for _, repoDir := range flag.Args() {
+ 		repoDir, err := filepath.Abs(repoDir)
+ 		if err != nil {
+@@ -109,7 +120,7 @@ func run() int {
+ 		} else {
+ 			name = strings.TrimSuffix(filepath.Base(name), ".git")
+ 		}
+-		gitRepos[repoDir] = name
++		gitRepos = append(gitRepos, gitInput{dir: repoDir, derivedName: name})
+ 	}
+ 
+ 	opts.LanguageMap = make(ctags.LanguageMap)
+@@ -130,29 +141,125 @@ func run() int {
+ 		}
+ 	}
+ 
++	// explicitName is true when -meta set a repository name up front; in
++	// that case every repository argument shares that one explicit name,
++	// matching the pre-existing behavior. Otherwise each repository gets
++	// its own name, derived per-directory into gitRepos above.
++	//
++	// The previous version of this loop instead checked whether
++	// opts.RepositoryDescription.Name was still empty on each iteration
++	// and, if so, set it to that iteration's derived name - but opts is a
++	// pointer shared across every iteration, so as soon as the first
++	// repository set it, every later repository silently reused the first
++	// repository's name too, regardless of its own directory or basename.
++	// That is a second, independent way to hit the same class of bug
++	// described in the buildgroup package and issue #1133: several
++	// repositories ending up sharing one name and therefore one builder
++	// lifecycle, without the user asking for that.
++	explicitName := opts.RepositoryDescription.Name != ""
++
++	// A repository's own git config can override its name via a
++	// "zoekt.name" setting, taking precedence over both -meta and the
++	// derived basename - so the name two repositories will actually
++	// share can only be known by opening them. Resolve every repository's
++	// effective name up front (best effort: a repository that can't even
++	// be opened falls back to its provisional name here, and the real
++	// error surfaces, and is handled, during the indexing pass below) so
++	// that forcing a full reindex for a shared name below is judged
++	// against the name repositories actually end up sharing, not the
++	// name they merely started with.
++	// The group is created before the resolution pass so every name this
++	// invocation will use can be declared up front. That declaration is
++	// what makes it safe for an individual repository to skip indexing
++	// when nothing changed: the group can only answer "is this name
++	// shared?" once it knows the whole set. See
++	// buildgroup.Group.Declare/MayIncrementallySkip.
++	group := buildgroup.New()
++	resolvedNames := make([]string, len(gitRepos))
++	for i, in := range gitRepos {
++		repoOpts := *opts
++		if !explicitName {
++			repoOpts.RepositoryDescription.Name = in.derivedName
++		}
++		resolved, err := gitindex.ResolveRepositoryName(gitindex.Options{RepoDir: in.dir, BuildOptions: repoOpts})
++		if err != nil {
++			resolved = repoOpts.RepositoryDescription.Name
++		}
++		resolvedNames[i] = resolved
++		group.Declare(resolved)
++	}
++
+ 	profiler.Init("zoekt-git-index")
++	// Repositories that resolve to the same name (via -meta, a collision
++	// between their derived per-directory names, or a collision only
++	// visible after their own git config is read) share a single builder
++	// in group, and are Finish'd exactly once. See IndexGitRepoInto and
++	// the buildgroup package for why: giving each repository its own
++	// builder for a shared name would mean a later repository's Finish
++	// call destroys an earlier repository's freshly written shard.
+ 	exitStatus := 0
+-	for dir, name := range gitRepos {
+-		if opts.RepositoryDescription.Name == "" {
+-			opts.RepositoryDescription.Name = name
+-		}
++	for i, in := range gitRepos {
++		dir := in.dir
++		repoOpts := *opts
++		// Use the name already resolved above, not the raw derived
++		// basename or even an explicit -meta name as-is: a repository's
++		// own git config overrides any caller-supplied name, explicit
++		// -meta included, so two repositories can share a derived
++		// basename or an explicit -meta name while their own git config
++		// resolves them to two distinct, non-colliding names (or vice
++		// versa). Reserve below must agree with indexGitRepo's own
++		// eventual resolution, or a repository that never collides on its
++		// real name can still be wrongly rejected as colliding on its
++		// provisional one - notably for -delta, where that means silently
++		// dropping it instead of indexing it.
++		repoOpts.RepositoryDescription.Name = resolvedNames[i]
++
++		// Whether an unchanged repository may skip indexing is decided by
++		// the group, from the names declared above, rather than here: a
++		// member of a shared name that skips contributes nothing to the
++		// shared builder while a changed sibling still finishes it, and
++		// that Finish replaces every shard for the name. Enforcing it in
++		// the group means a direct gitindex.IndexGitRepoInto caller gets
++		// the same protection instead of having to reimplement it.
++
+ 		gitOpts := gitindex.Options{
+-			BranchPrefix:                      *branchPrefix,
+-			Incremental:                       *incremental,
+-			Submodules:                        *submodules,
+-			RepoCacheDir:                      *repoCacheDir,
+-			AllowMissingBranch:                *allowMissing,
+-			BuildOptions:                      *opts,
+-			Branches:                          branches,
+-			RepoDir:                           dir,
++			BranchPrefix:       *branchPrefix,
++			Incremental:        *incremental,
++			Submodules:         *submodules,
++			RepoCacheDir:       *repoCacheDir,
++			AllowMissingBranch: *allowMissing,
++			BuildOptions:       repoOpts,
++			Branches:           branches,
++			RepoDir:            dir,
++			// Each positional occurrence is its own input, so listing the
++			// same directory twice collides with itself on every path it
++			// contains, exactly as two distinct directories sharing a
++			// path would.
++			InputID:                           fmt.Sprintf("%d:%s", i, dir),
+ 			DeltaShardNumberFallbackThreshold: *deltaShardNumberFallbackThreshold,
+ 		}
+ 
+-		if _, err := gitindex.IndexGitRepo(gitOpts); err != nil {
++		// IndexGitRepoInto reserves the repository's name in group itself
++		// (once it knows the final, config-resolved name) before doing
++		// any work that can fail, and returns that name so a failure -
++		// wherever it happens - can still be rolled back against the
++		// right group entry below.
++		name, _, err := gitindex.IndexGitRepoInto(gitOpts, group)
++		if err != nil {
+ 			log.Printf("indexGitRepo(%s, delta=%t): %v", dir, gitOpts.BuildOptions.IsDelta, err)
+ 			exitStatus = 1
++			// Give up on this repository's whole name-group rather than
++			// finishing it with only a partial result; other names in the
++			// group are unaffected.
++			if abandonErr := group.Abandon(name); abandonErr != nil {
++				log.Printf("abandoning %q after the error above: %v", name, abandonErr)
++			}
+ 		}
+ 	}
++	if err := group.FinishAll(); err != nil {
++		log.Print(err)
++		exitStatus = 1
++	}
+ 
+ 	return exitStatus
+ }
+diff --git a/cmd/zoekt-index/main.go b/cmd/zoekt-index/main.go
+index cc3aab15..88b51f2b 100644
+--- a/cmd/zoekt-index/main.go
++++ b/cmd/zoekt-index/main.go
+@@ -27,6 +27,7 @@ import (
+ 
+ 	"go.uber.org/automaxprocs/maxprocs"
+ 
++	"github.com/sourcegraph/zoekt/buildgroup"
+ 	"github.com/sourcegraph/zoekt/cmd"
+ 	"github.com/sourcegraph/zoekt/ignore"
+ 	"github.com/sourcegraph/zoekt/index"
+@@ -81,7 +82,14 @@ func (a *fileAggregator) add(path string, info os.FileInfo, err error) error {
+ 	return nil
+ }
+ 
+-func main() {
++// run contains the same logic main used to run directly. It returns the
++// process exit status instead of calling os.Exit itself, so that main can
++// still run its deferred cleanup (in particular, finalizing a requested
++// CPU profile) before the process actually exits - os.Exit does not run
++// deferred functions, so calling it from inside a function that owns a
++// pprof.StartCPUProfile/StopCPUProfile pair would leave the profile
++// unfinalized.
++func run() int {
+ 	cpuProfile := flag.String("cpu_profile", "", "write cpu profile to file")
+ 	ignoreDirs := flag.String("ignore_dirs", ".git,.hg,.svn", "comma separated list of directories to ignore.")
+ 	metaFile := flag.String("meta", "", "path to .meta JSON file with repository description")
+@@ -131,34 +139,91 @@ func main() {
+ 		}
+ 	}
+ 
+-	for _, arg := range flag.Args() {
++	// Positional directories that resolve to the same repository name (via
++	// -meta, or via the default filepath.Base(dir) naming) share a single
++	// builder in group, and are Finish'd exactly once, after every
++	// directory for that name has been indexed. A non-delta Builder.Finish
++	// deletes every existing shard for its name before installing the new
++	// ones, so running one builder per directory would mean a later
++	// directory's Finish call destroys an earlier directory's freshly
++	// written shard, silently losing that directory's files. See
++	// https://github.com/sourcegraph/zoekt/issues/1133 and the buildgroup
++	// package.
++	group := buildgroup.New()
++	exitStatus := 0
++	for i, arg := range flag.Args() {
+ 		opts.RepositoryDescription.Source = arg
+-		if err := indexArg(arg, *opts, ignoreDirMap); err != nil {
+-			log.Fatal(err)
++		// Each positional occurrence is a distinct input: the same
++		// directory listed twice must collide with itself on every path
++		// it contains rather than be treated as one input repeating.
++		name, err := indexArg(arg, fmt.Sprintf("%d:%s", i, arg), *opts, ignoreDirMap, group)
++		if err != nil {
++			log.Printf("indexing %s: %v", arg, err)
++			exitStatus = 1
++			// This directory's own group (its repository name) is left
++			// without a final shard: any other directory already merged
++			// into it has its output discarded too, rather than silently
++			// publishing a partial result under that name. Directories
++			// under other names are unaffected and are still finished
++			// below.
++			if abandonErr := group.Abandon(name); abandonErr != nil {
++				log.Printf("abandoning %q after the error above: %v", name, abandonErr)
++			}
+ 		}
+ 	}
++	if err := group.FinishAll(); err != nil {
++		log.Print(err)
++		exitStatus = 1
++	}
++	return exitStatus
++}
++
++func main() {
++	os.Exit(run())
+ }
+ 
+-func indexArg(arg string, opts index.Options, ignore map[string]struct{}) error {
++// indexArg walks arg and adds its files to the builder registered under
++// its repository name in group (creating that builder, or reusing one
++// shared with an earlier directory of the same name, via
++// buildgroup.Group.Builder). It returns the resolved repository name
++// alongside any error, so that a caller can group.Abandon the right name
++// on failure; it does not itself call Finish or Abandon, since a name's
++// builder may still be receiving documents from a later directory when
++// this call returns successfully.
++func indexArg(arg, inputID string, opts index.Options, ignore map[string]struct{}, group *buildgroup.Group) (string, error) {
+ 	dir, err := filepath.Abs(filepath.Clean(arg))
+ 	if err != nil {
+-		return err
+-	}
+-	ignoreMatcher, err := newIgnoreMatcher(dir)
+-	if err != nil {
+-		return err
++		// If the caller already set an explicit name (for example, via
++		// -meta), report that name rather than "" - it may already be
++		// Reserved by a sibling directory under this same explicit name,
++		// and the caller needs the right name to Abandon that group.
++		// Without dir, there's no way to derive an implicit name, so a
++		// caller-less failure still reports "".
++		return opts.RepositoryDescription.Name, err
+ 	}
+ 
++	// Resolve the repository name before any step that can fail, so that
++	// every error path below returns the right name for the caller to
++	// group.Abandon - including a name derived from dir when the caller
++	// didn't set one explicitly.
+ 	if opts.RepositoryDescription.Name == "" {
+ 		opts.RepositoryDescription.Name = filepath.Base(dir)
+ 	}
+-	builder, err := index.NewBuilder(opts)
++	name := opts.RepositoryDescription.Name
++
++	if err := group.Reserve(name, opts.IsDelta); err != nil {
++		return name, err
++	}
++
++	ignoreMatcher, err := newIgnoreMatcher(dir)
+ 	if err != nil {
+-		return err
++		return name, err
++	}
++
++	builder, err := group.Builder(opts)
++	if err != nil {
++		return name, err
+ 	}
+-	// we don't need to check error, since we either already have an error, or
+-	// we returning the first call to builder.Finish.
+-	defer builder.Finish() // nolint:errcheck
+ 
+ 	branches := make([]string, 0, len(opts.RepositoryDescription.Branches))
+ 	for _, branch := range opts.RepositoryDescription.Branches {
+@@ -174,22 +239,42 @@ func indexArg(arg string, opts index.Options, ignore map[string]struct{}) error
+ 		sizeMax:    int64(opts.SizeMax),
+ 	}
+ 
++	walkErr := make(chan error, 1)
+ 	go func() {
+-		if err := filepath.Walk(dir, agg.add); err != nil {
+-			log.Fatal(err)
+-		}
++		walkErr <- filepath.Walk(dir, agg.add)
+ 		close(comm)
+ 	}()
+ 
++	var loopErr error
++loop:
+ 	for f := range comm {
+-		displayName := strings.TrimPrefix(f.name, dir+"/")
++		// filepath.Rel (rather than trimming a literal "dir+/" prefix)
++		// and filepath.ToSlash give a real, slash-normalized relative
++		// path on every OS: on Windows, filepath.Walk yields paths
++		// containing '\', so a literal "/" suffix never matches and the
++		// old TrimPrefix left displayName unchanged (still holding dir's
++		// full path), which broke both indexing and CheckPath's
++		// same-relative-path conflict detection - two inputs both
++		// writing a file at the same relative path would go undetected
++		// because their untrimmed absolute paths always differed.
++		displayName, err := filepath.Rel(dir, f.name)
++		if err != nil {
++			loopErr = err
++			break loop
++		}
++		displayName = filepath.ToSlash(displayName)
++		if err := group.CheckPath(name, inputID, displayName); err != nil {
++			loopErr = err
++			break loop
++		}
+ 		if f.size > int64(opts.SizeMax) && !opts.IgnoreSizeMax(displayName) {
+ 			if err := builder.Add(index.Document{
+ 				Name:       displayName,
+ 				Branches:   branches,
+ 				SkipReason: index.SkipReasonTooLarge,
+ 			}); err != nil {
+-				return err
++				loopErr = err
++				break loop
+ 			}
+ 			continue
+ 		}
+@@ -197,14 +282,16 @@ func indexArg(arg string, opts index.Options, ignore map[string]struct{}) error
+ 		if f.isSymlink {
+ 			target, err := os.Readlink(f.name)
+ 			if err != nil {
+-				return err
++				loopErr = err
++				break loop
+ 			}
+ 			content = []byte(target)
+ 		} else {
+ 			var err error
+ 			content, err = os.ReadFile(f.name)
+ 			if err != nil {
+-				return err
++				loopErr = err
++				break loop
+ 			}
+ 		}
+ 
+@@ -213,11 +300,27 @@ func indexArg(arg string, opts index.Options, ignore map[string]struct{}) error
+ 			Content:  content,
+ 			Branches: branches,
+ 		}); err != nil {
+-			return err
++			loopErr = err
++			break loop
+ 		}
+ 	}
++	// Drain whatever's left of comm - a no-op once the loop above has
++	// consumed it all naturally, but if we broke out early on an error,
++	// the walk goroutine can otherwise be left blocked forever trying to
++	// send its next file into comm, since nothing reads it after we
++	// return. Draining lets filepath.Walk finish (or fail) and close(comm)
++	// on its own, so the goroutine doesn't leak.
++	for range comm {
++	}
++	if loopErr != nil {
++		return name, loopErr
++	}
++
++	if err := <-walkErr; err != nil {
++		return name, err
++	}
+ 
+-	return builder.Finish()
++	return name, nil
+ }
+ 
+ func newIgnoreMatcher(root string) (*ignore.Matcher, error) {
+diff --git a/cmd/zoekt-index/main_test.go b/cmd/zoekt-index/main_test.go
+index 07072f23..7a3b1818 100644
+--- a/cmd/zoekt-index/main_test.go
++++ b/cmd/zoekt-index/main_test.go
+@@ -8,6 +8,7 @@ import (
+ 	"testing"
+ 
+ 	"github.com/sourcegraph/zoekt"
++	"github.com/sourcegraph/zoekt/buildgroup"
+ 	"github.com/sourcegraph/zoekt/index"
+ 	"github.com/sourcegraph/zoekt/query"
+ 	"github.com/sourcegraph/zoekt/search"
+@@ -32,7 +33,11 @@ func TestIndexArgAttachesConfiguredBranches(t *testing.T) {
+ 		},
+ 	}
+ 	opts.SetDefaults()
+-	if err := indexArg(sourceDir, opts, nil); err != nil {
++	group := buildgroup.New()
++	if _, err := indexArg(sourceDir, sourceDir, opts, nil, group); err != nil {
++		t.Fatal(err)
++	}
++	if err := group.FinishAll(); err != nil {
+ 		t.Fatal(err)
+ 	}
+ 
+@@ -91,7 +96,11 @@ func TestIndexArgIndexesSymlinkTarget(t *testing.T) {
+ 		},
+ 	}
+ 	opts.SetDefaults()
+-	if err := indexArg(sourceDir, opts, nil); err != nil {
++	group := buildgroup.New()
++	if _, err := indexArg(sourceDir, sourceDir, opts, nil, group); err != nil {
++		t.Fatal(err)
++	}
++	if err := group.FinishAll(); err != nil {
+ 		t.Fatal(err)
+ 	}
+ 
+diff --git a/gitindex/index.go b/gitindex/index.go
+index 7b78bba8..abffac5c 100644
+--- a/gitindex/index.go
++++ b/gitindex/index.go
+@@ -40,6 +40,7 @@ import (
+ 	"github.com/go-git/go-git/v5/storage/filesystem"
+ 
+ 	"github.com/sourcegraph/zoekt"
++	"github.com/sourcegraph/zoekt/buildgroup"
+ 	"github.com/sourcegraph/zoekt/ignore"
+ 	"github.com/sourcegraph/zoekt/index"
+ 
+@@ -413,6 +414,17 @@ type Options struct {
+ 	// The repository to be indexed.
+ 	RepoDir string
+ 
++	// InputID distinguishes this particular input from every other input
++	// merged under the same repository name. The same directory listed
++	// twice on one command line is two inputs, not one, so identifying an
++	// input by its path alone would let a repeated positional argument
++	// escape the same-relative-path conflict rule: both occurrences would
++	// claim the same paths and look like one input repeating itself.
++	// Callers that can list the same directory more than once should set
++	// a distinct value per occurrence. When empty, RepoDir is used, which
++	// keeps single-occurrence callers working unchanged.
++	InputID string
++
+ 	// If set, follow submodule links. This requires RepoCacheDir to be set.
+ 	Submodules bool
+ 
+@@ -501,14 +513,93 @@ func expandBranches(repo *git.Repository, bs []string, prefix string) ([]string,
+ // updated when DryRun is set. This can be informative if doing incremental
+ // indexing.
+ func IndexGitRepo(opts Options) (bool, error) {
+-	return indexGitRepo(opts, gitIndexConfig{})
++	_, ok, err := indexGitRepo(opts, gitIndexConfig{})
++	return ok, err
++}
++
++// IndexGitRepoInto is like IndexGitRepo, but adds this repository's
++// documents to (and, on success, leaves unfinished in) the builder
++// registered under opts.BuildOptions.RepositoryDescription.Name in group,
++// instead of creating and finishing a builder of its own.
++//
++// This lets a caller that indexes multiple git repositories in one
++// invocation share a builder across repositories whose names collide,
++// using the same fix as cmd/zoekt-index for the data loss described in
++// https://github.com/sourcegraph/zoekt/issues/1133: a non-delta
++// Builder.Finish deletes every existing shard for its name, so giving each
++// repository its own builder means a later repository's Finish call
++// destroys an earlier repository's freshly written shard.
++//
++// The caller is responsible for calling group.FinishAll once every
++// repository has been processed, and group.Abandon(name) - using the
++// returned name, not whatever name the caller originally passed in, since
++// this repository's own git config can override
++// opts.BuildOptions.RepositoryDescription.Name - if IndexGitRepoInto
++// returns an error, so that a partially indexed name is not finished with
++// only some of its repositories' documents. Because a delta build stacks
++// changes onto one specific existing repository's shards,
++// IndexGitRepoInto returns an error rather than merging if
++// opts.BuildOptions.IsDelta is true and group already has another
++// repository registered under this (possibly config-resolved) name (see
++// buildgroup.Group.Reserve).
++func IndexGitRepoInto(opts Options, group *buildgroup.Group) (name string, ok bool, err error) {
++	return indexGitRepo(opts, gitIndexConfig{group: group})
++}
++
++// inputID identifies this input for buildgroup.Group.CheckPath. See
++// Options.InputID.
++func (o *Options) inputID() string {
++	if o.InputID != "" {
++		return o.InputID
++	}
++	return o.RepoDir
++}
++
++// ResolveRepositoryName determines the effective repository name
++// indexGitRepo would use for opts.RepoDir: opts.BuildOptions
++// .RepositoryDescription.Name if that's already set and the
++// repository's own git config doesn't override it via a "zoekt.name"
++// setting, or the name from that config setting otherwise. It does no
++// indexing.
++//
++// Callers that need to know in advance whether several repositories will
++// end up sharing a name - for example, to decide whether an incremental
++// build must be forced to a full rebuild for repositories that will be
++// merged under a shared name, before any of them has actually been
++// indexed - can call this first. If opts.RepoDir can't even be opened,
++// ResolveRepositoryName returns an error; callers indexing multiple
++// repositories should fall back to the caller-provided name in that case
++// and let the real error surface (and be handled) during indexing.
++func ResolveRepositoryName(opts Options) (string, error) {
++	var repo *git.Repository
++	legacyRepoOpen := cmp.Or(os.Getenv("ZOEKT_DISABLE_GOGIT_OPTIMIZATION"), "false")
++	if b, err := strconv.ParseBool(legacyRepoOpen); b || err != nil {
++		r, err := plainOpenRepo(opts.RepoDir)
++		if err != nil {
++			return "", fmt.Errorf("plainOpenRepo: %w", err)
++		}
++		repo = r
++	} else {
++		r, repoCloser, err := openRepo(opts.RepoDir)
++		if err != nil {
++			return "", fmt.Errorf("openRepo: %w", err)
++		}
++		defer repoCloser.Close()
++		repo = r
++	}
++
++	desc := opts.BuildOptions.RepositoryDescription
++	if err := setTemplatesFromRepo(&desc, repo, opts.RepoDir); err != nil {
++		log.Printf("setTemplatesFromRepo(%s): %s", opts.RepoDir, err)
++	}
++	return desc.Name, nil
+ }
+ 
+ // indexGitRepo indexes the git repository as specified by the options and the provided gitIndexConfig.
+ // The returned bool indicates whether the index was updated, or would be
+ // updated when DryRun is set. This can be informative if doing incremental
+ // indexing.
+-func indexGitRepo(opts Options, config gitIndexConfig) (bool, error) {
++func indexGitRepo(opts Options, config gitIndexConfig) (name string, ok bool, err error) {
+ 	prepareDeltaBuild := prepareDeltaBuild
+ 	if config.prepareDeltaBuild != nil {
+ 		prepareDeltaBuild = config.prepareDeltaBuild
+@@ -522,23 +613,49 @@ func indexGitRepo(opts Options, config gitIndexConfig) (bool, error) {
+ 	// Set max thresholds, since we use them in this function.
+ 	opts.BuildOptions.SetDefaults()
+ 	if opts.RepoDir == "" {
+-		return false, fmt.Errorf("gitindex: must set RepoDir")
++		return name, false, fmt.Errorf("gitindex: must set RepoDir")
+ 	}
+ 
+ 	opts.BuildOptions.RepositoryDescription.Source = opts.RepoDir
+ 
++	// name starts out as the caller-provided name (explicit -meta, or a
++	// derived basename): the best we can report if this repository fails
++	// to even open. Reserve it under that provisional name right away, so
++	// a failure to even open the repository still has something to
++	// Abandon below - this reservation is refreshed once the repository's
++	// own git config has had a chance to override the name (see below);
++	// if it turns out to differ, the provisional entry is simply left
++	// behind, unused and harmless (FinishAll skips any entry that never
++	// got a Builder).
++	name = opts.BuildOptions.RepositoryDescription.Name
++	// Decide the reservation on the name this repository will actually be
++	// published under, not on the provisional one. A -delta collision is
++	// refused outright, so refusing it against a fallback basename that
++	// the repository's own git config is about to override would drop a
++	// repository that never really collides. ResolveRepositoryName reads
++	// that config up front; if the repository can't be opened at all the
++	// provisional name stands, and the real failure surfaces below.
++	if resolved, resolveErr := ResolveRepositoryName(opts); resolveErr == nil {
++		name = resolved
++	}
++	if config.group != nil {
++		if err := config.group.Reserve(name, opts.BuildOptions.IsDelta); err != nil {
++			return name, false, err
++		}
++	}
++
+ 	var repo *git.Repository
+ 	legacyRepoOpen := cmp.Or(os.Getenv("ZOEKT_DISABLE_GOGIT_OPTIMIZATION"), "false")
+ 	if b, err := strconv.ParseBool(legacyRepoOpen); b || err != nil {
+ 		repo, err = plainOpenRepo(opts.RepoDir)
+ 		if err != nil {
+-			return false, fmt.Errorf("plainOpenRepo: %w", err)
++			return name, false, fmt.Errorf("plainOpenRepo: %w", err)
+ 		}
+ 	} else {
+ 		var repoCloser io.Closer
+ 		repo, repoCloser, err = openRepo(opts.RepoDir)
+ 		if err != nil {
+-			return false, fmt.Errorf("openRepo: %w", err)
++			return name, false, fmt.Errorf("openRepo: %w", err)
+ 		}
+ 		defer repoCloser.Close()
+ 	}
+@@ -546,10 +663,27 @@ func indexGitRepo(opts Options, config gitIndexConfig) (bool, error) {
+ 	if err := setTemplatesFromRepo(&opts.BuildOptions.RepositoryDescription, repo, opts.RepoDir); err != nil {
+ 		log.Printf("setTemplatesFromRepo(%s): %s", opts.RepoDir, err)
+ 	}
++	// The repository's own git config (a "zoekt.name" setting) can
++	// override the caller-provided name above. If it did, re-Reserve
++	// under the real, final name - the provisional reservation above
++	// doesn't transfer automatically - so a config-resolved collision
++	// between two repositories is caught even when their caller-provided
++	// names (explicit -meta, or derived basenames) didn't collide. Only
++	// do this when the name actually changed: re-Reserving the same name
++	// a second time for what is still logically the same input would
++	// look like two different inputs colliding with themselves.
++	if resolvedName := opts.BuildOptions.RepositoryDescription.Name; resolvedName != name {
++		name = resolvedName
++		if config.group != nil {
++			if err := config.group.Reserve(name, opts.BuildOptions.IsDelta); err != nil {
++				return name, false, err
++			}
++		}
++	}
+ 
+ 	branches, err := expandBranches(repo, opts.Branches, opts.BranchPrefix)
+ 	if err != nil {
+-		return false, fmt.Errorf("expandBranches: %w", err)
++		return name, false, fmt.Errorf("expandBranches: %w", err)
+ 	}
+ 	for _, b := range branches {
+ 		commit, err := getCommit(repo, opts.BranchPrefix, b)
+@@ -558,7 +692,7 @@ func indexGitRepo(opts Options, config gitIndexConfig) (bool, error) {
+ 				continue
+ 			}
+ 
+-			return false, fmt.Errorf("getCommit(%q, %q): %w", opts.BranchPrefix, b, err)
++			return name, false, fmt.Errorf("getCommit(%q, %q): %w", opts.BranchPrefix, b, err)
+ 		}
+ 
+ 		opts.BuildOptions.RepositoryDescription.Branches = append(opts.BuildOptions.RepositoryDescription.Branches, zoekt.RepositoryBranch{
+@@ -572,10 +706,24 @@ func indexGitRepo(opts Options, config gitIndexConfig) (bool, error) {
+ 	}
+ 
+ 	if opts.Incremental && opts.BuildOptions.IncrementalSkipIndexing() {
+-		return false, nil
++		// Deciding independently that there is nothing to do is only safe
++		// when this repository is the sole input for its name. When a name
++		// is shared, this repository contributes nothing to the shared
++		// builder, but a changed sibling still finishes it - and that
++		// Finish replaces every shard for the name, permanently losing
++		// this repository's content with no error reported anywhere.
++		//
++		// The group decides, rather than the caller, so that a direct
++		// IndexGitRepoInto caller cannot skip its way into publishing a
++		// partial shared-name replacement; a caller that never declared
++		// its names simply gets no skipping. See
++		// buildgroup.Group.MayIncrementallySkip.
++		if config.group == nil || config.group.MayIncrementallySkip(name) {
++			return name, false, nil
++		}
+ 	}
+ 	if opts.DryRun {
+-		return true, nil
++		return name, true, nil
+ 	}
+ 
+ 	// branch => (path, sha1) => repo.
+@@ -601,7 +749,7 @@ func indexGitRepo(opts Options, config gitIndexConfig) (bool, error) {
+ 	if !opts.BuildOptions.IsDelta {
+ 		repos, branchVersions, err = prepareNormalBuild(opts, repo)
+ 		if err != nil {
+-			return false, fmt.Errorf("preparing normal build: %w", err)
++			return name, false, fmt.Errorf("preparing normal build: %w", err)
+ 		}
+ 	}
+ 
+@@ -637,18 +785,25 @@ func indexGitRepo(opts Options, config gitIndexConfig) (bool, error) {
+ 		}
+ 	}
+ 
+-	builder, err := index.NewBuilder(opts.BuildOptions)
+-	if err != nil {
+-		return false, fmt.Errorf("build.NewBuilder: %w", err)
++	var builder *index.Builder
++	if config.group != nil {
++		builder, err = config.group.Builder(opts.BuildOptions)
++		if err != nil {
++			return name, false, err
++		}
++	} else {
++		builder, err = index.NewBuilder(opts.BuildOptions)
++		if err != nil {
++			return name, false, fmt.Errorf("build.NewBuilder: %w", err)
++		}
++		// we don't need to check error, since we either already have an error, or
++		// we returning the first call to builder.Finish.
++		defer builder.Finish() // nolint:errcheck
+ 	}
+ 
+ 	// Preparing the build can consume substantial memory, so check usage before starting to index.
+ 	builder.CheckMemoryUsage()
+ 
+-	// we don't need to check error, since we either already have an error, or
+-	// we returning the first call to builder.Finish.
+-	defer builder.Finish() // nolint:errcheck
+-
+ 	for _, f := range changedOrRemovedFiles {
+ 		builder.MarkFileAsChangedOrRemoved(f)
+ 	}
+@@ -715,23 +870,30 @@ func indexGitRepo(opts Options, config gitIndexConfig) (bool, error) {
+ 		}
+ 		cr, err := newCatfileReader(opts.RepoDir, mainRepoIDs, crOpts)
+ 		if err != nil {
+-			return false, fmt.Errorf("newCatfileReader: %w", err)
++			return name, false, fmt.Errorf("newCatfileReader: %w", err)
+ 		}
+ 
+-		if err := indexCatfileBlobs(cr, mainRepoKeys, repos, opts, builder); err != nil {
+-			return false, err
++		if err := indexCatfileBlobs(cr, mainRepoKeys, repos, opts, builder, config.group); err != nil {
++			return name, false, err
+ 		}
+ 	}
+ 
+ 	// Index submodule blobs via go-git.
++	repoName := opts.BuildOptions.RepositoryDescription.Name
+ 	for idx, key := range submoduleKeys {
+ 		doc, err := createDocument(key, repos, opts.BuildOptions)
+ 		if err != nil {
+-			return false, err
++			return name, false, err
++		}
++
++		if config.group != nil {
++			if err := config.group.CheckPath(repoName, opts.inputID(), doc.Name); err != nil {
++				return name, false, err
++			}
+ 		}
+ 
+ 		if err := builder.Add(doc); err != nil {
+-			return false, fmt.Errorf("error adding document with name %s: %w", key.FullPath(), err)
++			return name, false, fmt.Errorf("error adding document with name %s: %w", key.FullPath(), err)
+ 		}
+ 
+ 		if idx%10_000 == 0 {
+@@ -739,16 +901,27 @@ func indexGitRepo(opts Options, config gitIndexConfig) (bool, error) {
+ 		}
+ 	}
+ 
+-	return true, builder.Finish()
++	if config.group != nil {
++		// The caller owns Finish (via group.FinishAll), since this
++		// repository's builder may be shared with another repository of
++		// the same name that hasn't been processed yet.
++		return name, true, nil
++	}
++	return name, true, builder.Finish()
+ }
+ 
+ // indexCatfileBlobs streams main-repo blobs from the catfileReader into the
+ // builder. Large blobs are skipped without reading content into memory.
+ // keys must correspond 1:1 (in order) with the ids passed to newCatfileReader.
+-// The reader is always closed when this function returns.
+-func indexCatfileBlobs(cr *catfileReader, keys []fileKey, repos map[fileKey]BlobLocation, opts Options, builder *index.Builder) error {
++// The reader is always closed when this function returns. If group is not
++// nil, every document's path is checked against group's duplicate
++// relative-path policy (see buildgroup.Group.CheckPath) for
++// opts.BuildOptions.RepositoryDescription.Name before it is added.
++func indexCatfileBlobs(cr *catfileReader, keys []fileKey, repos map[fileKey]BlobLocation, opts Options, builder *index.Builder, group *buildgroup.Group) error {
+ 	defer cr.Close()
+ 
++	repoName := opts.BuildOptions.RepositoryDescription.Name
++
+ 	slab := newContentSlab(16 << 20) // 16 MB per slab
+ 
+ 	for idx, key := range keys {
+@@ -786,6 +959,12 @@ func indexCatfileBlobs(cr *catfileReader, keys []fileKey, repos map[fileKey]Blob
+ 			}
+ 		}
+ 
++		if group != nil {
++			if err := group.CheckPath(repoName, opts.inputID(), doc.Name); err != nil {
++				return err
++			}
++		}
++
+ 		if err := builder.Add(doc); err != nil {
+ 			return fmt.Errorf("error adding document with name %s: %w", key.FullPath(), err)
+ 		}
+@@ -904,6 +1083,12 @@ type gitIndexConfig struct {
+ 	//
+ 	// If prepareNormalBuild is nil, gitindex.prepareNormalBuild will be used instead.
+ 	prepareNormalBuild prepareNormalBuildFunc
++
++	// group, if not nil, is used to obtain (and share, across repositories
++	// with the same name) the index.Builder this repository's documents are
++	// added to, instead of creating and finishing a builder of its own. See
++	// IndexGitRepoInto.
++	group *buildgroup.Group
+ }
+ 
+ func prepareDeltaBuild(options Options, repository *git.Repository) (repos map[fileKey]BlobLocation, branchVersions map[string]map[string]plumbing.Hash, changedOrDeletedPaths []string, err error) {
+diff --git a/gitindex/index_test.go b/gitindex/index_test.go
+index 133a8048..7c49e47c 100644
+--- a/gitindex/index_test.go
++++ b/gitindex/index_test.go
+@@ -1074,7 +1074,7 @@ func TestIndexDeltaBasic(t *testing.T) {
+ 					}
+ 
+ 					// run test
+-					_, err := indexGitRepo(options, gitIndexConfig{
++					_, _, err := indexGitRepo(options, gitIndexConfig{
+ 						prepareDeltaBuild:  prepareDeltaSpy,
+ 						prepareNormalBuild: prepareNormalSpy,
+ 					})
+diff --git a/index/builder.go b/index/builder.go
+index d221981f..fad8fa9b 100644
+--- a/index/builder.go
++++ b/index/builder.go
+@@ -261,6 +261,21 @@ type Builder struct {
+ 	errMu      sync.Mutex
+ 	buildError error
+ 
++	// metaMu guards RepositoryDescription and SubRepositories on opts
++	// against concurrent merges from buildgroup (see MergeSubRepositories
++	// and MergeBranches) racing a background shard build's read of the
++	// same fields in newShardBuilder. It is separate from errMu because
++	// flush holds errMu for the duration of a synchronous (non-parallel)
++	// buildShard call, which itself calls newShardBuilder; reusing errMu
++	// there would deadlock.
++	metaMu sync.Mutex
++
++	// subRepoBranchVersions remembers, per subrepository path, the commit
++	// each of its own branches was resolved to, so that repeatedly
++	// realigning subrepository branch metadata against a still-growing
++	// root branch list never loses a version. Guarded by metaMu.
++	subRepoBranchVersions map[string]map[string]string
++
+ 	// temp name => final name for finished shards. We only rename
+ 	// them once all shards succeed to avoid Frankstein corpuses.
+ 	finishedShards map[string]string
+@@ -806,6 +821,178 @@ func (b *Builder) Finish() error {
+ 	return b.buildError
+ }
+ 
++// Abort stops this builder without creating a final shard or touching any
++// existing shards for its repository: any temporary shard files already
++// written by earlier flush()es (triggered by Add once the buffered size
++// crosses ShardMax) are removed, and shards from previous index runs are
++// left completely untouched. Unlike Finish, Abort never renames a
++// temporary shard into place and never deletes an old shard.
++//
++// This is meant for callers that group several inputs into one Builder
++// (see the buildgroup package) and need to give up on the whole group
++// after one of the inputs failed, without corrupting or losing the
++// previously indexed data for this repository. It is safe to call Abort
++// after some successful Add calls, and safe to call multiple times; it is
++// a no-op once Finish or Abort has already been called.
++func (b *Builder) Abort() error {
++	if b.finishCalled {
++		return nil
++	}
++	b.finishCalled = true
++
++	b.building.Wait()
++
++	for tmp := range b.finishedShards {
++		os.Remove(tmp)
++	}
++	b.finishedShards = map[string]string{}
++
++	return nil
++}
++
++// MergeSubRepositories adds every entry of sub into this Builder's
++// SubRepositories map, without discarding entries already present. It is
++// meant for callers that group several inputs into one Builder (see the
++// buildgroup package): if a later input's SubRepositories map were
++// simply ignored in favor of an earlier input's, documents from the
++// later input whose SubRepositoryPath isn't in the earlier input's map
++// would be rejected as referring to an unknown subrepo path once the
++// shard is built.
++//
++// MergeSubRepositories is safe to call concurrently with Add and with a
++// background shard build triggered by an earlier Add - it never mutates
++// the map used by a shard already being built, and it takes the same
++// lock a background build uses to read SubRepositories when starting a
++// new shard.
++func (b *Builder) MergeSubRepositories(sub map[string]*zoekt.Repository) error {
++	if len(sub) == 0 {
++		return nil
++	}
++
++	b.metaMu.Lock()
++	defer b.metaMu.Unlock()
++
++	merged := make(map[string]*zoekt.Repository, len(b.opts.SubRepositories)+len(sub))
++	for path, repo := range b.opts.SubRepositories {
++		merged[path] = repo
++	}
++	for path, repo := range sub {
++		merged[path] = repo
++	}
++	b.opts.SubRepositories = merged
++	b.alignSubRepositoryBranchesLocked()
++	return nil
++}
++
++// MergeBranches adds every branch in branches to this Builder's root
++// RepositoryDescription.Branches that isn't already present by name,
++// without discarding branches already present. It is meant for callers
++// that group several inputs into one Builder (see the buildgroup
++// package): if a later input's branches were simply ignored in favor of
++// an earlier input's, documents from the later input carrying one of
++// its own branches would be rejected at Finish, because that branch
++// isn't among the root branches the shard is being built for.
++//
++// Two different inputs merged under one repository name are, by
++// definition, two different sources of content, so it's expected (not a
++// conflict) for them to independently use the same branch name - most
++// commonly "HEAD" - pointing at their own, different commit: MergeBranches
++// keeps whichever version was recorded first for a given branch name and
++// is a no-op for a name already present, rather than erroring.
++func (b *Builder) MergeBranches(branches []zoekt.RepositoryBranch) error {
++	if len(branches) == 0 {
++		return nil
++	}
++
++	b.metaMu.Lock()
++	defer b.metaMu.Unlock()
++
++	existing := make(map[string]struct{}, len(b.opts.RepositoryDescription.Branches))
++	for _, br := range b.opts.RepositoryDescription.Branches {
++		existing[br.Name] = struct{}{}
++	}
++	for _, br := range branches {
++		if _, ok := existing[br.Name]; ok {
++			continue
++		}
++		existing[br.Name] = struct{}{}
++		b.opts.RepositoryDescription.Branches = append(b.opts.RepositoryDescription.Branches, br)
++	}
++	b.alignSubRepositoryBranchesLocked()
++	return nil
++}
++
++// alignSubRepositoryBranchesLocked restores the invariant that every
++// subrepository carries one branch entry per branch of the repository it
++// belongs to, in that repository's branch order.
++//
++// A document's branch is recorded as a position in the root branch list,
++// and a match reports its version by reading the entry at that same
++// position out of the subrepository the document belongs to. A single
++// input keeps the two lists aligned by construction, because a
++// subrepository's entries are built from the root branch list it was
++// resolved against. Merging inputs under one name breaks that: a
++// subrepository arrives knowing only the branches of the input that
++// contributed it, while the name it lands under can go on to carry the
++// union of every input's branches. Its own documents then sit at
++// positions its metadata never grew an entry for, and are silently
++// dropped from results - or read past the end of the list - depending on
++// where the branch landed in the merged order.
++//
++// Entries are filled in for branches the subrepository does not itself
++// have, so that positions line up; those entries carry no version,
++// because no document of that subrepository can be on such a branch.
++//
++// The versions a subrepository arrived with are remembered separately in
++// subRepoBranchVersions, because this runs after every merge and the root
++// branch list is still growing while it does: a subrepository contributed
++// before the branch it actually lives on has been merged would otherwise
++// have that version overwritten with a placeholder and never get it back.
++//
++// b.metaMu must be held.
++func (b *Builder) alignSubRepositoryBranchesLocked() {
++	root := b.opts.RepositoryDescription.Branches
++	if len(root) == 0 || len(b.opts.SubRepositories) == 0 {
++		return
++	}
++
++	if b.subRepoBranchVersions == nil {
++		b.subRepoBranchVersions = make(map[string]map[string]string, len(b.opts.SubRepositories))
++	}
++
++	// Replace the map wholesale rather than mutating entries in place: a
++	// shard already being built may still be reading the previous map and
++	// the descriptions in it.
++	aligned := make(map[string]*zoekt.Repository, len(b.opts.SubRepositories))
++	for path, repo := range b.opts.SubRepositories {
++		versions := b.subRepoBranchVersions[path]
++		if versions == nil {
++			versions = make(map[string]string, len(repo.Branches))
++			b.subRepoBranchVersions[path] = versions
++		}
++		// Only real versions are recorded, so the placeholders written by
++		// an earlier pass can never displace one.
++		for _, br := range repo.Branches {
++			if br.Version != "" {
++				versions[br.Name] = br.Version
++			}
++		}
++
++		branches := make([]zoekt.RepositoryBranch, 0, len(root))
++		for _, br := range root {
++			branches = append(branches, zoekt.RepositoryBranch{
++				Name:    br.Name,
++				Version: versions[br.Name],
++			})
++		}
++
++		clone := *repo
++		clone.Branches = branches
++		aligned[path] = &clone
++	}
++	b.opts.SubRepositories = aligned
++}
++
+ // BranchNamesEqual compares the given zoekt.RepositoryBranch slices, and returns true
+ // iff both slices specify the same set of branch names in the same order.
+ func BranchNamesEqual(a, b []zoekt.RepositoryBranch) bool {
+@@ -1054,9 +1241,11 @@ func (b *Builder) returnPostingsBuilders(sb *ShardBuilder) {
+ }
+ 
+ func (b *Builder) newShardBuilder() (*ShardBuilder, error) {
++	b.metaMu.Lock()
+ 	desc := b.opts.RepositoryDescription
+-	desc.HasSymbols = !b.opts.DisableCTags && b.opts.CTagsPath != ""
+ 	desc.SubRepoMap = b.opts.SubRepositories
++	b.metaMu.Unlock()
++	desc.HasSymbols = !b.opts.DisableCTags && b.opts.CTagsPath != ""
+ 	desc.IndexOptions = b.opts.GetHash()
+ 
+ 	content := b.getPostingsBuilder()

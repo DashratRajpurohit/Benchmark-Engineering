@@ -1,0 +1,17 @@
+{
+  "problemId": "kh74mg7azbntx1y2fewb5e8bsh8dkp2c",
+  "title": "zoekt-index and zoekt-git-index: shared repository names silently lose data across positional inputs",
+  "status": "accepted",
+  "version": 6,
+  "versionId": "kd77zhcts97avqr782sevd55tn8dxbea",
+  "isLocked": true,
+  "language": "go",
+  "difficulty": null,
+  "category": "bugfix",
+  "repoUrl": "https://github.com/sourcegraph/zoekt",
+  "commitHash": "5f833dde1bc4b1a8f99007617b4b721e44506c4f",
+  "githubIssueUrl": "https://github.com/sourcegraph/zoekt/issues/1133",
+  "estimatedLOC": null,
+  "testOutputMode": null,
+  "downloadedAt": "2026-10-24T17:10:41.627Z"
+}
