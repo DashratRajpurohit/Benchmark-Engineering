@@ -1,0 +1,1117 @@
+diff --git a/customlevel_250f05/logger_registry_9f4b1d_test.go b/customlevel_250f05/logger_registry_9f4b1d_test.go
+new file mode 100644
+index 0000000..1910b73
+--- /dev/null
++++ b/customlevel_250f05/logger_registry_9f4b1d_test.go
+@@ -0,0 +1,200 @@
++package customlevel_test
++
++import (
++	"bytes"
++	"reflect"
++	"strings"
++	"testing"
++
++	"github.com/rs/zerolog"
++)
++
++type levelRegistrySetter interface {
++	LevelRegistry(*zerolog.LevelRegistry) zerolog.Logger
++}
++
++func applyLevelRegistry(t *testing.T, logger zerolog.Logger, registry *zerolog.LevelRegistry) zerolog.Logger {
++	if setter, ok := (interface{})(logger).(levelRegistrySetter); ok {
++		return setter.LevelRegistry(registry)
++	}
++	t.Fatal("LevelRegistry method not implemented on Logger")
++	return logger
++}
++
++func applyConsoleRegistry(t *testing.T, console *zerolog.ConsoleWriter, registry *zerolog.LevelRegistry) {
++	v := reflect.ValueOf(console).Elem()
++	f := v.FieldByName("LevelRegistry")
++	if !f.IsValid() {
++		t.Fatal("LevelRegistry field not found on ConsoleWriter")
++	}
++	f.Set(reflect.ValueOf(registry))
++}
++
++func TestLevelRegistry_LocalScope(t *testing.T) {
++	registry := zerolog.NewLevelRegistry()
++	lvl := zerolog.Level(35)
++	if err := registry.RegisterLevel(lvl, "local_trace"); err != nil {
++		t.Fatalf("RegisterLevel: %v", err)
++	}
++
++	var buf bytes.Buffer
++	logger := applyLevelRegistry(t, zerolog.New(&buf), registry)
++
++	logger.WithLevel(lvl).Msg("hello")
++	out := buf.String()
++
++	if !strings.Contains(out, `"level":"local_trace"`) {
++		t.Errorf("Expected custom level in output, got: %s", out)
++	}
++
++	if lvl.String() == "local_trace" {
++		t.Errorf("Expected local registry to not affect global Level.String()")
++	}
++}
++
++func TestConsoleWriter_WithLevelRegistry(t *testing.T) {
++	registry := zerolog.NewLevelRegistry()
++	lvl := zerolog.Level(36)
++	if err := registry.RegisterLevel(lvl, "my_custom"); err != nil {
++		t.Fatalf("RegisterLevel: %v", err)
++	}
++
++	// A distinctive FormattedLevels entry that only appears in the output
++	// if ConsoleWriter actually resolved "my_custom" back to lvl through
++	// its local registry -- the message-is-present / not-"???" checks
++	// alone would also pass if the registry were silently ignored, since
++	// the raw-string abbreviation fallback produces non-empty output too.
++	zerolog.FormattedLevels[lvl] = "CUS"
++	defer delete(zerolog.FormattedLevels, lvl)
++
++	var buf bytes.Buffer
++	console := zerolog.ConsoleWriter{
++		Out:        &buf,
++		NoColor:    true,
++		PartsOrder: []string{zerolog.LevelFieldName, zerolog.MessageFieldName},
++	}
++	applyConsoleRegistry(t, &console, registry)
++
++	logger := applyLevelRegistry(t, zerolog.New(console), registry)
++	logger.WithLevel(lvl).Msg("test message")
++
++	out := buf.String()
++	if !strings.Contains(out, "CUS") {
++		t.Errorf("Expected ConsoleWriter to resolve the custom level via its local registry and use FormattedLevels, got: %q", out)
++	}
++	if !strings.Contains(out, "test message") {
++		t.Errorf("Expected message to be present, got: %q", out)
++	}
++}
++
++func TestConsoleWriter_CaseInsensitive(t *testing.T) {
++	registry := zerolog.NewLevelRegistry()
++	lvl := zerolog.Level(36)
++	if err := registry.RegisterLevel(lvl, "my_custom"); err != nil {
++		t.Fatalf("RegisterLevel: %v", err)
++	}
++
++	// Same distinctiveness rationale as TestConsoleWriter_WithLevelRegistry:
++	// "MY_" is what the raw-string abbreviation fallback would ALSO
++	// produce for the literal input "MY_CUSTOM" even if case-insensitive
++	// registry parsing were never attempted, so it cannot tell the two
++	// apart. A FormattedLevels lookup only succeeds if "MY_CUSTOM" was
++	// actually resolved to lvl via customLevelByName's EqualFold match.
++	zerolog.FormattedLevels[lvl] = "CUS"
++	defer delete(zerolog.FormattedLevels, lvl)
++
++	var buf bytes.Buffer
++	console := zerolog.ConsoleWriter{
++		Out:        &buf,
++		NoColor:    true,
++		PartsOrder: []string{zerolog.LevelFieldName, zerolog.MessageFieldName},
++	}
++	applyConsoleRegistry(t, &console, registry)
++
++	_, err := console.Write([]byte(`{"level":"MY_CUSTOM", "message":"test message"}`))
++	if err != nil {
++		t.Fatalf("ConsoleWriter.Write: %v", err)
++	}
++
++	out := buf.String()
++	if !strings.Contains(out, "CUS") {
++		t.Errorf("Expected the uppercase custom level to be parsed case-insensitively via the local registry and formatted via FormattedLevels, got: %q", out)
++	}
++	if !strings.Contains(out, "test message") {
++		t.Errorf("Expected message to be present, got: %q", out)
++	}
++}
++
++func TestLevelRegistry_OverrideGlobal(t *testing.T) {
++	// Register a level globally
++	lvl := zerolog.Level(37)
++	if err := zerolog.RegisterLevel(lvl, "global_name"); err != nil {
++		t.Fatalf("global RegisterLevel: %v", err)
++	}
++	defer zerolog.UnregisterLevel(lvl)
++
++	// Register the same level locally with a different name
++	registry := zerolog.NewLevelRegistry()
++	if err := registry.RegisterLevel(lvl, "local_name"); err != nil {
++		t.Fatalf("local RegisterLevel: %v", err)
++	}
++
++	// Verify that parsing the global name works (ParseLevel uses global registry)
++	parsedLvl, err := zerolog.ParseLevel("global_name")
++	if err != nil || parsedLvl != lvl {
++		t.Errorf("Expected ParseLevel to use global registry, got level %v, err %v", parsedLvl, err)
++	}
++
++	// Verify that the local registry overrides the global one for output
++	var buf bytes.Buffer
++	logger := applyLevelRegistry(t, zerolog.New(&buf), registry)
++
++	logger.WithLevel(lvl).Msg("hello")
++	out := buf.String()
++
++	if !strings.Contains(out, `"level":"local_name"`) {
++		t.Errorf("Expected local registry to override global registry in output, got: %s", out)
++	}
++	if strings.Contains(out, `"level":"global_name"`) {
++		t.Errorf("Expected local registry to override global registry, but global name leaked into output: %s", out)
++	}
++}
++
++func TestLevelRegistry_LocalValidation(t *testing.T) {
++	registry := zerolog.NewLevelRegistry()
++	
++	// empty name
++	if err := registry.RegisterLevel(105, ""); err == nil {
++		t.Error("Expected error registering empty name")
++	}
++
++	// built-in level
++	if err := registry.RegisterLevel(zerolog.DebugLevel, "custom_debug"); err == nil {
++		t.Error("Expected error registering custom name for built-in level")
++	}
++
++	// collision with built-in
++	if err := registry.RegisterLevel(105, "debug"); err == nil {
++		t.Error("Expected error colliding with built-in level")
++	}
++
++	// collision with other local level
++	registry.RegisterLevel(105, "my_105")
++	if err := registry.RegisterLevel(106, "my_105"); err == nil {
++		t.Error("Expected error colliding with other local level")
++	}
++
++	// collision with LevelFieldMarshalFunc
++	oldMarshal := zerolog.LevelFieldMarshalFunc
++	zerolog.LevelFieldMarshalFunc = func(l zerolog.Level) string {
++		if l == zerolog.TraceLevel {
++			return "local_renamed_trace"
++		}
++		return oldMarshal(l)
++	}
++	defer func() { zerolog.LevelFieldMarshalFunc = oldMarshal }()
++
++	if err := registry.RegisterLevel(107, "local_renamed_trace"); err == nil {
++		t.Error("Expected error colliding with LevelFieldMarshalFunc output on local registry")
++	}
++}
+diff --git a/customlevel_250f05/merge_registry_7a2c91_test.go b/customlevel_250f05/merge_registry_7a2c91_test.go
+new file mode 100644
+index 0000000..a7f0190
+--- /dev/null
++++ b/customlevel_250f05/merge_registry_7a2c91_test.go
+@@ -0,0 +1,183 @@
++package customlevel_test
++
++import (
++	"strings"
++	"sync"
++	"testing"
++	"time"
++
++	"github.com/rs/zerolog"
++)
++
++// TestMerge_CombinesDisjointEntries verifies that merging two registries
++// with no overlapping levels produces a registry containing every entry
++// from both, and leaves both inputs unmodified.
++func TestMerge_CombinesDisjointEntries(t *testing.T) {
++	a := zerolog.NewLevelRegistry()
++	if err := a.RegisterLevel(zerolog.Level(100), "alpha"); err != nil {
++		t.Fatalf("RegisterLevel(a): %v", err)
++	}
++	b := zerolog.NewLevelRegistry()
++	if err := b.RegisterLevel(zerolog.Level(101), "beta"); err != nil {
++		t.Fatalf("RegisterLevel(b): %v", err)
++	}
++
++	merged, err := a.Merge(b)
++	if err != nil {
++		t.Fatalf("Merge: %v", err)
++	}
++
++	var buf strings.Builder
++	logger := zerolog.New(&buf).LevelRegistry(merged)
++	for lvl, name := range map[zerolog.Level]string{100: "alpha", 101: "beta"} {
++		buf.Reset()
++		logger.WithLevel(lvl).Msg("hello")
++		if !strings.Contains(buf.String(), `"level":"`+name+`"`) {
++			t.Errorf("merged registry missing %v=%q: %s", lvl, name, buf.String())
++		}
++	}
++
++	// Neither input registry should have gained the other's entry.
++	buf.Reset()
++	loggerA := zerolog.New(&buf).LevelRegistry(a)
++	loggerA.WithLevel(101).Msg("hello")
++	if strings.Contains(buf.String(), `"level":"beta"`) {
++		t.Errorf("Merge modified its receiver: %s", buf.String())
++	}
++	buf.Reset()
++	loggerB := zerolog.New(&buf).LevelRegistry(b)
++	loggerB.WithLevel(100).Msg("hello")
++	if strings.Contains(buf.String(), `"level":"alpha"`) {
++		t.Errorf("Merge modified its argument: %s", buf.String())
++	}
++}
++
++// TestMerge_AgreeingSharedLevelIsNotAConflict verifies that the same level
++// registered under the same name (case-insensitively) in both registries
++// merges cleanly rather than being treated as a collision.
++func TestMerge_AgreeingSharedLevelIsNotAConflict(t *testing.T) {
++	a := zerolog.NewLevelRegistry()
++	if err := a.RegisterLevel(zerolog.Level(102), "shared"); err != nil {
++		t.Fatalf("RegisterLevel(a): %v", err)
++	}
++	b := zerolog.NewLevelRegistry()
++	if err := b.RegisterLevel(zerolog.Level(102), "SHARED"); err != nil {
++		t.Fatalf("RegisterLevel(b): %v", err)
++	}
++
++	merged, err := a.Merge(b)
++	if err != nil {
++		t.Fatalf("expected agreeing shared level to merge cleanly, got: %v", err)
++	}
++	var buf strings.Builder
++	logger := zerolog.New(&buf).LevelRegistry(merged)
++	logger.WithLevel(102).Msg("hello")
++	out := buf.String()
++	if !strings.Contains(out, `"level":"shared"`) && !strings.Contains(out, `"level":"SHARED"`) {
++		t.Errorf("merged registry lost the agreeing entry: %s", out)
++	}
++}
++
++// TestMerge_RejectsDisagreeingSharedLevel verifies that the same level
++// registered under two different names in the two input registries is
++// rejected rather than silently resolved by preferring either side. It
++// does not require the returned *LevelRegistry to be exactly nil on
++// failure -- the prompt requires only that the merge commit nothing, not
++// any particular nil-vs-empty return convention -- so it checks the
++// observable contract directly: if a non-nil registry is returned, neither
++// disputed name must be usable from it.
++func TestMerge_RejectsDisagreeingSharedLevel(t *testing.T) {
++	a := zerolog.NewLevelRegistry()
++	if err := a.RegisterLevel(zerolog.Level(103), "from_a"); err != nil {
++		t.Fatalf("RegisterLevel(a): %v", err)
++	}
++	b := zerolog.NewLevelRegistry()
++	if err := b.RegisterLevel(zerolog.Level(103), "from_b"); err != nil {
++		t.Fatalf("RegisterLevel(b): %v", err)
++	}
++
++	merged, err := a.Merge(b)
++	if err == nil {
++		t.Fatal("expected an error when the two registries disagree on a shared level's name")
++	}
++	if merged != nil {
++		var buf strings.Builder
++		logger := zerolog.New(&buf).LevelRegistry(merged)
++		logger.WithLevel(103).Msg("hello")
++		if strings.Contains(buf.String(), `"level":"from_a"`) || strings.Contains(buf.String(), `"level":"from_b"`) {
++			t.Fatalf("expected a failed Merge to commit nothing, but got: %s", buf.String())
++		}
++	}
++}
++
++// TestMerge_RejectsCrossRegistryNameCollision verifies that two different
++// levels claiming the same name (case-insensitively), one from each input
++// registry, are rejected even though neither registry is individually
++// invalid.
++func TestMerge_RejectsCrossRegistryNameCollision(t *testing.T) {
++	a := zerolog.NewLevelRegistry()
++	if err := a.RegisterLevel(zerolog.Level(104), "duplicate"); err != nil {
++		t.Fatalf("RegisterLevel(a): %v", err)
++	}
++	b := zerolog.NewLevelRegistry()
++	if err := b.RegisterLevel(zerolog.Level(108), "DUPLICATE"); err != nil {
++		t.Fatalf("RegisterLevel(b): %v", err)
++	}
++
++	if _, err := a.Merge(b); err == nil {
++		t.Fatal("expected a cross-registry name collision error")
++	}
++}
++
++// TestMerge_NeverDeadlocksUnderCrossDirectionConcurrency drives two
++// registries merging from each other concurrently and repeatedly --
++// goroutine 1 calling a.Merge(b) while goroutine 2 calls b.Merge(a) at the
++// same time, over and over. A Merge implementation that locks its receiver
++// then its argument in call order (rather than a fixed order independent
++// of which side is the receiver) deadlocks under exactly this
++// interleaving: goroutine 1 holds a's lock waiting for b's, while
++// goroutine 2 holds b's lock waiting for a's. The test fails by timing
++// out rather than hanging forever if that happens.
++func TestMerge_NeverDeadlocksUnderCrossDirectionConcurrency(t *testing.T) {
++	a := zerolog.NewLevelRegistry()
++	if err := a.RegisterLevel(zerolog.Level(110), "a_name"); err != nil {
++		t.Fatalf("RegisterLevel(a): %v", err)
++	}
++	b := zerolog.NewLevelRegistry()
++	if err := b.RegisterLevel(zerolog.Level(111), "b_name"); err != nil {
++		t.Fatalf("RegisterLevel(b): %v", err)
++	}
++
++	const iterations = 500
++	done := make(chan struct{})
++	go func() {
++		var wg sync.WaitGroup
++		wg.Add(2)
++		go func() {
++			defer wg.Done()
++			for i := 0; i < iterations; i++ {
++				if _, err := a.Merge(b); err != nil {
++					t.Errorf("a.Merge(b): %v", err)
++					return
++				}
++			}
++		}()
++		go func() {
++			defer wg.Done()
++			for i := 0; i < iterations; i++ {
++				if _, err := b.Merge(a); err != nil {
++					t.Errorf("b.Merge(a): %v", err)
++					return
++				}
++			}
++		}()
++		wg.Wait()
++		close(done)
++	}()
++
++	select {
++	case <-done:
++	case <-time.After(10 * time.Second):
++		t.Fatal("Merge deadlocked under concurrent cross-direction merges (a.Merge(b) and b.Merge(a) at the same time)")
++	}
++}
+diff --git a/customlevel_250f05/multisink_e98446_test.go b/customlevel_250f05/multisink_e98446_test.go
+new file mode 100644
+index 0000000..5631b8e
+--- /dev/null
++++ b/customlevel_250f05/multisink_e98446_test.go
+@@ -0,0 +1,114 @@
++package customlevel_test
++
++import (
++	"strings"
++	"sync"
++	"testing"
++
++	"github.com/rs/zerolog"
++)
++
++// TestMultiSink_IndependentlyConfiguredRegistriesDoNotCrossTalk builds
++// several loggers, each writing to its own buffer and each configured with
++// its own local LevelRegistry (a live registry, a Snapshot of another
++// registry, and one built via LoadLevelRegistry), then drives all of them
++// concurrently from many goroutines. It asserts that every sink only ever
++// emits names from its own registry, never another sink's -- proving the
++// per-Logger registry attachment stays correctly isolated under
++// concurrent use across sinks, not just within a single registry's own
++// internal locking (which the other tests already cover for a single
++// shared registry).
++func TestMultiSink_IndependentlyConfiguredRegistriesDoNotCrossTalk(t *testing.T) {
++	lvl := zerolog.Level(80)
++
++	liveReg := zerolog.NewLevelRegistry()
++	if err := liveReg.RegisterLevel(lvl, "sink_live"); err != nil {
++		t.Fatalf("RegisterLevel(live): %v", err)
++	}
++
++	snapSource := zerolog.NewLevelRegistry()
++	if err := snapSource.RegisterLevel(lvl, "sink_snapshot"); err != nil {
++		t.Fatalf("RegisterLevel(snapSource): %v", err)
++	}
++	snapReg := snapSource.Snapshot()
++	// Mutate the source after taking the snapshot; the snapshot-backed
++	// sink below must keep emitting "sink_snapshot", not this new name,
++	// proving the snapshot really is frozen even while other sinks and
++	// goroutines are concurrently active.
++	if err := snapSource.RegisterLevel(lvl, "sink_snapshot_mutated_after"); err != nil {
++		t.Fatalf("RegisterLevel(snapSource mutation): %v", err)
++	}
++
++	loadedReg, err := zerolog.LoadLevelRegistry(map[zerolog.Level]string{lvl: "sink_loaded"})
++	if err != nil {
++		t.Fatalf("LoadLevelRegistry: %v", err)
++	}
++
++	type sink struct {
++		name string
++		buf  *syncBuffer
++		want string
++	}
++	sinks := []sink{
++		{name: "live", buf: &syncBuffer{}, want: "sink_live"},
++		{name: "snapshot", buf: &syncBuffer{}, want: "sink_snapshot"},
++		{name: "loaded", buf: &syncBuffer{}, want: "sink_loaded"},
++	}
++	loggers := []zerolog.Logger{
++		zerolog.New(sinks[0].buf).LevelRegistry(liveReg),
++		zerolog.New(sinks[1].buf).LevelRegistry(snapReg),
++		zerolog.New(sinks[2].buf).LevelRegistry(loadedReg),
++	}
++
++	const messagesPerSink = 200
++	var wg sync.WaitGroup
++	for i := range loggers {
++		wg.Add(1)
++		go func(i int) {
++			defer wg.Done()
++			for j := 0; j < messagesPerSink; j++ {
++				loggers[i].WithLevel(lvl).Msg("hello")
++			}
++		}(i)
++	}
++	wg.Wait()
++
++	for _, s := range sinks {
++		out := s.buf.String()
++		wantCount := strings.Count(out, `"level":"`+s.want+`"`)
++		if wantCount != messagesPerSink {
++			t.Errorf("sink %s: expected %d occurrences of %q, got %d in output of length %d",
++				s.name, messagesPerSink, s.want, wantCount, len(out))
++		}
++		for _, other := range sinks {
++			if other.want == s.want {
++				continue
++			}
++			if strings.Contains(out, other.want) {
++				t.Errorf("sink %s: leaked another sink's level name %q", s.name, other.want)
++			}
++		}
++	}
++}
++
++// syncBuffer is a minimal concurrency-safe io.Writer, needed because
++// multiple goroutines write to the same Logger's underlying writer above
++// and zerolog does not itself serialize writes to an arbitrary io.Writer
++// (see the package doc: "If your Writer is not thread safe, you may
++// consider a sync wrapper").
++type syncBuffer struct {
++	mu  sync.Mutex
++	buf strings.Builder
++}
++
++func (b *syncBuffer) Write(p []byte) (int, error) {
++	b.mu.Lock()
++	defer b.mu.Unlock()
++	return b.buf.Write(p)
++}
++
++func (b *syncBuffer) String() string {
++	b.mu.Lock()
++	defer b.mu.Unlock()
++	return b.buf.String()
++}
+diff --git a/customlevel_250f05/register_level_0c31c2_test.go b/customlevel_250f05/register_level_0c31c2_test.go
+new file mode 100644
+index 0000000..cd6be3a
+--- /dev/null
++++ b/customlevel_250f05/register_level_0c31c2_test.go
+@@ -0,0 +1,287 @@
++package customlevel_test
++
++import (
++	"strconv"
++	"sync"
++	"testing"
++
++	"github.com/rs/zerolog"
++)
++
++// TestRegisterLevel_StringAndParseRoundTrip verifies that a level registered
++// with RegisterLevel is returned by String() and that ParseLevel resolves
++// the registered name (case-insensitively) back to the same Level.
++func TestRegisterLevel_StringAndParseRoundTrip(t *testing.T) {
++	lvl := zerolog.Level(20)
++	defer zerolog.UnregisterLevel(lvl)
++
++	if err := zerolog.RegisterLevel(lvl, "audit"); err != nil {
++		t.Fatalf("RegisterLevel: %v", err)
++	}
++	if got := lvl.String(); got != "audit" {
++		t.Fatalf("String() = %q, want %q", got, "audit")
++	}
++	for _, form := range []string{"audit", "AUDIT", "Audit"} {
++		got, err := zerolog.ParseLevel(form)
++		if err != nil {
++			t.Fatalf("ParseLevel(%q): %v", form, err)
++		}
++		if got != lvl {
++			t.Fatalf("ParseLevel(%q) = %v, want %v", form, got, lvl)
++		}
++	}
++}
++
++// TestRegisterLevel_TextMarshalRoundTrip verifies that MarshalText and
++// UnmarshalText, which delegate to LevelFieldMarshalFunc (String by
++// default) and ParseLevel respectively, correctly round-trip a registered
++// custom level.
++func TestRegisterLevel_TextMarshalRoundTrip(t *testing.T) {
++	lvl := zerolog.Level(21)
++	defer zerolog.UnregisterLevel(lvl)
++	if err := zerolog.RegisterLevel(lvl, "notice"); err != nil {
++		t.Fatalf("RegisterLevel: %v", err)
++	}
++
++	text, err := lvl.MarshalText()
++	if err != nil {
++		t.Fatalf("MarshalText: %v", err)
++	}
++	if string(text) != "notice" {
++		t.Fatalf("MarshalText = %q, want %q", text, "notice")
++	}
++
++	var got zerolog.Level
++	if err := got.UnmarshalText(text); err != nil {
++		t.Fatalf("UnmarshalText: %v", err)
++	}
++	if got != lvl {
++		t.Fatalf("UnmarshalText result = %v, want %v", got, lvl)
++	}
++}
++
++// TestRegisterLevel_RejectsBuiltinLevel verifies that RegisterLevel refuses
++// to rename any of the built-in Level constants.
++func TestRegisterLevel_RejectsBuiltinLevel(t *testing.T) {
++	if err := zerolog.RegisterLevel(zerolog.TraceLevel, "renamed"); err == nil {
++		t.Error("RegisterLevel(TraceLevel) should fail")
++	}
++	if err := zerolog.RegisterLevel(zerolog.NoLevel, "renamed"); err == nil {
++		t.Error("RegisterLevel(NoLevel) should fail")
++	}
++	if err := zerolog.RegisterLevel(zerolog.Disabled, "renamed"); err == nil {
++		t.Error("RegisterLevel(Disabled) should fail")
++	}
++}
++
++// TestRegisterLevel_RejectsEmptyName verifies that an empty name is
++// rejected rather than silently registered.
++func TestRegisterLevel_RejectsEmptyName(t *testing.T) {
++	if err := zerolog.RegisterLevel(zerolog.Level(22), ""); err == nil {
++		t.Fatal("RegisterLevel with an empty name should have failed")
++	}
++}
++
++// TestRegisterLevel_RejectsBuiltinNameCollision verifies that a custom
++// level cannot be registered under a name that already belongs to a
++// built-in level, which would otherwise make ParseLevel ambiguous.
++func TestRegisterLevel_RejectsBuiltinNameCollision(t *testing.T) {
++	if err := zerolog.RegisterLevel(zerolog.Level(23), "info"); err == nil {
++		t.Fatal("RegisterLevel colliding with a built-in name should have failed")
++	}
++	if err := zerolog.RegisterLevel(zerolog.Level(23), "WARN"); err == nil {
++		t.Fatal("RegisterLevel colliding with a built-in name (case-insensitive) should have failed")
++	}
++	if err := zerolog.RegisterLevel(zerolog.Level(23), "warning"); err == nil {
++		t.Fatal("RegisterLevel colliding with the 'warning' alias should have failed")
++	}
++}
++
++// TestRegisterLevel_RejectsCustomNameCollision verifies that two different
++// custom levels cannot be registered under names that collide
++// case-insensitively with each other.
++func TestRegisterLevel_RejectsCustomNameCollision(t *testing.T) {
++	a := zerolog.Level(24)
++	defer zerolog.UnregisterLevel(a)
++	if err := zerolog.RegisterLevel(a, "special"); err != nil {
++		t.Fatalf("RegisterLevel: %v", err)
++	}
++	b := zerolog.Level(25)
++	if err := zerolog.RegisterLevel(b, "SPECIAL"); err == nil {
++		zerolog.UnregisterLevel(b)
++		t.Fatal("RegisterLevel colliding with another custom level's name should have failed")
++	}
++}
++
++func TestRegisterLevel_LevelFieldMarshalFuncCollision(t *testing.T) {
++	// Temporarily override LevelFieldMarshalFunc
++	oldMarshal := zerolog.LevelFieldMarshalFunc
++	zerolog.LevelFieldMarshalFunc = func(l zerolog.Level) string {
++		if l == zerolog.TraceLevel {
++			return "my_renamed_trace"
++		}
++		return oldMarshal(l)
++	}
++	defer func() { zerolog.LevelFieldMarshalFunc = oldMarshal }()
++
++	// Registering the exact output of LevelFieldMarshalFunc should collide
++	err := zerolog.RegisterLevel(32, "my_renamed_trace")
++	if err == nil {
++		t.Errorf("Expected collision with LevelFieldMarshalFunc output, but got nil error")
++	}
++
++	// Should also be case-insensitive
++	err = zerolog.RegisterLevel(33, "MY_RENAMED_TRACE")
++	if err == nil {
++		t.Errorf("Expected case-insensitive collision with LevelFieldMarshalFunc output, but got nil error")
++	}
++}
++
++// TestRegisterLevel_ReRegisterReplacesName verifies that registering a new
++// name for an already-registered level replaces the old name, and that the
++// old name stops resolving via ParseLevel (so it doesn't remain a stale,
++// dangling alias for the level).
++func TestRegisterLevel_ReRegisterReplacesName(t *testing.T) {
++	lvl := zerolog.Level(26)
++	defer zerolog.UnregisterLevel(lvl)
++
++	if err := zerolog.RegisterLevel(lvl, "first"); err != nil {
++		t.Fatalf("RegisterLevel: %v", err)
++	}
++	if err := zerolog.RegisterLevel(lvl, "second"); err != nil {
++		t.Fatalf("RegisterLevel (re-register): %v", err)
++	}
++	if got := lvl.String(); got != "second" {
++		t.Fatalf("String() = %q, want %q", got, "second")
++	}
++	if _, err := zerolog.ParseLevel("first"); err == nil {
++		t.Fatal(`ParseLevel("first") should fail after the level was re-registered as "second"`)
++	}
++	got, err := zerolog.ParseLevel("second")
++	if err != nil {
++		t.Fatalf("ParseLevel: %v", err)
++	}
++	if got != lvl {
++		t.Fatalf("ParseLevel(\"second\") = %v, want %v", got, lvl)
++	}
++}
++
++// TestUnregisterLevel_FallsBackToNumeric verifies that after
++// UnregisterLevel, String() falls back to the previous numeric
++// representation and ParseLevel no longer resolves the old name.
++func TestUnregisterLevel_FallsBackToNumeric(t *testing.T) {
++	lvl := zerolog.Level(27)
++	if err := zerolog.RegisterLevel(lvl, "temp"); err != nil {
++		t.Fatalf("RegisterLevel: %v", err)
++	}
++	if got := lvl.String(); got != "temp" {
++		t.Fatalf("String() before unregister = %q, want %q", got, "temp")
++	}
++	zerolog.UnregisterLevel(lvl)
++
++	if got := lvl.String(); got != strconv.Itoa(int(lvl)) {
++		t.Fatalf("String() after unregister = %q, want %q", got, strconv.Itoa(int(lvl)))
++	}
++	if _, err := zerolog.ParseLevel("temp"); err == nil {
++		t.Fatal(`ParseLevel("temp") should fail after UnregisterLevel`)
++	}
++}
++
++// TestUnregisterLevel_UnregisteredIsNoop verifies that unregistering a
++// level that was never registered does not panic or error.
++func TestUnregisterLevel_UnregisteredIsNoop(t *testing.T) {
++	defer func() {
++		if r := recover(); r != nil {
++			t.Fatalf("UnregisterLevel panicked: %v", r)
++		}
++	}()
++	zerolog.UnregisterLevel(zerolog.Level(28))
++}
++
++// TestRegisterLevel_MultipleCustomLevelsCoexist verifies that several
++// distinct custom levels can be registered at once, each resolving
++// independently through both String and ParseLevel.
++func TestRegisterLevel_MultipleCustomLevelsCoexist(t *testing.T) {
++	access := zerolog.Level(29)
++	audit := zerolog.Level(30)
++	defer zerolog.UnregisterLevel(access)
++	defer zerolog.UnregisterLevel(audit)
++
++	if err := zerolog.RegisterLevel(access, "access"); err != nil {
++		t.Fatalf("RegisterLevel(access): %v", err)
++	}
++	if err := zerolog.RegisterLevel(audit, "audit"); err != nil {
++		t.Fatalf("RegisterLevel(audit): %v", err)
++	}
++
++	if got := access.String(); got != "access" {
++		t.Fatalf("access.String() = %q, want %q", got, "access")
++	}
++	if got := audit.String(); got != "audit" {
++		t.Fatalf("audit.String() = %q, want %q", got, "audit")
++	}
++	if got, err := zerolog.ParseLevel("access"); err != nil || got != access {
++		t.Fatalf(`ParseLevel("access") = %v, %v; want %v, nil`, got, err, access)
++	}
++	if got, err := zerolog.ParseLevel("audit"); err != nil || got != audit {
++		t.Fatalf(`ParseLevel("audit") = %v, %v; want %v, nil`, got, err, audit)
++	}
++}
++
++// TestRegisterLevel_ConsoleRoundTrip mirrors what ConsoleWriter's default
++// level formatter does internally: it takes the string form of a level
++// (as it would appear in a log event's level field) and must ParseLevel it
++// back to a Level to look up the FormattedLevels/LevelColors maps.
++func TestRegisterLevel_ConsoleRoundTrip(t *testing.T) {
++	lvl := zerolog.Level(31)
++	defer zerolog.UnregisterLevel(lvl)
++	if err := zerolog.RegisterLevel(lvl, "trace2"); err != nil {
++		t.Fatalf("RegisterLevel: %v", err)
++	}
++	zerolog.FormattedLevels[lvl] = "TR2"
++	defer delete(zerolog.FormattedLevels, lvl)
++
++	s := lvl.String()
++	if s != "trace2" {
++		t.Fatalf("String() = %q, want %q", s, "trace2")
++	}
++	parsed, err := zerolog.ParseLevel(s)
++	if err != nil {
++		t.Fatalf("ParseLevel(%q): %v", s, err)
++	}
++	if parsed != lvl {
++		t.Fatalf("round trip: String()=%q -> ParseLevel = %v, want %v", s, parsed, lvl)
++	}
++	if formatted, ok := zerolog.FormattedLevels[parsed]; !ok || formatted != "TR2" {
++		t.Fatalf("FormattedLevels[%v] = %q, %v; want %q, true", parsed, formatted, ok, "TR2")
++	}
++}
++
++// TestRegisterLevel_ConcurrentUse exercises RegisterLevel, String, and
++// ParseLevel from many goroutines at once against distinct Level values, to
++// catch any data race in the registry.
++func TestRegisterLevel_ConcurrentUse(t *testing.T) {
++	const n = 50
++	var wg sync.WaitGroup
++	for i := 0; i < n; i++ {
++		wg.Add(1)
++		go func(i int) {
++			defer wg.Done()
++			l := zerolog.Level(40 + i)
++			name := "level" + strconv.Itoa(i)
++			if err := zerolog.RegisterLevel(l, name); err != nil {
++				t.Errorf("RegisterLevel(%v, %q): %v", l, name, err)
++				return
++			}
++			defer zerolog.UnregisterLevel(l)
++			if got := l.String(); got != name {
++				t.Errorf("String() = %q, want %q", got, name)
++			}
++			got, err := zerolog.ParseLevel(name)
++			if err != nil || got != l {
++				t.Errorf("ParseLevel(%q) = %v, %v; want %v, nil", name, got, err, l)
++			}
++		}(i)
++	}
++	wg.Wait()
++}
+diff --git a/customlevel_250f05/registry_expansion_d15b07_test.go b/customlevel_250f05/registry_expansion_d15b07_test.go
+new file mode 100644
+index 0000000..4b5735a
+--- /dev/null
++++ b/customlevel_250f05/registry_expansion_d15b07_test.go
+@@ -0,0 +1,197 @@
++package customlevel_test
++
++import (
++	"strings"
++	"testing"
++
++	"github.com/rs/zerolog"
++)
++
++// TestSnapshot_IsIndependentOfLiveRegistry verifies that a registry
++// returned by Snapshot is a frozen, independent copy: later
++// RegisterLevel/UnregisterLevel calls on the original registry are not
++// visible through the snapshot, and vice versa.
++func TestSnapshot_IsIndependentOfLiveRegistry(t *testing.T) {
++	live := zerolog.NewLevelRegistry()
++	lvl := zerolog.Level(50)
++	if err := live.RegisterLevel(lvl, "before_snapshot"); err != nil {
++		t.Fatalf("RegisterLevel: %v", err)
++	}
++
++	snap := live.Snapshot()
++
++	// Mutating the live registry after the snapshot must not affect it.
++	if err := live.RegisterLevel(lvl, "after_snapshot"); err != nil {
++		t.Fatalf("RegisterLevel on live: %v", err)
++	}
++
++	var buf strings.Builder
++	snapLogger := zerolog.New(&buf).LevelRegistry(snap)
++	snapLogger.WithLevel(lvl).Msg("hello")
++	if !strings.Contains(buf.String(), `"level":"before_snapshot"`) {
++		t.Errorf("snapshot logger output changed after live registry was mutated: %s", buf.String())
++	}
++
++	// Mutating the snapshot itself must not affect the live registry.
++	otherLvl := zerolog.Level(51)
++	if err := snap.RegisterLevel(otherLvl, "only_in_snapshot"); err != nil {
++		t.Fatalf("RegisterLevel on snapshot: %v", err)
++	}
++	buf.Reset()
++	liveLogger := zerolog.New(&buf).LevelRegistry(live)
++	liveLogger.WithLevel(otherLvl).Msg("hello")
++	if strings.Contains(buf.String(), "only_in_snapshot") {
++		t.Errorf("registering on the snapshot leaked into the live registry: %s", buf.String())
++	}
++}
++
++// TestSnapshot_CopiesAllExistingEntries verifies a snapshot taken after
++// several registrations carries every one of them, not just the most
++// recent.
++func TestSnapshot_CopiesAllExistingEntries(t *testing.T) {
++	live := zerolog.NewLevelRegistry()
++	entries := map[zerolog.Level]string{
++		zerolog.Level(52): "alpha",
++		zerolog.Level(53): "beta",
++		zerolog.Level(54): "gamma",
++	}
++	for lvl, name := range entries {
++		if err := live.RegisterLevel(lvl, name); err != nil {
++			t.Fatalf("RegisterLevel(%v, %q): %v", lvl, name, err)
++		}
++	}
++
++	snap := live.Snapshot()
++	var buf strings.Builder
++	logger := zerolog.New(&buf).LevelRegistry(snap)
++	for lvl, name := range entries {
++		buf.Reset()
++		logger.WithLevel(lvl).Msg("hello")
++		if !strings.Contains(buf.String(), `"level":"`+name+`"`) {
++			t.Errorf("snapshot missing entry %v=%q: %s", lvl, name, buf.String())
++		}
++	}
++}
++
++// TestLoadLevelRegistry_AllOrNothing verifies that a batch containing
++// multiple different kinds of invalid entries (an empty name alongside a
++// reserved-level entry) is rejected atomically: nothing from the batch is
++// committed. It deliberately does not inspect the returned error's text or
++// structure, nor require the returned *LevelRegistry to be exactly nil --
++// the prompt requires only that every violation be reported and that
++// nothing be committed, not any particular error representation or
++// nil-vs-empty return convention, so asserting either would reject an
++// equally valid implementation that reports the same violations, or
++// signals "nothing committed", a different way. What is checked instead is
++// the actual observable contract: none of the batch's entries are usable
++// afterward, whether the returned registry is nil or a freshly allocated
++// empty one.
++func TestLoadLevelRegistry_AllOrNothing(t *testing.T) {
++	entries := map[zerolog.Level]string{
++		zerolog.Level(60):  "good_one",
++		zerolog.Level(61):  "",              // invalid: empty name
++		zerolog.DebugLevel: "custom_debug", // invalid: reserved level
++	}
++	reg, err := zerolog.LoadLevelRegistry(entries)
++	if err == nil {
++		t.Fatal("expected an error for a batch containing invalid entries")
++	}
++	if reg != nil {
++		var buf strings.Builder
++		logger := zerolog.New(&buf).LevelRegistry(reg)
++		logger.WithLevel(60).Msg("hello")
++		if strings.Contains(buf.String(), `"level":"good_one"`) {
++			t.Fatal("expected no entry from the invalid batch to be committed, but good_one was usable")
++		}
++	}
++}
++
++// TestLoadLevelRegistry_RejectsPairwiseCollision verifies that two
++// different levels claiming the same name (case-insensitively) within a
++// single batch are rejected, even though neither individually collides
++// with a built-in.
++func TestLoadLevelRegistry_RejectsPairwiseCollision(t *testing.T) {
++	entries := map[zerolog.Level]string{
++		zerolog.Level(62): "shared_name",
++		zerolog.Level(63): "SHARED_NAME",
++	}
++	if _, err := zerolog.LoadLevelRegistry(entries); err == nil {
++		t.Fatal("expected a pairwise-collision error")
++	}
++}
++
++// TestLoadLevelRegistry_RejectsUnicodeEqualFoldCollision verifies the
++// pairwise collision check uses real Unicode case folding
++// (strings.EqualFold), as the problem explicitly requires, rather than
++// ASCII-only lowercasing: the Greek capital sigma and the "final sigma"
++// form are EqualFold-equal but map to different strings under a naive
++// ToLower comparison.
++func TestLoadLevelRegistry_RejectsUnicodeEqualFoldCollision(t *testing.T) {
++	entries := map[zerolog.Level]string{
++		zerolog.Level(90): "Σ", // Greek capital sigma
++		zerolog.Level(91): "ς", // Greek final sigma
++	}
++	if _, err := zerolog.LoadLevelRegistry(entries); err == nil {
++		t.Fatal("expected a Unicode EqualFold collision error")
++	}
++}
++
++// TestLoadLevelRegistry_CommitsValidBatch verifies a fully valid batch is
++// committed atomically and every entry is usable afterward.
++func TestLoadLevelRegistry_CommitsValidBatch(t *testing.T) {
++	entries := map[zerolog.Level]string{
++		zerolog.Level(64): "one",
++		zerolog.Level(65): "two",
++	}
++	reg, err := zerolog.LoadLevelRegistry(entries)
++	if err != nil {
++		t.Fatalf("LoadLevelRegistry: %v", err)
++	}
++	var buf strings.Builder
++	logger := zerolog.New(&buf).LevelRegistry(reg)
++	for lvl, name := range entries {
++		buf.Reset()
++		logger.WithLevel(lvl).Msg("hello")
++		if !strings.Contains(buf.String(), `"level":"`+name+`"`) {
++			t.Errorf("committed entry %v=%q not usable: %s", lvl, name, buf.String())
++		}
++	}
++}
++
++// TestConflicts_DetectsDriftAfterMarshalFuncChange verifies that a name
++// which was valid when registered can later be flagged by Conflicts once
++// LevelFieldMarshalFunc changes to produce a colliding built-in name, and
++// that Conflicts does not itself modify the registry.
++func TestConflicts_DetectsDriftAfterMarshalFuncChange(t *testing.T) {
++	reg := zerolog.NewLevelRegistry()
++	lvl := zerolog.Level(70)
++	if err := reg.RegisterLevel(lvl, "renamed_trace"); err != nil {
++		t.Fatalf("RegisterLevel: %v", err)
++	}
++	if errs := reg.Conflicts(); len(errs) != 0 {
++		t.Fatalf("expected no conflicts before the marshal func changes, got: %v", errs)
++	}
++
++	oldMarshal := zerolog.LevelFieldMarshalFunc
++	zerolog.LevelFieldMarshalFunc = func(l zerolog.Level) string {
++		if l == zerolog.TraceLevel {
++			return "renamed_trace"
++		}
++		return oldMarshal(l)
++	}
++	defer func() { zerolog.LevelFieldMarshalFunc = oldMarshal }()
++
++	errs := reg.Conflicts()
++	if len(errs) != 1 {
++		t.Fatalf("expected exactly one conflict after the marshal func change, got %d: %v", len(errs), errs)
++	}
++
++	// Conflicts must not have unregistered anything: the name is still
++	// usable until the caller explicitly acts on the reported conflict.
++	var buf strings.Builder
++	logger := zerolog.New(&buf).LevelRegistry(reg)
++	logger.WithLevel(lvl).Msg("hello")
++	if !strings.Contains(buf.String(), `"level":"renamed_trace"`) {
++		t.Errorf("Conflicts modified the registry, expected the name to still be usable: %s", buf.String())
++	}
++}
+diff --git a/test.sh b/test.sh
+new file mode 100755
+index 0000000..114f64f
+--- /dev/null
++++ b/test.sh
+@@ -0,0 +1,100 @@
++#!/bin/bash
++set -uo pipefail
++cd "$(dirname "$0")"
++
++MODE=""
++OUTPUT_PATH=""
++
++while [[ $# -gt 0 ]]; do
++  case "$1" in
++    base|new)
++      MODE="$1"
++      shift
++      ;;
++    --output_path)
++      OUTPUT_PATH="$2"
++      shift 2
++      ;;
++    *)
++      shift
++      ;;
++  esac
++done
++
++if [ -z "$MODE" ]; then
++    echo "Usage: $0 {base|new} [--output_path <path>]"
++    exit 1
++fi
++
++sanitize() {
++    # Some tests log ANSI-colored output (via t.Log) containing raw control
++    # bytes (ESC, BS, ...) that are illegal in XML 1.0 even inside CDATA.
++    # Strip everything outside tab/LF/CR before handing the log to
++    # go-junit-report, or it emits unparseable XML.
++    tr -d '\000-\010\013\014\016-\037'
++}
++
++# Emits a minimal, valid JUnit report where every "func TestXxx(t
++# *testing.T)" found by static grep under $1 is recorded as a failed test
++# case with $2 as the shared failure message. Used only when `go test`
++# could not produce any per-test output at all (a build/compile failure,
++# e.g. the new tests reference a type the solution hasn't been applied
++# yet) -- a plain go-junit-report run on that input yields a JUnit file
++# with zero <testcase> entries, which downstream tooling treats as "test
++# runner did not discover any tests" rather than "every test failed".
++# Named failing test cases carry the same information correctly.
++emit_fallback_junit() {
++    local search_dir="$1" msg="$2" out_path="$3" exclude_dir="${4:-}"
++    local grep_opts=(-rhoE)
++    if [ -n "$exclude_dir" ]; then
++        grep_opts+=(--exclude-dir="$exclude_dir")
++    fi
++    local names
++    names="$(grep "${grep_opts[@]}" 'func Test[A-Za-z0-9_]+\(t \*testing\.T\)' "$search_dir" \
++        | sed -E 's/^func (Test[A-Za-z0-9_]+).*/\1/' | sort -u)"
++    local count
++    count="$(printf '%s\n' "$names" | grep -c . || true)"
++    # classname must match the import path go-junit-report would use for a
++    # real run of this same package (e.g. github.com/rs/zerolog/foo), or
++    # downstream F2P/P2P classification -- which correlates by
++    # "classname::testname" -- won't recognize these as the same tests.
++    local classname
++    classname="$(go list "$search_dir" 2>/dev/null | head -1)"
++    [ -z "$classname" ] && classname="$search_dir"
++    {
++        printf '<?xml version="1.0" encoding="UTF-8"?>\n'
++        printf '<testsuites tests="%s">\n' "$count"
++        printf '\t<testsuite name="%s" tests="%s" failures="%s" errors="0">\n' "$classname" "$count" "$count"
++        while IFS= read -r name; do
++            [ -z "$name" ] && continue
++            printf '\t\t<testcase name="%s" classname="%s">\n' "$name" "$classname"
++            printf '\t\t\t<failure message="build failed"><![CDATA[%s]]></failure>\n' \
++                "$(printf '%s' "$msg" | sanitize)"
++            printf '\t\t</testcase>\n'
++        done <<< "$names"
++        printf '\t</testsuite>\n'
++        printf '</testsuites>\n'
++    } > "$out_path"
++}
++
++run_tests() {
++    local pkg_args="$1" search_dir="$2" exclude_dir="${3:-}"
++    if [ -n "$OUTPUT_PATH" ]; then
++        local out status
++        out="$(go test -count=1 -race -v $pkg_args 2>&1)"
++        status=$?
++        if [ $status -ne 0 ] && ! printf '%s\n' "$out" | grep -Eq '^--- (PASS|FAIL)'; then
++            emit_fallback_junit "$search_dir" "$out" "$OUTPUT_PATH" "$exclude_dir"
++        else
++            printf '%s\n' "$out" | sanitize | go-junit-report > "$OUTPUT_PATH"
++        fi
++    else
++        go test -count=1 -race -v $pkg_args
++    fi
++}
++
++if [ "$MODE" = "base" ]; then
++    run_tests "$(go list ./... | grep -v 'customlevel_250f05' | tr '\n' ' ')" "." "customlevel_250f05" || true
++elif [ "$MODE" = "new" ]; then
++    run_tests "./customlevel_250f05/..." "./customlevel_250f05"
++fi

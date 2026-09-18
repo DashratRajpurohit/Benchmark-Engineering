@@ -1,0 +1,172 @@
+{
+ "allPassing": false,
+ "computedDifficulty": null,
+ "criteria": [
+  {
+   "description": "No agent run flagged the task as unfair or broken",
+   "id": "fair",
+   "label": "Fair task",
+   "status": "pending"
+  },
+  {
+   "description": "At least 1 agent run must solve the problem",
+   "id": "solvable",
+   "label": "Solvable",
+   "status": "pending"
+  },
+  {
+   "description": "At least 4 runs must complete on each of Nova, Orion and Vega",
+   "id": "codenameCoverage",
+   "label": "Rollouts on every model",
+   "status": "pending"
+  },
+  {
+   "description": "Exactly one of Nova, Orion or Vega solves it, more than 0% and at most 25% of the time; the other two stay at 0%",
+   "id": "passStructure",
+   "label": "Solved by one model only",
+   "status": "pending"
+  },
+  {
+   "description": "Nova runs must average more than 400K tokens of sequence length",
+   "id": "novaSequenceLength",
+   "label": "Long horizon",
+   "status": "pending"
+  },
+  {
+   "description": "Cheat rate must be below 20% (across all agents)",
+   "id": "noCheating",
+   "label": "No cheating",
+   "status": "pending"
+  },
+  {
+   "description": "No run should be blocked by environment or verifier issues",
+   "id": "noEnvBlocker",
+   "label": "No environment blockers",
+   "status": "pending"
+  }
+ ],
+ "currentSubmissionType": "olympus",
+ "marsAllPassing": null,
+ "marsCriteria": null,
+ "observedPassRate": null,
+ "olympusV2": true,
+ "olympusV2Pools": {
+  "nova": {
+   "avgPassSequenceLength": null,
+   "avgSequenceLength": null,
+   "codename": "Nova",
+   "measured": 0,
+   "passRate": null,
+   "passes": 0,
+   "passesMeasured": 0,
+   "running": 0,
+   "working": 0
+  },
+  "strong": [
+   {
+    "avgPassSequenceLength": null,
+    "avgSequenceLength": null,
+    "codename": "Orion",
+    "measured": 0,
+    "passRate": null,
+    "passes": 0,
+    "passesMeasured": 0,
+    "running": 0,
+    "working": 0
+   },
+   {
+    "avgPassSequenceLength": null,
+    "avgSequenceLength": null,
+    "codename": "Vega",
+    "measured": 0,
+    "passRate": null,
+    "passes": 0,
+    "passesMeasured": 0,
+    "running": 0,
+    "working": 0
+   }
+  ]
+ },
+ "viewer": {
+  "isBeginner": false,
+  "marsLocked": true,
+  "olympusLocked": false,
+  "unlockTierName": null
+ },
+ "readiness": [
+  {
+   "detail": "5/5 passing, repository verification expired \u2014 re-run checks",
+   "id": "prechecks",
+   "label": "Prechecks",
+   "stale": true,
+   "status": "fail"
+  },
+  {
+   "detail": "rejected by the Scope Gate",
+   "id": "scopeGate",
+   "label": "Scope Gate",
+   "status": "fail",
+   "verdict": "drop"
+  },
+  {
+   "detail": "7/7 passing, description quality needs a re-run",
+   "id": "dynamicChecks",
+   "label": "Quality Checks",
+   "stale": true,
+   "status": "fail"
+  },
+  {
+   "id": "agentFair",
+   "label": "Fair task",
+   "status": "pending"
+  },
+  {
+   "id": "agentSolvable",
+   "label": "Solvable",
+   "status": "pending"
+  },
+  {
+   "id": "agentCodenameCoverage",
+   "label": "Rollouts on every model",
+   "status": "pending"
+  },
+  {
+   "id": "agentPassStructure",
+   "label": "Solved by one model only",
+   "status": "pending"
+  },
+  {
+   "id": "agentNovaSequenceLength",
+   "label": "Long horizon",
+   "status": "pending"
+  },
+  {
+   "id": "agentNoCheating",
+   "label": "No cheating",
+   "status": "pending"
+  },
+  {
+   "id": "agentNoEnvBlocker",
+   "label": "No environment blockers",
+   "status": "pending"
+  },
+  {
+   "detail": "not run yet",
+   "id": "autoReview",
+   "label": "Auto Review",
+   "status": "pending"
+  },
+  {
+   "detail": "image rebuilds hermetically",
+   "id": "rebuildSafe",
+   "label": "Rebuild-safe",
+   "status": "pass"
+  },
+  {
+   "detail": "image deep-rebuilds from clean source + vendored deps",
+   "id": "harborSafe",
+   "label": "Harbor rebuild-safe",
+   "status": "pass"
+  }
+ ]
+}

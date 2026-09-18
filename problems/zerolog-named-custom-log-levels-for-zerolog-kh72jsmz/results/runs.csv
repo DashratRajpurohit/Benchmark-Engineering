@@ -1,0 +1,4 @@
+label,agent,agentType,verdict,stale,reEvalRound,fault,filesModified,solutionLOC,agentMessages,sequenceLength,executionTimeSeconds,environmentBlocker,createdIST,id
+Nova #3,Nova,codex_cli,PASS_LEGITIMATE,True,,pass,4,439,34,68838,418.334654,False,2026-09-18T21:25:21.586000+05:30,rd71jphxvyx440jqtx5hzq827x8en3hk
+Nova #2,Nova,codex_cli,PASS_LEGITIMATE,True,,pass,3,339,38,67935,459.992548,False,2026-09-18T21:25:21.586000+05:30,rd7abt15y0x73hj1qa5kksyvq58en61h
+Nova #1,Nova,codex_cli,PASS_LEGITIMATE,True,,pass,4,541,29,80587,440.569548,False,2026-09-18T21:25:21.586000+05:30,rd75fa84s5n64zba6gejrxgyp98en3jb

@@ -1,0 +1,17 @@
+{
+  "problemId": "kh72jsmz1f9j6xt8t2cjhtzm158dmyrz",
+  "title": "Named custom log levels for zerolog",
+  "status": "draft",
+  "version": 0,
+  "versionId": "kd7c3gr81ht51fptf36senk2ms8dmg8t",
+  "isLocked": false,
+  "language": "go",
+  "difficulty": "medium",
+  "category": "feature_request",
+  "repoUrl": "https://github.com/rs/zerolog",
+  "commitHash": "dfd11cca1143ba03ba0fc0ff14e5dbb4d61f6f0a",
+  "githubIssueUrl": "https://github.com/rs/zerolog/issues/686",
+  "estimatedLOC": null,
+  "testOutputMode": null,
+  "downloadedAt": "2026-10-24T17:10:47.553Z"
+}

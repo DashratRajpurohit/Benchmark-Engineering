@@ -1,0 +1,474 @@
+diff --git a/console.go b/console.go
+index 1bc3cdc..773ae40 100644
+--- a/console.go
++++ b/console.go
+@@ -96,6 +96,9 @@ type ConsoleWriter struct {
+ 	FormatExtra func(map[string]interface{}, *bytes.Buffer) error
+ 
+ 	FormatPrepare func(map[string]interface{}) error
++
++	// LevelRegistry is an optional registry for custom level names.
++	LevelRegistry *LevelRegistry
+ }
+ 
+ // NewConsoleWriter creates and initializes a new ConsoleWriter.
+@@ -321,7 +324,7 @@ func (w ConsoleWriter) writePart(buf *bytes.Buffer, evt map[string]interface{},
+ 	switch p {
+ 	case LevelFieldName:
+ 		if w.FormatLevel == nil {
+-			f = consoleDefaultFormatLevel(w.NoColor)
++			f = consoleDefaultFormatLevel(w.NoColor, w.LevelRegistry)
+ 		} else {
+ 			f = w.FormatLevel
+ 		}
+@@ -482,15 +485,25 @@ func stripLevel(ll string) string {
+ 	return strings.ToUpper(ll)
+ }
+ 
+-func consoleDefaultFormatLevel(noColor bool) Formatter {
++func consoleDefaultFormatLevel(noColor bool, lr *LevelRegistry) Formatter {
+ 	return func(i interface{}) string {
+ 		if ll, ok := i.(string); ok {
+-			level, _ := ParseLevel(ll)
++			var level Level
++			if lr != nil {
++				if l, ok := lr.customLevelByName(ll); ok {
++					level = l
++				} else {
++					level, _ = ParseLevel(ll)
++				}
++			} else {
++				level, _ = ParseLevel(ll)
++			}
+ 			fl, ok := FormattedLevels[level]
+ 			if ok {
+ 				return colorize(fl, LevelColors[level], noColor)
+ 			}
+-			return stripLevel(ll)
++			// Use the provided string if not a known level, formatted similarly
++			return colorize(stripLevel(ll), 0, noColor)
+ 		}
+ 		if i == nil {
+ 			return unknownLevel
+diff --git a/level_registry.go b/level_registry.go
+new file mode 100644
+index 0000000..f0f9ef8
+--- /dev/null
++++ b/level_registry.go
+@@ -0,0 +1,332 @@
++package zerolog
++
++import (
++	"errors"
++	"fmt"
++	"strings"
++	"sync"
++)
++
++// LevelRegistry holds custom log level names registered with
++// RegisterLevel, keyed by Level. Name lookups (for ParseLevel) scan
++// this same map case-insensitively via customLevelByName.
++type LevelRegistry struct {
++	mu      sync.RWMutex
++	byLevel map[Level]string // level → canonical name
++}
++
++// NewLevelRegistry creates a new, empty, mutable registry for custom
++// levels. Use RegisterLevel to populate it incrementally, or
++// LoadLevelRegistry to build one atomically from a fixed set of entries
++// (for example loaded from configuration).
++func NewLevelRegistry() *LevelRegistry {
++	return &LevelRegistry{
++		byLevel: make(map[Level]string),
++	}
++}
++
++var globalLevelRegistry = NewLevelRegistry()
++
++// isReservedLevel reports whether l is one of the built-in Level constants,
++// which can never be renamed via RegisterLevel.
++func isReservedLevel(l Level) bool {
++	switch l {
++	case TraceLevel, DebugLevel, InfoLevel, WarnLevel, ErrorLevel,
++		FatalLevel, PanicLevel, NoLevel, Disabled:
++		return true
++	}
++	return false
++}
++
++// builtinLevelNames returns the current display name of every built-in
++// level, as produced by LevelFieldMarshalFunc (which honours the global
++// LevelFieldMarshalFunc override, keeping collision detection aligned with
++// ParseLevel). It also includes the "warning" alias for WarnLevel.
++//
++// Because LevelFieldMarshalFunc is a mutable package variable, the names
++// this returns can change at runtime after a registry has already
++// validated a name against an earlier snapshot of them -- see Conflicts
++// for how a registry can be re-checked against the current names.
++func builtinLevelNames() []string {
++	return []string{
++		LevelFieldMarshalFunc(TraceLevel), LevelFieldMarshalFunc(DebugLevel), LevelFieldMarshalFunc(InfoLevel),
++		LevelFieldMarshalFunc(WarnLevel), "warning", LevelFieldMarshalFunc(ErrorLevel), LevelFieldMarshalFunc(FatalLevel),
++		LevelFieldMarshalFunc(PanicLevel), LevelFieldMarshalFunc(NoLevel), LevelFieldMarshalFunc(Disabled),
++	}
++}
++
++// validateEntry checks that level/name are individually eligible for
++// registration (non-empty name, non-reserved level, no collision with a
++// current built-in name), without consulting any registry's existing
++// entries. Both RegisterLevel and LoadLevelRegistry build on this so the
++// two validation paths cannot silently drift apart. It returns every
++// applicable violation, not just the first: RegisterLevel only needs one
++// (it fails fast on any violation), but LoadLevelRegistry must report all
++// of them, since a single entry can violate more than one rule at once
++// (for example an empty name for an already-reserved level).
++func validateEntry(level Level, name string) []error {
++	var errs []error
++	if name == "" {
++		errs = append(errs, fmt.Errorf("zerolog: custom level name must not be empty"))
++	}
++	if isReservedLevel(level) {
++		errs = append(errs, fmt.Errorf("zerolog: cannot register built-in level %d", int(level)))
++	}
++	if name != "" {
++		for _, builtin := range builtinLevelNames() {
++			if strings.EqualFold(name, builtin) {
++				errs = append(errs, fmt.Errorf("zerolog: level name %q collides with built-in level %q", name, builtin))
++			}
++		}
++	}
++	return errs
++}
++
++// RegisterLevel associates name with level in the registry. It returns an
++// error if:
++//   - name is empty,
++//   - level is a built-in zerolog level,
++//   - name collides (case-insensitively) with any built-in level name or
++//     any other custom level already registered under a different level value.
++//
++// Re-registering an existing level under a new name is allowed and replaces
++// the old name (the old name is removed from ParseLevel).
++func (r *LevelRegistry) RegisterLevel(level Level, name string) error {
++	if errs := validateEntry(level, name); len(errs) > 0 {
++		return errs[0]
++	}
++
++	r.mu.Lock()
++	defer r.mu.Unlock()
++
++	// Check collision against other custom levels in this registry.
++	for existingLevel, existingName := range r.byLevel {
++		if strings.EqualFold(name, existingName) && existingLevel != level {
++			return fmt.Errorf("zerolog: level name %q collides with already-registered custom level %d", name, int(existingLevel))
++		}
++	}
++
++	// Store the canonical name. Previous name for this level is overwritten.
++	r.byLevel[level] = name
++	return nil
++}
++
++// LoadLevelRegistry builds a new, independent registry from entries in a
++// single atomic, all-or-nothing operation: every level/name pair is
++// validated (individually against the built-ins, and pairwise against
++// every other entry in the same map) before any of them is committed. If
++// any entry is invalid, LoadLevelRegistry commits nothing and returns a
++// single error joining every violation found, so a misconfigured entry
++// deep in a large configuration doesn't require a fix-rerun-fix cycle to
++// discover the next one.
++//
++// This is the intended entry point for building a registry from
++// structured configuration (for example, a decoded TOML/YAML/JSON map of
++// level number to name) rather than a sequence of individual
++// RegisterLevel calls.
++func LoadLevelRegistry(entries map[Level]string) (*LevelRegistry, error) {
++	var errs []error
++	for level, name := range entries {
++		errs = append(errs, validateEntry(level, name)...)
++	}
++
++	// Pairwise collision check among the entries themselves: two different
++	// levels in the same batch cannot claim case-insensitively equal
++	// names, even though neither one individually collides with a
++	// built-in. This compares every distinct pair directly with
++	// strings.EqualFold rather than grouping by a strings.ToLower key --
++	// ToLower is NOT equivalent to EqualFold for full Unicode case
++	// folding (for example strings.EqualFold("Σ", "ς") is true,
++	// the capital and "final" forms of Greek sigma, but they ToLower to
++	// different strings), so a ToLower-keyed map can miss real collisions
++	// and let customLevelByName's EqualFold-based lookup later resolve
++	// either name to whichever level happened to be stored, silently.
++	levels := make([]Level, 0, len(entries))
++	for level := range entries {
++		levels = append(levels, level)
++	}
++	for i := 0; i < len(levels); i++ {
++		for j := i + 1; j < len(levels); j++ {
++			li, lj := levels[i], levels[j]
++			ni, nj := entries[li], entries[lj]
++			if ni == "" || nj == "" {
++				continue // already reported as an empty-name violation above
++			}
++			if strings.EqualFold(ni, nj) {
++				errs = append(errs, fmt.Errorf("zerolog: level name %q is claimed by both level %d and level %d", ni, int(li), int(lj)))
++			}
++		}
++	}
++
++	if len(errs) > 0 {
++		return nil, errors.Join(errs...)
++	}
++
++	r := NewLevelRegistry()
++	for level, name := range entries {
++		r.byLevel[level] = name
++	}
++	return r, nil
++}
++
++// Snapshot returns a new, independent registry containing a copy of r's
++// entries at the time of the call. Mutating the returned registry (or the
++// original r) after Snapshot returns has no effect on the other.
++//
++// Attaching r directly to a Logger or ConsoleWriter (via Logger.LevelRegistry
++// or the LevelRegistry field) means later RegisterLevel/UnregisterLevel
++// calls on r are immediately visible to every sink already configured with
++// it, since they all share the same instance. Attaching r.Snapshot()
++// instead freezes that sink's view of the names as of the snapshot: later
++// changes to r require taking and re-attaching a new snapshot to reach that
++// sink. Both are legitimate, deliberately different integration modes --
++// pick live sharing for a registry meant to be updated centrally and read
++// everywhere, and Snapshot for a sink that needs a stable, independently
++// evolving view (e.g. one worker pool's names should not shift mid-batch
++// just because an unrelated worker pool registered something).
++func (r *LevelRegistry) Snapshot() *LevelRegistry {
++	r.mu.RLock()
++	defer r.mu.RUnlock()
++	s := &LevelRegistry{byLevel: make(map[Level]string, len(r.byLevel))}
++	for level, name := range r.byLevel {
++		s.byLevel[level] = name
++	}
++	return s
++}
++
++// Conflicts re-validates every entry currently in r against the *current*
++// built-in level names (LevelFieldMarshalFunc is a mutable package
++// variable, and RegisterLevel/LoadLevelRegistry only ever checked it at
++// registration time). It returns one error per entry that would be
++// rejected if registered again right now, or nil if every entry is still
++// consistent. Conflicts never modifies r: detecting that an entry has
++// drifted into conflict is a distinct, deliberate step from deciding what
++// to do about it (leave it, UnregisterLevel it, or re-register it under a
++// different name), left to the caller.
++func (r *LevelRegistry) Conflicts() []error {
++	r.mu.RLock()
++	defer r.mu.RUnlock()
++	var errs []error
++	for level, name := range r.byLevel {
++		for _, builtin := range builtinLevelNames() {
++			if strings.EqualFold(name, builtin) {
++				errs = append(errs, fmt.Errorf("zerolog: registered level %d name %q now collides with built-in level %q", int(level), name, builtin))
++				break
++			}
++		}
++	}
++	return errs
++}
++
++// customLevelName returns the registered name for level, if any.
++func (r *LevelRegistry) customLevelName(level Level) (string, bool) {
++	r.mu.RLock()
++	defer r.mu.RUnlock()
++	name, ok := r.byLevel[level]
++	return name, ok
++}
++
++// customLevelByName returns the Level registered under name (case-insensitive).
++// It uses strings.EqualFold for the comparison, consistent with how
++// collision detection works in RegisterLevel.
++func (r *LevelRegistry) customLevelByName(name string) (Level, bool) {
++	r.mu.RLock()
++	defer r.mu.RUnlock()
++	for level, registered := range r.byLevel {
++		if strings.EqualFold(name, registered) {
++			return level, true
++		}
++	}
++	return 0, false
++}
++
++// UnregisterLevel removes the custom name for level from the local registry.
++// If level was never registered, it is a no-op.
++func (r *LevelRegistry) UnregisterLevel(level Level) {
++	r.mu.Lock()
++	defer r.mu.Unlock()
++	delete(r.byLevel, level)
++}
++
++// UnregisterLevel removes the custom name for level from the global registry.
++// If level was never registered, it is a no-op.
++func UnregisterLevel(level Level) {
++	globalLevelRegistry.UnregisterLevel(level)
++}
++
++// RegisterLevel associates name with level in the global registry.
++// See (*LevelRegistry).RegisterLevel for the full contract.
++func RegisterLevel(level Level, name string) error {
++	return globalLevelRegistry.RegisterLevel(level, name)
++}
++
++// Merge returns a new, independent registry containing every entry from r
++// and every entry from other. Neither r nor other is modified.
++//
++// The same Level appearing in both r and other is not itself a conflict as
++// long as both sides agree on the name (case-insensitively); it is only a
++// conflict when they disagree, since silently preferring one side over the
++// other would make the merged registry depend on argument order. Beyond
++// that, Merge applies the same pairwise, case-insensitive collision check
++// LoadLevelRegistry applies to a single batch, across the full combined
++// entry set (entries from r against each other, entries from other against
++// each other, and entries from r against entries from other). Any
++// violation -- a disagreeing shared level, or a name collision between two
++// different levels -- means Merge commits nothing and returns a nil
++// registry and a single error listing every violation found.
++//
++// Merge takes a read lock on both r and other for the duration of the
++// call. Two registries can legitimately be merged from both directions at
++// once (goroutine A calling a.Merge(b) while goroutine B concurrently
++// calls b.Merge(a)); locking r then other, in that argument order, would
++// deadlock under exactly that interleaving. Merge instead always acquires
++// the two locks in a fixed order independent of which registry is the
++// receiver and which is the argument, so it remains deadlock-free no
++// matter which side either caller merges from.
++func (r *LevelRegistry) Merge(other *LevelRegistry) (*LevelRegistry, error) {
++	if other == nil || other == r {
++		return r.Snapshot(), nil
++	}
++
++	first, second := r, other
++	if fmt.Sprintf("%p", r) > fmt.Sprintf("%p", other) {
++		first, second = other, r
++	}
++	first.mu.RLock()
++	defer first.mu.RUnlock()
++	second.mu.RLock()
++	defer second.mu.RUnlock()
++
++	var errs []error
++	merged := make(map[Level]string, len(r.byLevel)+len(other.byLevel))
++	for level, name := range r.byLevel {
++		merged[level] = name
++	}
++	for level, oName := range other.byLevel {
++		if rName, ok := merged[level]; ok && !strings.EqualFold(rName, oName) {
++			errs = append(errs, fmt.Errorf("zerolog: level %d has conflicting names %q and %q across the merged registries", int(level), rName, oName))
++			continue
++		}
++		merged[level] = oName
++	}
++
++	levels := make([]Level, 0, len(merged))
++	for level := range merged {
++		levels = append(levels, level)
++	}
++	for i := 0; i < len(levels); i++ {
++		for j := i + 1; j < len(levels); j++ {
++			li, lj := levels[i], levels[j]
++			ni, nj := merged[li], merged[lj]
++			if strings.EqualFold(ni, nj) {
++				errs = append(errs, fmt.Errorf("zerolog: level name %q is claimed by both level %d and level %d", ni, int(li), int(lj)))
++			}
++		}
++	}
++
++	if len(errs) > 0 {
++		return nil, errors.Join(errs...)
++	}
++
++	return &LevelRegistry{byLevel: merged}, nil
++}
+diff --git a/log.go b/log.go
+index 131b5a4..c68bdbc 100644
+--- a/log.go
++++ b/log.go
+@@ -170,6 +170,9 @@ func (l Level) String() string {
+ 	case NoLevel:
+ 		return ""
+ 	}
++	if name, ok := globalLevelRegistry.customLevelName(l); ok {
++		return name
++	}
+ 	return strconv.Itoa(int(l))
+ }
+ 
+@@ -197,6 +200,9 @@ func ParseLevel(levelStr string) (Level, error) {
+ 	case strings.EqualFold(levelStr, LevelFieldMarshalFunc(NoLevel)):
+ 		return NoLevel, nil
+ 	}
++	if lvl, ok := globalLevelRegistry.customLevelByName(levelStr); ok {
++		return lvl, nil
++	}
+ 	i, err := strconv.Atoi(levelStr)
+ 	if err != nil {
+ 		return NoLevel, fmt.Errorf("Unknown Level String: '%s', defaulting to NoLevel", levelStr)
+@@ -228,13 +234,14 @@ func (l Level) MarshalText() ([]byte, error) {
+ // serialization to the Writer. If your Writer is not thread safe,
+ // you may consider a sync wrapper.
+ type Logger struct {
+-	w       LevelWriter
+-	level   Level
+-	sampler Sampler
+-	context []byte
+-	hooks   []Hook
+-	stack   bool
+-	ctx     context.Context
++	w             LevelWriter
++	level         Level
++	sampler       Sampler
++	context       []byte
++	levelRegistry *LevelRegistry
++	hooks         []Hook
++	stack         bool
++	ctx           context.Context
+ }
+ 
+ // New creates a root logger with given output writer. If the output writer implements
+@@ -260,12 +267,19 @@ func Nop() Logger {
+ 	return New(nil).Level(Disabled)
+ }
+ 
++// LevelRegistry returns a new logger with the custom level registry applied.
++func (l Logger) LevelRegistry(registry *LevelRegistry) Logger {
++	l.levelRegistry = registry
++	return l
++}
++
+ // Output duplicates the current logger and sets w as its output.
+ func (l Logger) Output(w io.Writer) Logger {
+ 	l2 := New(w)
+ 	l2.level = l.level
+ 	l2.sampler = l.sampler
+ 	l2.stack = l.stack
++	l2.levelRegistry = l.levelRegistry
+ 	if len(l.hooks) > 0 {
+ 		l2.hooks = append(l2.hooks, l.hooks...)
+ 	}
+@@ -497,7 +511,16 @@ func (l *Logger) newEvent(level Level, done func(string)) *Event {
+ 	e := newEvent(l.w, level, l.stack, l.ctx, l.hooks)
+ 	e.done = done
+ 	if level != NoLevel && LevelFieldName != "" {
+-		e.Str(LevelFieldName, LevelFieldMarshalFunc(level))
++		var levelStr string
++		if l.levelRegistry != nil {
++			if name, ok := l.levelRegistry.customLevelName(level); ok {
++				levelStr = name
++			}
++		}
++		if levelStr == "" {
++			levelStr = LevelFieldMarshalFunc(level)
++		}
++		e.Str(LevelFieldName, levelStr)
+ 	}
+ 	if len(l.context) > 1 {
+ 		e.buf = enc.AppendObjectData(e.buf, l.context)
