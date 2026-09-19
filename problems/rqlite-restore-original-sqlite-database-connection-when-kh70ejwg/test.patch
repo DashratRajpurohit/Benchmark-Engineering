@@ -1,0 +1,241 @@
+diff --git a/db/swap_restore_b7e2c1_test.go b/db/swap_restore_b7e2c1_test.go
+new file mode 100644
+index 00000000..442a2fb1
+--- /dev/null
++++ b/db/swap_restore_b7e2c1_test.go
+@@ -0,0 +1,167 @@
++//go:build swaprestore
++
++package db
++
++import (
++	"os"
++	"testing"
++
++	command "github.com/rqlite/rqlite/v10/command/proto"
++	"github.com/rqlite/rqlite/v10/internal/fsutil"
++)
++
++// mustExecuteSwappable runs a single write statement against a SwappableDB
++// using only its public API.
++func mustExecuteSwappable(t *testing.T, s *SwappableDB, stmt string) {
++	t.Helper()
++	req := &command.Request{
++		Statements: []*command.Statement{{Sql: stmt}},
++	}
++	if _, err := s.Execute(req, false); err != nil {
++		t.Fatalf("failed to execute %q: %s", stmt, err)
++	}
++}
++
++// corruptSQLiteFile writes a file at path whose header passes
++// IsValidSQLiteFile (which only inspects the 16-byte magic string) but whose
++// body is garbage, so opening it as a real SQLite database fails.
++func corruptSQLiteFile(t *testing.T, path string) {
++	t.Helper()
++	data := make([]byte, 4096)
++	copy(data, []byte("SQLite format 3\x00"))
++	for i := 16; i < len(data); i++ {
++		data[i] = 0xFF
++	}
++	if err := os.WriteFile(path, data, 0644); err != nil {
++		t.Fatalf("failed to write corrupt SQLite file: %s", err)
++	}
++	if !IsValidSQLiteFile(path) {
++		t.Fatalf("test setup invalid: corrupt file does not pass IsValidSQLiteFile")
++	}
++}
++
++// Test_Swap_FailedOpen_RestoresOriginal confirms that when the replacement
++// database at the swap path fails to open, the SwappableDB recovers its
++// original database and remains fully usable with the data it had before
++// the failed swap was attempted.
++func Test_Swap_FailedOpen_RestoresOriginal(t *testing.T) {
++	swappablePath := mustTempPath()
++	defer os.Remove(swappablePath)
++	swappableDB, err := OpenSwappable(swappablePath, nil, false, false, 0)
++	if err != nil {
++		t.Fatalf("failed to open swappable database: %s", err)
++	}
++	defer swappableDB.Close()
++
++	mustExecuteSwappable(t, swappableDB, "CREATE TABLE foo (id INTEGER NOT NULL PRIMARY KEY, name TEXT)")
++	mustExecuteSwappable(t, swappableDB, `INSERT INTO foo(name) VALUES("original")`)
++
++	badPath := mustTempPath()
++	defer os.Remove(badPath)
++	corruptSQLiteFile(t, badPath)
++
++	if err := swappableDB.Swap(badPath, false, false); err == nil {
++		t.Fatalf("expected Swap to fail against a corrupt replacement database")
++	}
++
++	// The SwappableDB must still be usable, and must still contain the
++	// original data, not be left pointing at a closed or missing database.
++	rows, err := swappableDB.QueryStringStmt("SELECT * FROM foo")
++	if err != nil {
++		t.Fatalf("swappable database is unusable after failed swap: %s", err)
++	}
++	if exp, got := `[{"columns":["id","name"],"types":["integer","text"],"values":[[1,"original"]]}]`, asJSON(rows); exp != got {
++		t.Fatalf("unexpected results after failed swap, expected %s, got %s", exp, got)
++	}
++
++	// A subsequent write must also work, proving the recovered connection is
++	// not just readable but fully functional.
++	mustExecuteSwappable(t, swappableDB, `INSERT INTO foo(name) VALUES("after-recovery")`)
++
++	// No stray backup files should be left behind after the caller retries
++	// with a valid file and the swap succeeds.
++	goodPath := mustTempPath()
++	defer os.Remove(goodPath)
++	goodSrc, err := Open(goodPath, false, false)
++	if err != nil {
++		t.Fatalf("failed to create replacement database: %s", err)
++	}
++	mustExecute(goodSrc, "CREATE TABLE bar (id INTEGER NOT NULL PRIMARY KEY)")
++	if err := goodSrc.Close(); err != nil {
++		t.Fatalf("failed to close replacement database: %s", err)
++	}
++	if err := swappableDB.Swap(goodPath, false, false); err != nil {
++		t.Fatalf("expected swap with valid replacement to succeed after prior failed swap: %s", err)
++	}
++	if _, err := os.Stat(swappablePath + ".bak"); !os.IsNotExist(err) {
++		t.Fatalf("expected backup file to be removed after successful swap, stat err: %v", err)
++	}
++}
++
++// Test_Swap_FailedOpen_PreservesWALAndFKSettings confirms that a failed swap
++// recovers a WAL-mode, foreign-key-enabled original database with its WAL
++// and SHM files intact, and reopens it with its original settings rather
++// than the settings that were passed for the failed replacement.
++func Test_Swap_FailedOpen_PreservesWALAndFKSettings(t *testing.T) {
++	swappablePath := mustTempPath()
++	defer os.Remove(swappablePath)
++	swappableDB, err := OpenSwappable(swappablePath, nil, true, true, 0)
++	if err != nil {
++		t.Fatalf("failed to open swappable database: %s", err)
++	}
++	defer swappableDB.Close()
++
++	if !swappableDB.FKEnabled() || !swappableDB.WALEnabled() {
++		t.Fatalf("expected original database to have FK and WAL enabled")
++	}
++
++	mustExecuteSwappable(t, swappableDB, "CREATE TABLE parent (id INTEGER NOT NULL PRIMARY KEY)")
++	mustExecuteSwappable(t, swappableDB, "CREATE TABLE child (id INTEGER NOT NULL PRIMARY KEY, parent_id INTEGER REFERENCES parent(id))")
++	mustExecuteSwappable(t, swappableDB, "INSERT INTO parent(id) VALUES(1)")
++	mustExecuteSwappable(t, swappableDB, "INSERT INTO child(id, parent_id) VALUES(1, 1)")
++
++	if !fsutil.FileExists(swappablePath + "-wal") {
++		t.Fatalf("expected WAL file to exist before swap attempt")
++	}
++
++	badPath := mustTempPath()
++	defer os.Remove(badPath)
++	corruptSQLiteFile(t, badPath)
++
++	// Attempt the swap with different (disabled) FK/WAL settings; since the
++	// replacement fails to open, the original database's own settings must
++	// be what gets restored, not these.
++	if err := swappableDB.Swap(badPath, false, false); err == nil {
++		t.Fatalf("expected Swap to fail against a corrupt replacement database")
++	}
++
++	if !swappableDB.FKEnabled() || !swappableDB.WALEnabled() {
++		t.Fatalf("expected recovered database to preserve its original FK/WAL settings, got FKEnabled=%v WALEnabled=%v",
++			swappableDB.FKEnabled(), swappableDB.WALEnabled())
++	}
++	if !fsutil.FileExists(swappablePath + "-wal") {
++		t.Fatalf("expected WAL file to still exist after recovery")
++	}
++
++	// The foreign key constraint must still be enforced, proving the
++	// recovered connection was reopened with FK support, not just that the
++	// flag reads true.
++	req := &command.Request{
++		Statements: []*command.Statement{{Sql: "INSERT INTO child(id, parent_id) VALUES(2, 999)"}},
++	}
++	results, err := swappableDB.Execute(req, false)
++	if err != nil {
++		t.Fatalf("unexpected error executing statement: %s", err)
++	}
++	if len(results) != 1 || results[0].GetError() == "" {
++		t.Fatalf("expected foreign key violation to be rejected after recovery, got %v", results)
++	}
++
++	rows, err := swappableDB.QueryStringStmt("SELECT * FROM child ORDER BY id")
++	if err != nil {
++		t.Fatalf("swappable database is unusable after failed swap: %s", err)
++	}
++	if exp, got := `[{"columns":["id","parent_id"],"types":["integer","integer"],"values":[[1,1]]}]`, asJSON(rows); exp != got {
++		t.Fatalf("unexpected results after failed swap, expected %s, got %s", exp, got)
++	}
++}
+diff --git a/test.sh b/test.sh
+new file mode 100755
+index 00000000..4e28eb4e
+--- /dev/null
++++ b/test.sh
+@@ -0,0 +1,62 @@
++#!/usr/bin/env bash
++# Test runner for the SwappableDB.Swap failed-open recovery task.
++#
++# Usage:
++#   ./test.sh [--output_path <junit.xml>] <base|new>
++#
++#   base  runs the repository's existing test suite as a regression check.
++#         Must pass both before and after the solution is applied. Run
++#         without the swaprestore build tag, so the new tests below are not
++#         even compiled into this run.
++#   new   runs only the new regression tests added for this task, in
++#         db/swap_restore_b7e2c1_test.go. These tests exercise Swap's
++#         existing, exported behavior (no new API is introduced), so they
++#         compile and run both before and after solution.patch is applied -
++#         before the fix they fail with assertion errors describing the bug,
++#         and after the fix they pass. The swaprestore build tag gates the
++#         test file so it's excluded from ordinary `base` runs.
++set -uo pipefail
++
++cd /app
++
++OUTPUT_PATH=""
++if [ "${1:-}" = "--output_path" ]; then
++  OUTPUT_PATH="$2"
++  shift 2
++fi
++
++MODE="${1:-new}"
++
++TEST_LOG="$(mktemp)"
++STATUS=0
++
++run_tests() {
++  go test -count=1 -v "$@" 2>&1 | tee -a "$TEST_LOG"
++  status=${PIPESTATUS[0]}
++  if [ "$status" -ne 0 ]; then
++    STATUS=$status
++  fi
++}
++
++case "$MODE" in
++  base)
++    mapfile -t PKGS < <(go list ./...)
++    # Test_Geopoly is skipped: it fails identically on an unmodified checkout
++    # of this commit in this container (a floating-point formatting mismatch
++    # from the SQLite geopoly extension, unrelated to this task's change).
++    run_tests -skip 'Test_Geopoly' "${PKGS[@]}"
++    ;;
++  new)
++    run_tests -tags swaprestore ./db/... -run 'Test_Swap_FailedOpen_RestoresOriginal|Test_Swap_FailedOpen_PreservesWALAndFKSettings'
++    ;;
++  *)
++    echo "unknown mode: $MODE (expected base or new)" >&2
++    exit 2
++    ;;
++esac
++
++if [ -n "$OUTPUT_PATH" ]; then
++  go-junit-report -set-exit-code < "$TEST_LOG" > "$OUTPUT_PATH" || true
++fi
++
++exit "$STATUS"

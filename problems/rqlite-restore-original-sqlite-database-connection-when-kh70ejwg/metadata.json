@@ -1,0 +1,17 @@
+{
+  "problemId": "kh70ejwg9kxtbb7g1eq7fp3sxd8eqyr6",
+  "title": "Restore original SQLite database connection when replacement open fails during hot-swap",
+  "status": "draft",
+  "version": 0,
+  "versionId": "kd73af411a33s222tpmtd4qeeh8eqh4t",
+  "isLocked": false,
+  "language": "go",
+  "difficulty": null,
+  "category": "bugfix",
+  "repoUrl": "https://github.com/rqlite/rqlite",
+  "commitHash": "fa20113319490355fdf3e33f6f7a16bd6aa97137",
+  "githubIssueUrl": null,
+  "estimatedLOC": null,
+  "testOutputMode": null,
+  "downloadedAt": "2026-10-24T17:10:32.453Z"
+}

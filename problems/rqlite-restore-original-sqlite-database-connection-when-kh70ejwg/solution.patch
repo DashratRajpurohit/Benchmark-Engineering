@@ -1,0 +1,114 @@
+diff --git a/db/swappable_db.go b/db/swappable_db.go
+index c616e9cc..aeef5bc4 100644
+--- a/db/swappable_db.go
++++ b/db/swappable_db.go
+@@ -10,6 +10,7 @@ import (
+ 	"time"
+ 
+ 	command "github.com/rqlite/rqlite/v10/command/proto"
++	"github.com/rqlite/rqlite/v10/internal/fsutil"
+ )
+ 
+ // SwappableDB is a wrapper around DB that allows the underlying database to be swapped out
+@@ -48,6 +49,12 @@ func OpenSwappable(dbPath string, drv *Driver, fkEnabled, wal bool, maxROConns i
+ // Swap swaps the underlying database with that at the given path. The Swap operation
+ // may fail on some platforms if the file at path is open by another process. It is
+ // the caller's responsibility to ensure the file at path is not in use.
++//
++// If the replacement database at path cannot be opened, the original database's
++// backing files are recovered and the original database is reopened, so the
++// SwappableDB remains usable with the data it had before the failed Swap. Only
++// once the replacement has been confirmed to open successfully are the original
++// database's files discarded.
+ func (s *SwappableDB) Swap(path string, fkConstraints, walEnabled bool) error {
+ 	if !IsValidSQLiteFile(path) {
+ 		return fmt.Errorf("invalid SQLite data")
+@@ -55,21 +62,55 @@ func (s *SwappableDB) Swap(path string, fkConstraints, walEnabled bool) error {
+ 
+ 	s.dbMu.Lock()
+ 	defer s.dbMu.Unlock()
++
++	origPath := s.db.Path()
++	origFK := s.db.FKEnabled()
++	origWAL := s.db.WALEnabled()
++
+ 	if err := s.db.Close(); err != nil {
+ 		return fmt.Errorf("failed to close: %s", err)
+ 	}
+-	if err := RemoveFiles(s.db.Path()); err != nil {
+-		return fmt.Errorf("failed to remove files: %s", err)
++
++	backupPath := origPath + ".bak"
++	if err := RemoveFiles(backupPath); err != nil {
++		return fmt.Errorf("failed to clear stale backup: %s", err)
++	}
++	if err := renameDBFiles(origPath, backupPath); err != nil {
++		return fmt.Errorf("failed to back up original database: %s", err)
+ 	}
+-	if err := os.Rename(path, s.db.Path()); err != nil {
+-		return fmt.Errorf("failed to rename database: %s", err)
++
++	// restoreOriginal moves the backed-up original files back into place and
++	// reopens the original database with its original settings, so a failed
++	// Swap leaves the SwappableDB usable rather than pointing at nothing.
++	restoreOriginal := func(swapErr error) error {
++		if err := RemoveFiles(origPath); err != nil {
++			return fmt.Errorf("swap failed (%s) and original database could not be recovered: %s", swapErr, err)
++		}
++		if err := renameDBFiles(backupPath, origPath); err != nil {
++			return fmt.Errorf("swap failed (%s) and original database could not be recovered: %s", swapErr, err)
++		}
++		db, err := OpenWithDriver(s.drv, origPath, origFK, origWAL)
++		if err != nil {
++			return fmt.Errorf("swap failed (%s) and original database could not be reopened: %s", swapErr, err)
++		}
++		s.db = db
++		return fmt.Errorf("open SQLite file failed: %s", swapErr)
++	}
++
++	if err := os.Rename(path, origPath); err != nil {
++		return restoreOriginal(fmt.Errorf("failed to rename database: %s", err))
+ 	}
+ 
+-	db, err := OpenWithDriver(s.drv, s.db.Path(), fkConstraints, walEnabled)
++	db, err := OpenWithDriver(s.drv, origPath, fkConstraints, walEnabled)
+ 	if err != nil {
+-		return fmt.Errorf("open SQLite file failed: %s", err)
++		return restoreOriginal(err)
+ 	}
+ 	s.db = db
++
++	if err := RemoveFiles(backupPath); err != nil {
++		return fmt.Errorf("failed to remove backup files after successful swap: %s", err)
++	}
++
+ 	if err := s.checkpointMgr.Close(); err != nil {
+ 		return fmt.Errorf("failed to close checkpoint manager: %s", err)
+ 	}
+@@ -81,6 +122,26 @@ func (s *SwappableDB) Swap(path string, fkConstraints, walEnabled bool) error {
+ 	return nil
+ }
+ 
++// renameDBFiles moves a SQLite database file, and any associated WAL and SHM
++// files, from srcPath to dstPath. If a WAL or SHM file does not exist at
++// srcPath, it is simply not moved.
++func renameDBFiles(srcPath, dstPath string) error {
++	if err := os.Rename(srcPath, dstPath); err != nil {
++		return err
++	}
++	if fsutil.FileExists(srcPath + "-wal") {
++		if err := os.Rename(srcPath+"-wal", dstPath+"-wal"); err != nil {
++			return err
++		}
++	}
++	if fsutil.FileExists(srcPath + "-shm") {
++		if err := os.Rename(srcPath+"-shm", dstPath+"-shm"); err != nil {
++			return err
++		}
++	}
++	return nil
++}
++
+ // Close closes the underlying database.
+ func (s *SwappableDB) Close() error {
+ 	s.dbMu.RLock()
