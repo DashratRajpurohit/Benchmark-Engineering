@@ -1,0 +1,17 @@
+{
+  "problemId": "kh708xbe8tsp5waj9n781njef18eprcw",
+  "title": "gitindex silently indexes a fraction of the repository when part of the object store is unreadable",
+  "status": "draft",
+  "version": 0,
+  "versionId": "kd7ah8sfry7w1amf5j0zjphte98eq6dn",
+  "isLocked": false,
+  "language": "go",
+  "difficulty": null,
+  "category": "bugfix",
+  "repoUrl": "https://github.com/sourcegraph/zoekt",
+  "commitHash": "eff4bc10cb945064577a64e0faf7ee338698e923",
+  "githubIssueUrl": null,
+  "estimatedLOC": null,
+  "testOutputMode": null,
+  "downloadedAt": "2026-10-24T17:10:30.496Z"
+}
