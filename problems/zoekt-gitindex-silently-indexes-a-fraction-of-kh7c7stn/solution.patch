@@ -1,0 +1,92 @@
+diff --git a/gitindex/index.go b/gitindex/index.go
+index 4042f689..94a0ae34 100644
+--- a/gitindex/index.go
++++ b/gitindex/index.go
+@@ -843,6 +843,13 @@ func openOptimizedRepo(repoDir string) (*git.Repository, io.Closer, error) {
+ 	s := filesystem.NewStorageWithOptions(fs, cache.NewObjectLRUDefault(), filesystem.Options{
+ 		// Cache the packfile handles, preventing the packfile from being opened then closed on every object access
+ 		KeepDescriptors: true,
++		// fs above is chrooted to the repository's own .git directory, so a
++		// relative object-store lookup can never resolve an absolute
++		// alternates path (as written by e.g. `git clone --shared`) from
++		// inside that chroot. Without AlternatesFS, objects that exist only
++		// in the alternate object store read back as not found; rooting it
++		// at "/" lets the absolute path in objects/info/alternates resolve.
++		AlternatesFS: osfs.New("/"),
+ 	})
+ 
+ 	// Because we're keeping descriptors open, we need to close the storage object when we're done.
+diff --git a/gitindex/tree.go b/gitindex/tree.go
+index b14f0e25..553f5d3a 100644
+--- a/gitindex/tree.go
++++ b/gitindex/tree.go
+@@ -16,7 +16,6 @@ package gitindex
+ 
+ import (
+ 	"fmt"
+-	"io"
+ 	"log"
+ 	"net/url"
+ 	"path"
+@@ -108,21 +107,52 @@ func (rw *RepoWalker) CollectFiles(t *object.Tree, branch string, ig *ignore.Mat
+ 		return nil, fmt.Errorf("newIgnoreMatcher: %w", err)
+ 	}
+ 
+-	tw := object.NewTreeWalker(t, true, make(map[plumbing.Hash]bool))
+-	defer tw.Close()
+-
+ 	// Path => commit SHA1
+ 	subRepoVersions := make(map[string]plumbing.Hash)
+-	for {
+-		name, entry, err := tw.Next()
+-		if err == io.EOF {
+-			break
++	seen := make(map[plumbing.Hash]bool)
++	if err := rw.walkTree(t, "", seen, branch, subRepoVersions, ig); err != nil {
++		return nil, fmt.Errorf("walkTree: %w", err)
++	}
++	return subRepoVersions, nil
++}
++
++// walkTree recursively visits every entry of t, calling handleEntry for
++// each blob and recursing into subtrees.
++//
++// This does not use object.NewTreeWalker: that walker reports a subtree it
++// cannot load as io.EOF, which is exactly the signal it also uses for
++// "the walk finished normally". A build could not tell "every file is
++// indexed" from "part of the tree was silently skipped", so a shard could
++// end up holding a fraction of the repository and report success. walkTree
++// instead calls Tree.Tree per directory entry and propagates whatever
++// error that returns, so an unreadable subtree aborts the build with a
++// real error instead of producing a short, silently incomplete shard.
++func (rw *RepoWalker) walkTree(t *object.Tree, base string, seen map[plumbing.Hash]bool, branch string, subRepoVersions map[string]plumbing.Hash, ig *ignore.Matcher) error {
++	for i := range t.Entries {
++		entry := t.Entries[i]
++		if seen[entry.Hash] {
++			continue
++		}
++		seen[entry.Hash] = true
++
++		name := path.Join(base, entry.Name)
++
++		if entry.Mode == filemode.Dir {
++			sub, err := t.Tree(entry.Name)
++			if err != nil {
++				return fmt.Errorf("reading tree %q: %w", name, err)
++			}
++			if err := rw.walkTree(sub, name, seen, branch, subRepoVersions, ig); err != nil {
++				return err
++			}
++			continue
+ 		}
++
+ 		if err := rw.handleEntry(name, &entry, branch, subRepoVersions, ig); err != nil {
+-			return nil, fmt.Errorf("handleEntry: %w", err)
++			return fmt.Errorf("handleEntry: %w", err)
+ 		}
+ 	}
+-	return subRepoVersions, nil
++	return nil
+ }
+ 
+ func (rw *RepoWalker) tryHandleSubmodule(p string, id *plumbing.Hash, branch string, subRepoVersions map[string]plumbing.Hash, ig *ignore.Matcher) error {

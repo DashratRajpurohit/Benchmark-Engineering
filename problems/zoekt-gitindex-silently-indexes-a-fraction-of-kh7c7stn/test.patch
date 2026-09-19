@@ -1,0 +1,306 @@
+diff --git a/gitindex/eof_regression_test.go b/gitindex/eof_regression_test.go
+new file mode 100644
+index 00000000..f14b182f
+--- /dev/null
++++ b/gitindex/eof_regression_test.go
+@@ -0,0 +1,218 @@
++// Copyright 2016 Google Inc. All rights reserved.
++//
++// Licensed under the Apache License, Version 2.0 (the "License");
++// you may not use this file except in compliance with the License.
++// You may obtain a copy of the License at
++//
++//    http://www.apache.org/licenses/LICENSE-2.0
++//
++// Unless required by applicable law or agreed to in writing, software
++// distributed under the License is distributed on an "AS IS" BASIS,
++// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++// See the License for the specific language governing permissions and
++// limitations under the License.
++
++package gitindex
++
++import (
++	"context"
++	"fmt"
++	"os"
++	"os/exec"
++	"path/filepath"
++	"strings"
++	"testing"
++
++	"github.com/grafana/regexp"
++
++	"github.com/sourcegraph/zoekt"
++	"github.com/sourcegraph/zoekt/index"
++	"github.com/sourcegraph/zoekt/query"
++	"github.com/sourcegraph/zoekt/search"
++)
++
++// createSharedCloneRepo builds a base repository "A" with files spread
++// across several subdirectories, then a clone "B" that shares A's object
++// store (git clone --shared) and adds one more commit. Every object that
++// predates the clone therefore lives only in A, reachable from B only via
++// the alternates file B/.git/objects/info/alternates.
++func createSharedCloneRepo(dir string) error {
++	if err := os.MkdirAll(dir, 0o755); err != nil {
++		return err
++	}
++	script := `
++export GIT_CONFIG_COUNT=1
++export GIT_CONFIG_KEY_0=protocol.file.allow
++export GIT_CONFIG_VALUE_0=always
++
++git init -q -b master A
++cd A
++git config user.email "you@example.com"
++git config user.name "Your Name"
++mkdir -p dir0 dir1 dir2 dir3
++echo "content 0" > dir0/f0.go
++echo "content 1" > dir1/f1.go
++echo "content 2" > dir2/f2.go
++echo "content 3" > dir3/f3.go
++git add -A
++git commit -qam base
++git repack -a -d -q
++cd ..
++
++git clone -q --shared A B
++cd B
++git config user.email "you@example.com"
++git config user.name "Your Name"
++echo "// touched" >> dir0/f0.go
++git add -A
++git commit -qam touch
++`
++	cmd := exec.Command("/bin/sh", "-euxc", script)
++	cmd.Dir = dir
++	cmd.Env = gitTestEnv()
++	if out, err := cmd.CombinedOutput(); err != nil {
++		return fmt.Errorf("execution error: %v, output %s", err, out)
++	}
++	return nil
++}
++
++// TestIndexSharedCloneAlternates guards against a regression where a
++// repository cloned with `git clone --shared` -- so most of its objects
++// live only in the origin's object store, reachable via an alternates
++// file -- silently indexed only the files that happened to live directly
++// in the clone's own object store, dropping every file that required
++// following the alternates path, without any error or warning.
++func TestIndexSharedCloneAlternates(t *testing.T) {
++	t.Parallel()
++
++	dir := t.TempDir()
++	if err := createSharedCloneRepo(dir); err != nil {
++		t.Fatalf("createSharedCloneRepo: %v", err)
++	}
++
++	indexDir := t.TempDir()
++	buildOpts := index.Options{
++		IndexDir: indexDir,
++		RepositoryDescription: zoekt.Repository{
++			Name: "B",
++		},
++	}
++	buildOpts.SetDefaults()
++
++	opts := Options{
++		RepoDir:      filepath.Join(dir, "B"),
++		BuildOptions: buildOpts,
++		BranchPrefix: "refs/heads/",
++		Branches:     []string{"master"},
++		Incremental:  true,
++	}
++	if _, err := IndexGitRepo(opts); err != nil {
++		t.Fatalf("IndexGitRepo: %v", err)
++	}
++
++	searcher, err := search.NewDirectorySearcher(indexDir)
++	if err != nil {
++		t.Fatalf("NewDirectorySearcher: %v", err)
++	}
++	defer searcher.Close()
++
++	rlist, err := searcher.List(context.Background(), &query.Repo{Regexp: regexp.MustCompile("B")}, nil)
++	if err != nil {
++		t.Fatalf("List: %v", err)
++	}
++	if len(rlist.Repos) != 1 {
++		t.Fatalf("got %d repos, want 1", len(rlist.Repos))
++	}
++
++	// All four files must be present: dir0/f0.go was touched in B itself,
++	// but dir1, dir2 and dir3 exist only via the alternates path to A.
++	if got, want := rlist.Repos[0].Stats.Documents, 4; got != want {
++		t.Fatalf("got %d indexed documents, want %d (a subtree reachable only "+
++			"through git alternates was silently dropped)", got, want)
++	}
++}
++
++// createUnreadableSubtreeRepo builds a small repository, then deletes the
++// loose object backing one subdirectory's tree after it has already been
++// referenced by a commit, simulating a corrupted or partially-transferred
++// object store: the reference to that subtree exists, but its content
++// cannot be read.
++func createUnreadableSubtreeRepo(dir string) (missingTreeHash string, err error) {
++	if err := os.MkdirAll(dir, 0o755); err != nil {
++		return "", err
++	}
++	script := `
++git init -q -b master repo
++cd repo
++git config user.email "you@example.com"
++git config user.name "Your Name"
++mkdir -p keep drop
++echo "kept" > keep/k.go
++echo "dropped" > drop/d.go
++git add -A
++git commit -qam base
++
++# Print the tree hash for the "drop" subdirectory, then delete its loose
++# object so the reference in the parent tree can no longer be read.
++tree_hash=$(git rev-parse HEAD:drop)
++echo "TREE_HASH=$tree_hash"
++loose_path=".git/objects/${tree_hash:0:2}/${tree_hash:2}"
++if [ ! -f "$loose_path" ]; then
++  echo "expected loose object at $loose_path" >&2
++  exit 1
++fi
++rm "$loose_path"
++`
++	cmd := exec.Command("/bin/sh", "-euxc", script)
++	cmd.Dir = dir
++	cmd.Env = gitTestEnv()
++	out, cmdErr := cmd.CombinedOutput()
++	if cmdErr != nil {
++		return "", fmt.Errorf("execution error: %v, output %s", cmdErr, out)
++	}
++	for _, line := range strings.Split(string(out), "\n") {
++		if hash, ok := strings.CutPrefix(line, "TREE_HASH="); ok {
++			return hash, nil
++		}
++	}
++	return "", fmt.Errorf("did not find TREE_HASH in output: %s", out)
++}
++
++// TestIndexUnreadableSubtreeFailsLoudly guards against a regression where a
++// tree whose subtree cannot be read (here: its loose object is missing, as
++// happens with a corrupted or partially-transferred object store) is
++// indexed anyway, silently omitting every file under that subtree instead
++// of the build failing.
++func TestIndexUnreadableSubtreeFailsLoudly(t *testing.T) {
++	t.Parallel()
++
++	dir := t.TempDir()
++	missingTreeHash, err := createUnreadableSubtreeRepo(dir)
++	if err != nil {
++		t.Fatalf("createUnreadableSubtreeRepo: %v", err)
++	}
++	if missingTreeHash == "" {
++		t.Fatalf("createUnreadableSubtreeRepo returned an empty tree hash")
++	}
++
++	indexDir := t.TempDir()
++	buildOpts := index.Options{
++		IndexDir: indexDir,
++		RepositoryDescription: zoekt.Repository{
++			Name: "repo",
++		},
++	}
++	buildOpts.SetDefaults()
++
++	opts := Options{
++		RepoDir:      filepath.Join(dir, "repo"),
++		BuildOptions: buildOpts,
++		BranchPrefix: "refs/heads/",
++		Branches:     []string{"master"},
++		Incremental:  true,
++	}
++	if _, err := IndexGitRepo(opts); err == nil {
++		t.Fatalf("IndexGitRepo succeeded despite an unreadable subtree; " +
++			"it should have failed instead of silently indexing a partial tree")
++	}
++}
+diff --git a/test.sh b/test.sh
+new file mode 100755
+index 00000000..656c050c
+--- /dev/null
++++ b/test.sh
+@@ -0,0 +1,76 @@
++#!/usr/bin/env bash
++# Test runner for the gitindex silent-partial-shard regression (unreadable
++# subtree, git-alternates clones).
++#
++# Usage:
++#   ./test.sh [--output_path <junit.xml>] <base|new>
++#
++# base  runs the pre-existing gitindex package regression suite. Must pass
++#       both before and after the solution is applied.
++# new   runs the two new regression tests: a repository cloned with
++#       `git clone --shared` must index every file reachable via the
++#       alternates object store, and a repository with a genuinely
++#       unreadable subtree must fail indexing with an error instead of
++#       silently publishing a shard with fewer files than the tree has.
++#       Both fail before the solution and pass after it.
++set -uo pipefail
++
++cd /app
++
++OUTPUT_PATH=""
++if [ "${1:-}" = "--output_path" ]; then
++  OUTPUT_PATH="$2"
++  shift 2
++fi
++
++MODE="${1:-new}"
++
++TEST_LOG="$(mktemp)"
++STATUS=0
++
++run_tests() {
++  regex="$1"
++  shift
++  go test -count=1 -v -run "$regex" "$@" 2>&1 | tee -a "$TEST_LOG"
++  status=${PIPESTATUS[0]}
++  if [ "$status" -ne 0 ]; then
++    STATUS=$status
++  fi
++}
++
++run_tests_skip() {
++  skip="$1"
++  shift
++  go test -count=1 -v -skip "$skip" "$@" 2>&1 | tee -a "$TEST_LOG"
++  status=${PIPESTATUS[0]}
++  if [ "$status" -ne 0 ]; then
++    STATUS=$status
++  fi
++}
++
++case "$MODE" in
++  base)
++    # The new tests below live in the same gitindex package as the rest of
++    # its regression suite, so they must be explicitly excluded here -
++    # otherwise they'd run as part of "base" too and fail pre-solution.
++    run_tests_skip '^(TestIndexSharedCloneAlternates|TestIndexUnreadableSubtreeFailsLoudly)$' ./gitindex/...
++    ;;
++  new)
++    run_tests '^(TestIndexSharedCloneAlternates|TestIndexUnreadableSubtreeFailsLoudly)$' ./gitindex/...
++    ;;
++  *)
++    echo "unknown mode: $MODE (expected base or new)" >&2
++    exit 2
++    ;;
++esac
++
++if [ -n "$OUTPUT_PATH" ]; then
++  go-junit-report -set-exit-code < "$TEST_LOG" > "$OUTPUT_PATH"
++  junit_status=$?
++  if [ "$junit_status" -ne 0 ] && [ "$STATUS" -eq 0 ]; then
++    echo "go-junit-report failed to convert the test log (exit $junit_status)" >&2
++    STATUS=$junit_status
++  fi
++fi
++
++exit "$STATUS"
