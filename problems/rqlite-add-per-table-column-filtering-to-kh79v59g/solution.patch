@@ -1,0 +1,1740 @@
+diff --git a/cdc/DESIGN.md b/cdc/DESIGN.md
+index 61109b49..1dcdbe5a 100644
+--- a/cdc/DESIGN.md
++++ b/cdc/DESIGN.md
+@@ -75,6 +75,8 @@ A **row-IDs-only mode** is available (`row_ids_only` in the config) which omits
+ 
+ **Table filtering** is supported via a regular expression (`table_filter` in the config). When set, only changes to tables whose names match the pattern are captured.
+ 
++**Column filtering** lets an operator exclude specific columns, per table, from the before/after row data (`column_filter` in the config, mapping a table name to the column names to exclude for it). A table absent from the map is unaffected, and an unknown column name is ignored rather than treated as an error. It composes with both `row_ids_only` (which already omits all column data, so `column_filter` has nothing to do) and `table_filter` (which still decides which tables are captured at all). Excluded columns are removed from both `before` and `after` for every event type, and the column-name list on each event always lines up, position for position, with the row values sent.
++
+ ## Key Components
+ 
+ ### Service
+@@ -197,6 +199,7 @@ The CDC service is configured via `-cdc-config`, which accepts either:
+ | `service_id` | (empty) | Optional identifier for multi-cluster setups |
+ | `row_ids_only` | false | Omit before/after column data |
+ | `table_filter` | (none) | Regex to filter which tables are captured |
++| `column_filter` | (none) | Per-table column names to exclude from row data |
+ | `max_batch_size` | 10 | Max events per HTTP request |
+ | `max_batch_delay` | 200ms | Max time before flushing a partial batch |
+ | `high_watermark_interval` | 1s | How often the leader broadcasts the HWM |
+diff --git a/cdc/config.go b/cdc/config.go
+index 2e0c3387..0c4e6955 100644
+--- a/cdc/config.go
++++ b/cdc/config.go
+@@ -3,6 +3,7 @@ package cdc
+ import (
+ 	"crypto/tls"
+ 	"encoding/json"
++	"fmt"
+ 	"net/url"
+ 	"os"
+ 	"strings"
+@@ -72,6 +73,14 @@ type Config struct {
+ 	// only changes to tables whose names match the regular expression are captured.
+ 	TableFilter *regexp.Regexp `json:"table_filter,omitempty"`
+ 
++	// ColumnFilter is an optional map from table name to a list of column names that should
++	// be excluded from the before/after row data of CDC events for that table. Tables that
++	// are not present in the map are unaffected, and unknown column names are ignored. This
++	// is independent of TableFilter and RowIDsOnly, and composes with both: RowIDsOnly already
++	// omits all row data, so ColumnFilter has nothing to do in that case, and TableFilter still
++	// decides which tables are captured at all.
++	ColumnFilter map[string][]string `json:"column_filter,omitempty"`
++
+ 	// TLS configuration
+ 	TLS *TLSConfiguration `json:"tls,omitempty"`
+ 
+@@ -171,6 +180,9 @@ func NewConfig(s string) (*Config, error) {
+ 	if err := json.Unmarshal(data, &config); err != nil {
+ 		return nil, err
+ 	}
++	if err := config.validateColumnFilter(); err != nil {
++		return nil, err
++	}
+ 
+ 	// Ensure all fields have sensible values, using defaults where necessary.
+ 	if config.MaxBatchSz <= 0 {
+@@ -197,3 +209,21 @@ func NewConfig(s string) (*Config, error) {
+ func intPtr(v int) *int {
+ 	return &v
+ }
++
++// validateColumnFilter checks that ColumnFilter, if set, does not contain an empty table
++// name or an empty column name, both of which indicate a malformed configuration file.
++// "Empty" means the zero-length string specifically -- a name that is merely whitespace
++// (for example " ", a valid quoted SQLite identifier) is not rejected here.
++func (c *Config) validateColumnFilter() error {
++	for table, cols := range c.ColumnFilter {
++		if table == "" {
++			return fmt.Errorf("column_filter contains an empty table name")
++		}
++		for _, col := range cols {
++			if col == "" {
++				return fmt.Errorf("column_filter for table %q contains an empty column name", table)
++			}
++		}
++	}
++	return nil
++}
+diff --git a/cmd/rqlited/main.go b/cmd/rqlited/main.go
+index 67c0dc58..928c5bce 100644
+--- a/cmd/rqlited/main.go
++++ b/cmd/rqlited/main.go
+@@ -397,7 +397,7 @@ func createCDC(cfg *Config, str *store.Store, clstrServ *cluster.Service, clstrC
+ 	if cdcCfg.TableFilter != nil {
+ 		re = cdcCfg.TableFilter.Regexp
+ 	}
+-	if err := str.EnableCDC(cdcService.C(), re, cdcCfg.RowIDsOnly); err != nil {
++	if err := str.EnableCDC(cdcService.C(), re, cdcCfg.RowIDsOnly, cdcCfg.ColumnFilter); err != nil {
+ 		return nil, fmt.Errorf("failed to enable CDC on Store: %s", err.Error())
+ 	}
+ 	return cdcService, nil
+diff --git a/db/DESIGN.md b/db/DESIGN.md
+index 2331af53..1b23924c 100644
+--- a/db/DESIGN.md
++++ b/db/DESIGN.md
+@@ -86,9 +86,17 @@ The compacting scanner has a `fullScan` mode that verifies every frame's checksu
+ 
+ ## CDC Integration
+ 
+-Change Data Capture is wired through SQLite's preupdate and commit hooks. The hooks are registered on the single `rwDB` connection — the same one that does all writes — via `RegisterPreUpdateHook` and `RegisterCommitHook`. Hook installation goes through `conn.Raw` because the registration methods are on the SQLite-specific connection type, not on the abstract `database/sql` connection.
++Change Data Capture is wired through SQLite's preupdate and commit hooks. The hooks are registered on the single `rwDB` connection — the same one that does all writes — via `RegisterPreUpdateHook` and `RegisterCommitHook`. Hook installation goes through `conn.Raw` because the registration methods are on the SQLite-specific connection type, not on the abstract `database/sql` connection. `RegisterPreCommitTxHook` and `RegisterPreStatementTxHook` are a third, unrelated kind of hook: plain Go callbacks `executeWithConn`/`RequestWithContext` invoke directly, with no SQLite callback and no `conn.Raw` involved at all — see below.
+ 
+-`CDCStreamer` (in `cdc.go`) is the in-package hook target. The preupdate hook appends an event to a pending group; the commit hook stamps the group with the current time, looks up column names per table (cached for the duration of the group), and non-blockingly sends the group to a channel. If the channel is full the event is dropped and a stat increments — by design, CDC is at-least-once on the receiver side, not back-pressuring the writer. The `CDCStreamer` lives in `db/` rather than in `cdc/` because its hook installation, its per-statement reset, and its lifecycle are all driven from inside the database write path; it is tightly bound to the SQLite hook plumbing and would only become harder to reason about if moved further away.
++`CDCStreamer` (in `cdc.go`) is the in-package hook target. The preupdate hook appends an event to a pending group; the commit hook stamps the group with the current time, looks up column names per table, and non-blockingly sends the group to a channel. If the channel is full the event is dropped and a stat increments — by design, CDC is at-least-once on the receiver side, not back-pressuring the writer. The `CDCStreamer` lives in `db/` rather than in `cdc/` because its hook installation, its per-statement reset, and its lifecycle are all driven from inside the database write path; it is tightly bound to the SQLite hook plumbing and would only become harder to reason about if moved further away.
++
++Per-table column names (which columns to exclude from a table's before/after row data is a separate, optional `column_filter`) are cached *across* commits, not just for the duration of one group — recomputing them from `db` on every commit is real overhead under sustained writes. A schema-version counter is the staleness signal: the commit hook re-reads it once per commit, and any change (or a read failure) discards the cache and re-derives it fresh. A database restore and a Raft leadership change can each replace what "the database" means without necessarily changing that counter observably, so `CDCStreamer.InvalidateAll()` is called explicitly for those two cases instead.
++
++That counter and those column names normally come from `ColumnsNameProvider.SchemaVersion()`/`ColumnNames()`, read through a connection distinct from the writer's (a pooled, read-only one) -- the same source and cache for every table, whether or not it has a `column_filter`. That's correct whenever a DDL statement against a table belongs to some earlier, already-completed commit -- the ordinary case, since `CDCStreamer`'s caller resets its pending events at the start of every new transaction -- but not when a single `Request` explicitly wraps a DDL statement and a row change to that table in one transaction (`Request.Transaction`, executed as one `BeginTx`/`Commit` pair in `db.go`'s `executeWithConn`/`RequestWithContext`): a separate, pooled connection cannot observe that transaction until it commits, and the commit hook itself cannot safely query anything, even read-only, through the connection that invoked it -- that restriction is exactly what an earlier version of this feature got wrong, retaining and reusing a raw connection from inside the hooks themselves.
++
++`CDCStreamer.PreCommitRefresh` covers the same-transaction case instead, from a different point in the write path entirely: `db.RegisterPreCommitTxHook` installs a callback that `executeWithConn`/`RequestWithContext` invoke as ordinary, sequential Go code, through the transaction's own `*sql.Tx`, immediately before calling `tx.Commit()` -- not from inside any SQLite callback, so none of the restrictions on hook reentrancy or `Conn.Raw` connection lifetime apply. By that point every statement in the transaction, DDL included, has already run against that same `*sql.Tx`, so a read through it sees the transaction's own uncommitted effects the way only the connection driving it can. `PreCommitRefresh` uses this to rebuild the cache for every table the pending batch needs, live, and marks `CDCStreamer.liveRefreshed` so the real, synchronous SQLite commit hook that fires moments later trusts that cache as-is rather than re-validating it against the pooled connection's still-pre-commit view. A table `PreCommitRefresh` cannot confirm (a query failure, never escalated to fail the write itself) is not left to the pooled path's fallback either, since that could describe the wrong schema for exactly the transaction this exists to handle -- its pending events are marked with an error instead.
++
++Knowing the transaction's final columns is only half of it, because a row's captured values are positional in whatever columns the table had *when that row was read*, and a later statement in the same transaction can add, drop, or rename one. Reconciling those values against the final columns by position is what would let a dropped column's leftover value be published under whatever column ends up in its old slot -- an excluded column's value included, since equal widths make the substitution invisible to any length check. `RegisterPreStatementTxHook` closes that gap: it installs a callback the same two functions invoke, through the same `*sql.Tx`, before each statement of an explicit transaction. `CDCStreamer.SnapshotCaptureLayouts` uses it to pin the columns of any already-captured row before the next statement can change them, so each pending event carries the layout it was actually read under. The commit hook then matches values to final columns by column *identity* (`remapCDCRow`): a surviving column keeps its value wherever it now sits, a column that did not exist at capture time is an explicit NULL, and a dropped or excluded column is simply never selected. An event no statement followed needs no snapshot -- nothing could have changed the table after it was read -- so the final columns describe it exactly.
+ 
+ The Store owns the streamer's lifecycle but delegates the row-data conversion (`normalizeCDCValues`) to this package, which is also where the SQLite-to-rqlite type mapping for query results lives.
+ 
+diff --git a/db/cdc.go b/db/cdc.go
+index 53b0f550..5ccf9034 100644
+--- a/db/cdc.go
++++ b/db/cdc.go
+@@ -1,31 +1,222 @@
+ package db
+ 
+ import (
++	"context"
++	"database/sql"
+ 	"fmt"
++	"slices"
++	"strings"
++	"sync"
+ 	"time"
+ 
+ 	command "github.com/rqlite/rqlite/v10/command/proto"
+ )
+ 
+-// ColumnsNameProvider provides column names for a given table.
++// ColumnsNameProvider provides column names for a given table, and a way to
++// detect when those names may have changed.
+ type ColumnsNameProvider interface {
+ 	ColumnNames(table string) ([]string, error)
++
++	// SchemaVersion returns a value that changes whenever the database's
++	// schema changes -- for example, when a table is created, altered, or
++	// dropped. It is used to detect that cached column-name information is
++	// stale without having to parse DDL. Implementations backed by SQLite
++	// can satisfy this directly with SQLite's own schema-version counter
++	// (PRAGMA schema_version), which SQLite increments on every schema
++	// change for the life of a given database file.
++	SchemaVersion() (int64, error)
++}
++
++// filterInfo holds, for one table, the column names that survive a
++// CDCStreamer's columnFilter -- in table order, and excluding any column the
++// filter names. It is the column-name list events for that table are
++// emitted with, and, because an excluded column simply is not in it, the
++// reason no excluded column's value is ever selected out of a captured
++// row.
++//
++// This holds names only, never column identity: unlike everything in
++// colIdentity, filterInfo is cached in s.filterCache across commits (see
++// the CDCStreamer doc comment), while column identity is deliberately
++// rebuilt from zero for every commit. Caching an identity here would let a
++// later commit's reconciliation compare against numbers minted for an
++// earlier, unrelated commit's tables -- which, because the numbering
++// restarts at zero every commit, can coincide with a completely different
++// column's identity in the new commit and leak its value. Filtering by
++// name alone carries no such risk: which names survive the filter is a
++// pure function of the schema and the configured exclusions, unaffected by
++// which commit is asking.
++type filterInfo struct {
++	names []string
++}
++
++// buildFilterInfo derives, from fullNames and the set of column names to
++// exclude, the retained column names, preserving order.
++func buildFilterInfo(fullNames []string, excluded map[string]struct{}) *filterInfo {
++	fi := &filterInfo{
++		names: make([]string, 0, len(fullNames)),
++	}
++	for _, n := range fullNames {
++		if _, skip := excluded[n]; skip {
++			continue
++		}
++		fi.names = append(fi.names, n)
++	}
++	return fi
++}
++
++// filteredIdentity selects, from full (a table's complete column identity
++// as of the current commit), the identity of each column named in names,
++// in the order given. names is normally a filterInfo's retained columns;
++// full is always this commit's own colLayout, never a cached one, so the
++// returned identity is never at risk of the cross-commit numbering
++// collision filterInfo's doc comment describes.
++func filteredIdentity(full *colLayout, names []string) *colLayout {
++	idx := make(map[string]int, len(full.names))
++	for i, n := range full.names {
++		idx[n] = i
++	}
++	ids := make([]int, 0, len(names))
++	for _, n := range names {
++		ids = append(ids, full.ids[idx[n]])
++	}
++	return &colLayout{names: names, ids: ids}
+ }
+ 
+ // CDCStreamer is a CDC streamer that collects events and sends them
+ // to a channel when the commit hook is called. It is used to stream
+ // changes to a client.
++//
++// Re-deriving a table's column names and filterInfo from db on every single
++// commit is always correct, but it isn't free -- real overhead under
++// sustained write load, often for the same handful of tables over and over.
++// CDCStreamer instead caches both across commits, and uses a change in the
++// current schema-version counter as the signal that the cache is stale: it
++// re-reads that value at the start of every commit that has pending events
++// and, if it has moved since the cache was built -- or hasn't been read
++// yet, or can't be read at all right now -- discards the cache and
++// re-derives everything fresh for that commit, failing safe rather than
++// risking stale data.
++//
++// Both values normally come from db.SchemaVersion() / db.ColumnNames(),
++// read through a separate, pooled connection -- the same source and the
++// same cache is used whether or not a table has a configured columnFilter.
++// That's correct whenever a DDL statement against a table belongs to some
++// earlier, already-completed commit (the ordinary case: CDCStreamer's own
++// caller resets its pending events at the start of every new transaction,
++// so a schema change and the row events it's read for are usually in
++// different commits entirely), but not when a single request explicitly
++// wraps a DDL statement and a row change to that table in one transaction:
++// a separate, pooled connection cannot observe that transaction at all
++// until it commits, and this commit hook itself runs from inside SQLite's
++// own commit-hook callback, where querying anything -- even read-only --
++// through the connection that invoked it is unsupported. PreCommitRefresh
++// covers exactly that case: called from ordinary, sequential Go code
++// immediately before such a transaction commits (see
++// db.PreCommitTxHookCallback), through the same *sql.Tx that already ran
++// every statement in it, it refreshes this cache using that transaction's
++// own view of its own uncommitted work -- something no read issued from
++// within CommitHook itself could safely do -- so that by the time the real
++// SQLite commit hook fires moments later, the cache already reflects that
++// transaction's final schema and CommitHook needs no further query at all.
++//
++// A database restore and a Raft leadership change can each replace what
++// "the database" means out from under a running CDCStreamer without
++// necessarily producing an observably different schema-version value: a
++// restored file's own counter can coincidentally match the value the cache
++// was built from, and a leadership change involves no schema change at
++// all. Neither is detectable by comparing schema-version values, so callers
++// must instead invoke InvalidateAll() explicitly when either occurs.
+ type CDCStreamer struct {
+-	pending *command.CDCIndexedEventGroup
+-	out     chan<- *command.CDCIndexedEventGroup
+-	db      ColumnsNameProvider
++	pending      *command.CDCIndexedEventGroup
++	out          chan<- *command.CDCIndexedEventGroup
++	db           ColumnsNameProvider
++	columnFilter map[string]map[string]struct{}
++
++	cacheMu sync.Mutex
++
++	haveVersion bool
++	version     int64
++	namesCache  map[string][]string
++	filterCache map[string]*filterInfo
++
++	// liveRefreshed is set by PreCommitRefresh and consumed by the very
++	// next CommitHook call: it means the cache above was just rebuilt,
++	// live, for this exact pending batch, and CommitHook must use it as
++	// though it were already validated, without re-checking it against
++	// db.SchemaVersion() -- a pooled read that, for the still-uncommitted
++	// transaction PreCommitRefresh just read live, would report an older
++	// version and cause CommitHook to discard exactly what PreCommitRefresh
++	// just correctly built.
++	liveRefreshed bool
++
++	// captureLayouts is index-aligned with pending.Events: entry i is the
++	// column identity of the table at the moment pending.Events[i]'s row
++	// values were read out of it, or nil if that is not yet established.
++	//
++	// A row's values are positional, and the positions mean whatever the
++	// table's columns were when the row was captured -- which is not
++	// necessarily what they are when the batch is finally reconciled, since
++	// a later statement in the same transaction can add, drop, or rename a
++	// column in between. Recording the layout at capture time, tagged with
++	// each column's identity rather than only its name, is what lets the two
++	// be reconciled correctly: a name alone cannot distinguish a renamed
++	// column from an unrelated one that happens to end up with its old name,
++	// nor a surviving column from a same-named column dropped and recreated
++	// in its place. See SnapshotCaptureLayouts and updateColumnIdentityLocked,
++	// which build these, and remapCDCRow, which consumes them.
++	//
++	// A nil entry means no statement ran after that row was captured, so
++	// nothing could have changed the table since: the transaction's final
++	// columns describe it exactly.
++	captureLayouts []*colLayout
++
++	// colIdentity tracks, per table referenced by a pending event, the
++	// identity of each of its columns as last observed within this batch. It
++	// is advanced one statement boundary at a time by
++	// updateColumnIdentityLocked, which is what makes a same-length change
++	// recognisable as a rename -- identity preserved, name changed -- rather
++	// than an unrelated column that happens to reuse a name, and a
++	// dropped-then-recreated column recognisable as a new identity rather
++	// than the one it replaced. It is rebuilt fresh for every batch: column
++	// identity is only ever compared within the batch that captured a row,
++	// never across commits.
++	colIdentity map[string]*colIdentityState
++
++	// nextIdentityID hands out the identifier for the next column identity
++	// created within this batch -- by a table's first sighting, or by an ADD
++	// COLUMN. It resets alongside colIdentity.
++	nextIdentityID int
++}
++
++// colLayout is one column layout: names in table order, and each one's
++// column identity, aligned by position. It is what a captured row's values
++// are positional against, and what a reconciled event's values are made
++// positional against in turn.
++type colLayout struct {
++	names []string
++	ids   []int
++}
++
++// colIdentityState is the column identity CDCStreamer has assigned to one
++// table as of the last statement boundary it observed within the current
++// batch. Its names and ids fields are always the same length and
++// index-aligned.
++type colIdentityState struct {
++	names []string
++	ids   []int
+ }
+ 
+ // NewCDCStreamer creates a new CDCStreamer. The out channel is used
+ // to send the collected events to the client. It is the caller's
+ // responsibility to ensure that the channel is read from, as the
+ // CDCStreamer will drop events if the channel is full.
+-func NewCDCStreamer(out chan<- *command.CDCIndexedEventGroup, db ColumnsNameProvider) (*CDCStreamer, error) {
++//
++// columnFilter, if non-nil, maps a table name to the set of column names that
++// should be excluded from the before/after row data of events for that table.
++// Tables absent from columnFilter are unaffected. columnFilter may be nil, in
++// which case no column is ever excluded.
++func NewCDCStreamer(out chan<- *command.CDCIndexedEventGroup, db ColumnsNameProvider,
++	columnFilter map[string][]string) (*CDCStreamer, error) {
+ 	if out == nil {
+ 		return nil, fmt.Errorf("nil out channel")
+ 	}
+@@ -33,15 +224,52 @@ func NewCDCStreamer(out chan<- *command.CDCIndexedEventGroup, db ColumnsNameProv
+ 		return nil, fmt.Errorf("nil ColumnsNameProvider")
+ 	}
+ 
++	var cf map[string]map[string]struct{}
++	if len(columnFilter) > 0 {
++		cf = make(map[string]map[string]struct{}, len(columnFilter))
++		for table, cols := range columnFilter {
++			if len(cols) == 0 {
++				continue
++			}
++			set := make(map[string]struct{}, len(cols))
++			for _, c := range cols {
++				set[c] = struct{}{}
++			}
++			cf[table] = set
++		}
++	}
++
+ 	return &CDCStreamer{
+ 		pending: &command.CDCIndexedEventGroup{
+ 			Events: make([]*command.CDCEvent, 0),
+ 		},
+-		out: out,
+-		db:  db,
++		out:          out,
++		db:           db,
++		columnFilter: cf,
++		namesCache:   make(map[string][]string),
++		filterCache:  make(map[string]*filterInfo),
++		colIdentity:  make(map[string]*colIdentityState),
+ 	}, nil
+ }
+ 
++// InvalidateAll discards any cached column-name and filter state, forcing
++// it to be re-derived on the next commit that needs it. Callers must invoke
++// this after a situation CDCStreamer cannot detect on its own by comparing
++// schema-version values -- a full database restore, or a change in which
++// node is driving CDC after a Raft leadership change. See the CDCStreamer
++// doc comment for why those two cases need this and DDL changes don't.
++func (s *CDCStreamer) InvalidateAll() {
++	s.cacheMu.Lock()
++	defer s.cacheMu.Unlock()
++	s.namesCache = make(map[string][]string)
++	s.filterCache = make(map[string]*filterInfo)
++	s.haveVersion = false
++	// A pending live refresh assumed the transaction that produced it
++	// would commit. If that turned out not to be true (or won't be known
++	// to be true), it must not be trusted by whatever commits next.
++	s.liveRefreshed = false
++}
++
+ // Reset resets the CDCStreamer. The K value is set to the
+ // current K value, and all pending events are cleared. This is used
+ // to reset the CDCStreamer before a new transaction is started.
+@@ -50,6 +278,11 @@ func (s *CDCStreamer) Reset(k uint64) {
+ 		Events: make([]*command.CDCEvent, 0),
+ 		Index:  k,
+ 	}
++	s.captureLayouts = nil
++	// Column identity is only ever meaningful within the batch that
++	// captured a row; a new batch starts with none assigned.
++	s.colIdentity = make(map[string]*colIdentityState)
++	s.nextIdentityID = 0
+ }
+ 
+ // Close closes the CDCStreamer. It closes the out channel.
+@@ -62,9 +295,176 @@ func (s *CDCStreamer) Close() error {
+ // the event and adds it to the pending events.
+ func (s *CDCStreamer) PreupdateHook(ev *command.CDCEvent) error {
+ 	s.pending.Events = append(s.pending.Events, ev)
++	// Runs inside a SQLite callback, where querying the connection that is
++	// mid-statement is not possible, so the layout this row was captured
++	// under is left unknown here and filled in by SnapshotCaptureLayouts
++	// before the next statement runs -- while the columns are still the ones
++	// this row was read with.
++	s.captureLayouts = append(s.captureLayouts, nil)
+ 	return nil
+ }
+ 
++// SnapshotCaptureLayouts advances the column identity of every table
++// referenced by a pending event to what that table's columns are right
++// now, and records that identity for any pending event whose capture-time
++// layout is not yet known. It is meant to be installed via
++// db.RegisterPreStatementTxHook, so that it runs between the statements of
++// an explicit transaction, through that transaction's own connection.
++//
++// Every referenced table's identity is advanced on every call, not only
++// while one of its events still needs a layout captured: a table can be
++// changed again by a later statement before any of its rows are finally
++// reconciled, and observing each statement boundary separately -- rather
++// than only the boundaries a still-uncaptured event happens to need -- is
++// what lets updateColumnIdentityLocked tell a rename apart from an
++// unrelated column that happens to end up with the same name, and a
++// dropped-then-recreated column apart from the one it replaced. See
++// updateColumnIdentityLocked and diffColumnIdentityOneStep.
++//
++// Running there is what makes the recorded layout the right one: a pending
++// event that still has no layout was captured by an earlier statement, and no
++// statement has run since, so the table's columns are necessarily still the
++// ones that event's row values were read with. Recording them before the next
++// statement executes captures them ahead of any schema change that statement
++// might make. Events captured later, under a layout a subsequent statement
++// then changes, are pinned the same way before that statement runs, so rows
++// captured on either side of a DDL each keep their own layout.
++//
++// A query failure leaves that table's identity and the layout unknown
++// rather than failing the write; reconciliation then falls back to the
++// transaction's final columns, which is the same assumption made for any
++// event no statement followed.
++func (s *CDCStreamer) SnapshotCaptureLayouts(ctx context.Context, q cdcPreCommitQueryer) {
++	s.cacheMu.Lock()
++	defer s.cacheMu.Unlock()
++
++	tables := make(map[string]struct{}, len(s.pending.Events))
++	for _, ev := range s.pending.Events {
++		tables[ev.Table] = struct{}{}
++	}
++
++	seen := make(map[string]struct{}, len(tables))
++	for table := range tables {
++		names, err := cdcQueryColumnNames(ctx, q, table)
++		if err != nil {
++			continue
++		}
++		seen[table] = struct{}{}
++		s.updateColumnIdentityLocked(table, names)
++	}
++
++	for i, ev := range s.pending.Events {
++		if i >= len(s.captureLayouts) || s.captureLayouts[i] != nil {
++			continue
++		}
++		if _, ok := seen[ev.Table]; !ok {
++			continue
++		}
++		state := s.colIdentity[ev.Table]
++		s.captureLayouts[i] = &colLayout{
++			names: append([]string(nil), state.names...),
++			ids:   append([]int(nil), state.ids...),
++		}
++	}
++}
++
++// updateColumnIdentityLocked brings table's tracked column identity up to
++// date with newNames: on this batch's first sighting of table, it assigns
++// each of newNames a fresh identity in order; otherwise it derives
++// newNames' identity from what was tracked before, via
++// diffColumnIdentityOneStep. A call that finds no change is a cheap no-op.
++// Callers must hold cacheMu.
++func (s *CDCStreamer) updateColumnIdentityLocked(table string, newNames []string) {
++	state, ok := s.colIdentity[table]
++	if !ok {
++		ids := make([]int, len(newNames))
++		for i := range ids {
++			ids[i] = s.nextIdentityID
++			s.nextIdentityID++
++		}
++		s.colIdentity[table] = &colIdentityState{
++			names: append([]string(nil), newNames...),
++			ids:   ids,
++		}
++		return
++	}
++	if slices.Equal(state.names, newNames) {
++		return
++	}
++	state.ids = diffColumnIdentityOneStep(state.names, state.ids, newNames, &s.nextIdentityID)
++	state.names = append([]string(nil), newNames...)
++}
++
++// diffColumnIdentityOneStep derives newNames' column identity from
++// oldNames' (oldIDs, aligned by position), on the assumption that the two
++// observations are one statement apart -- guaranteed by
++// updateColumnIdentityLocked being invoked at every statement boundary
++// rather than only when some event still needs a layout. SQLite's ALTER
++// TABLE always appends an added column at the end and never reorders
++// columns for a drop or a rename, which is what makes ADD, DROP, and
++// RENAME distinguishable from the resulting name list and its length
++// alone, without parsing the statement itself.
++func diffColumnIdentityOneStep(oldNames []string, oldIDs []int, newNames []string, nextID *int) []int {
++	switch {
++	case len(newNames) == len(oldNames)+1 && slices.Equal(oldNames, newNames[:len(oldNames)]):
++		// ADD COLUMN: everything before it is unchanged, and the appended
++		// column is a genuinely new identity.
++		id := *nextID
++		*nextID++
++		return append(append([]int(nil), oldIDs...), id)
++
++	case len(newNames) == len(oldNames)-1:
++		// DROP COLUMN: the two lists agree up to the dropped position and
++		// again from the position right after it, one slot earlier -- every
++		// later column shifts down without being reordered.
++		p := 0
++		for p < len(newNames) && oldNames[p] == newNames[p] {
++			p++
++		}
++		if slices.Equal(oldNames[p+1:], newNames[p:]) {
++			ids := append([]int(nil), oldIDs[:p]...)
++			return append(ids, oldIDs[p+1:]...)
++		}
++
++	case len(newNames) == len(oldNames):
++		// RENAME COLUMN: SQLite renames one column without reordering, so a
++		// same-length change with at most one differing position keeps every
++		// identity, including the renamed column's own -- it is still the
++		// same column under a new name.
++		mismatches := 0
++		for i := range oldNames {
++			if oldNames[i] != newNames[i] {
++				mismatches++
++			}
++		}
++		if mismatches <= 1 {
++			return append([]int(nil), oldIDs...)
++		}
++	}
++
++	// More changed between these two observations than a single ADD, DROP,
++	// or RENAME can explain. Treating every resulting column as newly
++	// identified is the safe fallback: reconciliation then emits NULL for
++	// it rather than risking another column's surviving value under the
++	// wrong name, which is exactly the failure mode column identity exists
++	// to prevent.
++	ids := make([]int, len(newNames))
++	for i := range ids {
++		ids[i] = *nextID
++		*nextID++
++	}
++	return ids
++}
++
++// captureLayoutAt returns the layout recorded for the event at index i, or
++// nil if none was established -- see the captureLayouts field.
++func (s *CDCStreamer) captureLayoutAt(i int) *colLayout {
++	if i < 0 || i >= len(s.captureLayouts) {
++		return nil
++	}
++	return s.captureLayouts[i]
++}
++
+ // CommitHook is called after the transaction is committed. It sends the
+ // pending events to the out channel and clears the pending events.
+ func (s *CDCStreamer) CommitHook() bool {
+@@ -75,18 +475,99 @@ func (s *CDCStreamer) CommitHook() bool {
+ 		return true
+ 	}
+ 
+-	colNamesCache := make(map[string][]string)
+-	for _, ev := range s.pending.Events {
+-		if _, ok := colNamesCache[ev.Table]; !ok {
++	s.cacheMu.Lock()
++	defer s.cacheMu.Unlock()
++
++	if s.liveRefreshed {
++		// PreCommitRefresh already rebuilt the cache for this exact batch,
++		// live, through this transaction's own connection -- see the
++		// CDCStreamer doc comment. Trust it as-is; a pooled
++		// db.SchemaVersion() read here would still be looking at the
++		// pre-transaction schema and would wrongly discard it.
++		s.liveRefreshed = false
++	} else {
++		sv, err := s.db.SchemaVersion()
++		if err != nil || !s.haveVersion || sv != s.version {
++			s.namesCache = make(map[string][]string)
++			s.filterCache = make(map[string]*filterInfo)
++			s.haveVersion = err == nil
++			if err == nil {
++				s.version = sv
++			}
++		}
++	}
++
++	// outLayouts is scoped to this one call, never to s itself: the output
++	// identity for a table must always come from this commit's own colLayout
++	// (see filteredIdentity), so nothing here may survive to be reused by a
++	// later commit.
++	outLayouts := make(map[string]*colLayout, len(s.pending.Events))
++
++	for i, ev := range s.pending.Events {
++		if ev.Error != "" {
++			// Already marked unresolvable; leave it as-is rather than risk
++			// filtering it against a schema this batch never confirmed.
++			continue
++		}
++		excluded := s.columnFilter[ev.Table]
++
++		if _, ok := s.namesCache[ev.Table]; !ok {
+ 			names, err := s.db.ColumnNames(ev.Table)
+ 			if err != nil {
+-				errStr := fmt.Sprintf("failed to get column names for table %s: %v", ev.Table, err)
+-				ev.Error = errStr
++				ev.Error = fmt.Sprintf("failed to get column names for table %s: %v", ev.Table, err)
+ 				continue
+ 			}
+-			colNamesCache[ev.Table] = names
++			s.namesCache[ev.Table] = names
+ 		}
+-		ev.ColumnNames = colNamesCache[ev.Table]
++		fullNames := s.namesCache[ev.Table]
++
++		// full is fullNames' column identity as of this commit. When
++		// PreCommitRefresh already advanced it live through this same
++		// transaction's own connection, this is a no-op; otherwise it is the
++		// first observation this batch has made of the table, which assigns
++		// every one of its columns a fresh identity -- correct, since nothing
++		// in this batch has any earlier layout to reconcile it against
++		// either.
++		full := s.finalLayoutLocked(ev.Table, fullNames)
++
++		fi, ok := s.filterCache[ev.Table]
++		if !ok {
++			fi = buildFilterInfo(fullNames, excluded)
++			s.filterCache[ev.Table] = fi
++		}
++
++		// The output identity is always rebuilt from this commit's own full,
++		// never taken from filterCache: filterCache's names survive across
++		// commits, but the numeric identity that goes with a name is only
++		// ever meaningful within the single commit that minted it -- see the
++		// filterInfo and colIdentity doc comments. Memoized per table for
++		// this call only, so multiple events against the same table don't
++		// repeat the lookup.
++		outLayout, ok := outLayouts[ev.Table]
++		if !ok {
++			outLayout = filteredIdentity(full, fi.names)
++			outLayouts[ev.Table] = outLayout
++		}
++
++		// The row's values are positional in the layout the row was captured
++		// under, which a later statement in this same transaction may since
++		// have changed. Reconcile by column identity against that layout
++		// rather than by position or by name against the final one: a column
++		// that survived keeps its own value wherever it now sits and however
++		// its name changed, a column whose identity did not exist at capture
++		// time is NULL even if a dropped column left the same name behind
++		// for it to reuse, and an excluded column's value is never selected
++		// at all -- so no value can be re-labelled as a different column.
++		// Where no capture layout was established, nothing ran that could
++		// have changed the table after the row was read, so the final
++		// columns describe it exactly -- the same identity for both.
++		capture := s.captureLayoutAt(i)
++		if capture == nil {
++			capture = full
++		}
++		ev.ColumnNames = outLayout.names
++		ev.OldRow = remapCDCRow(ev.OldRow, capture, outLayout)
++		ev.NewRow = remapCDCRow(ev.NewRow, capture, outLayout)
+ 	}
+ 
+ 	s.pending.CommitTimestamp = time.Now().UnixMilli()
+@@ -98,10 +579,197 @@ func (s *CDCStreamer) CommitHook() bool {
+ 	s.pending = &command.CDCIndexedEventGroup{
+ 		Events: make([]*command.CDCEvent, 0),
+ 	}
++	s.captureLayouts = nil
++	// Column identity is only ever meaningful within the batch that
++	// captured a row; the next batch starts with none assigned.
++	s.colIdentity = make(map[string]*colIdentityState)
++	s.nextIdentityID = 0
+ 	return true
+ }
+ 
++// finalLayoutLocked returns table's column identity, advancing it to
++// fullNames first if that has not already happened for this batch.
++// Callers must hold cacheMu.
++func (s *CDCStreamer) finalLayoutLocked(table string, fullNames []string) *colLayout {
++	s.updateColumnIdentityLocked(table, fullNames)
++	state := s.colIdentity[table]
++	return &colLayout{names: state.names, ids: state.ids}
++}
++
++// cdcPreCommitQueryer is the minimal interface PreCommitRefresh needs
++// against a still-open transaction. *sql.Tx satisfies it.
++type cdcPreCommitQueryer interface {
++	QueryContext(ctx context.Context, query string, args ...any) (*sql.Rows, error)
++}
++
++// PreCommitRefresh refreshes s's column-name cache using q -- the same,
++// still-open *sql.Tx that already ran every statement of an explicit,
++// multi-statement transaction, including any DDL -- immediately before
++// that transaction commits. It is meant to be installed, via
++// db.RegisterPreCommitTxHook, as ordinary Go code that runs before
++// SQLite's own commit hook, not from within any SQLite callback, so it can
++// safely see this transaction's own uncommitted effects in a way nothing
++// invoked from CommitHook itself could. See the CDCStreamer doc comment.
++//
++// A query failure here is never escalated to the write itself -- CDC must
++// not block or fail a transaction because of it -- but nor is it silently
++// papered over: a table this refresh needed but could not confirm is not
++// left to CommitHook's pooled fallback, which could describe the wrong
++// schema for exactly the transaction this exists to handle. Instead, every
++// pending event for that table is marked with an error, and CommitHook
++// leaves those events as-is rather than filtering them against a schema
++// this call never confirmed.
++func (s *CDCStreamer) PreCommitRefresh(ctx context.Context, q cdcPreCommitQueryer) {
++	s.cacheMu.Lock()
++	defer s.cacheMu.Unlock()
++
++	// tables is every table with a pending event in this commit: the
++	// final-schema guarantee ("events emitted afterward must reflect the
++	// table's actual current columns") applies regardless of whether that
++	// table also carries a column_filter, so all of them need their live,
++	// post-transaction column names -- not just the filtered ones.
++	tables := make(map[string]struct{})
++	for _, ev := range s.pending.Events {
++		tables[ev.Table] = struct{}{}
++	}
++	if len(tables) == 0 {
++		return
++	}
++
++	// A failure reading the schema-version counter itself must not fail
++	// these events -- the same transient-failure policy that applies to
++	// the ordinary, pooled-connection path applies here too: treat it as
++	// a detected change and re-derive column names fresh through this
++	// same live connection, still delivering normally as long as that
++	// fresh read succeeds. Only a per-table column-name lookup failure
++	// marks that table's events unresolvable.
++	sv, svErr := cdcQuerySchemaVersion(ctx, q)
++
++	s.namesCache = make(map[string][]string)
++	s.filterCache = make(map[string]*filterInfo)
++	for table := range tables {
++		names, err := cdcQueryColumnNames(ctx, q, table)
++		if err != nil {
++			for _, ev := range s.pending.Events {
++				if ev.Table == table {
++					ev.Error = fmt.Sprintf(
++						"failed to confirm column names for table %s within its own transaction: %v",
++						table, err)
++				}
++			}
++			continue
++		}
++		s.namesCache[table] = names
++		// This is the last observation SnapshotCaptureLayouts's per-statement
++		// tracking gets before CommitHook reconciles against it, so column
++		// identity must be advanced to it here too -- otherwise a DDL that
++		// ran after the last SnapshotCaptureLayouts call but before commit
++		// would be invisible to identity tracking even though CommitHook
++		// already sees its effect in namesCache.
++		s.updateColumnIdentityLocked(table, names)
++	}
++	if svErr == nil {
++		s.version = sv
++		s.haveVersion = true
++	} else {
++		// The version itself is unconfirmed, so it can't be trusted for a
++		// future commit's comparison either -- leave it unknown rather
++		// than remember a possibly-wrong number.
++		s.haveVersion = false
++	}
++	s.liveRefreshed = true
++}
++
++// cdcQuerySchemaVersion returns the database's current schema-version
++// counter via q, ordinary database/sql call.
++func cdcQuerySchemaVersion(ctx context.Context, q cdcPreCommitQueryer) (int64, error) {
++	rows, err := q.QueryContext(ctx, "PRAGMA schema_version")
++	if err != nil {
++		return 0, err
++	}
++	defer rows.Close()
++	if !rows.Next() {
++		return 0, fmt.Errorf("no rows returned for PRAGMA schema_version")
++	}
++	var v int64
++	if err := rows.Scan(&v); err != nil {
++		return 0, err
++	}
++	return v, rows.Err()
++}
++
++// cdcQueryColumnNames returns table's current column names via q, the same
++// way db.ColumnNames does, but through an arbitrary caller-supplied
++// queryer rather than db's own pooled connection.
++func cdcQueryColumnNames(ctx context.Context, q cdcPreCommitQueryer, table string) ([]string, error) {
++	rows, err := q.QueryContext(ctx,
++		fmt.Sprintf(`PRAGMA table_xinfo("%s")`, strings.ReplaceAll(table, `"`, `""`)))
++	if err != nil {
++		return nil, err
++	}
++	defer rows.Close()
++
++	var names []string
++	for rows.Next() {
++		var cid, notnull, pk, hidden int64
++		var name, colType string
++		var dflt any
++		if err := rows.Scan(&cid, &name, &colType, &notnull, &dflt, &pk, &hidden); err != nil {
++			return nil, err
++		}
++		if hidden == 1 {
++			// A genuinely hidden column (for example, a virtual table's
++			// hidden column) that SELECT * does not return.
++			continue
++		}
++		names = append(names, name)
++	}
++	if err := rows.Err(); err != nil {
++		return nil, err
++	}
++	if len(names) == 0 {
++		return nil, fmt.Errorf("no such table: %s", table)
++	}
++	return names, nil
++}
++
+ // Len returns the number of pending events.
+ func (s *CDCStreamer) Len() int {
+ 	return len(s.pending.Events)
+ }
++
++// remapCDCRow returns a copy of row whose values line up, position for
++// position, with out. row's values are positional in capture -- the
++// identity of the columns the table had when the row was read -- so each
++// output value is matched by column identity: the value whose capture-time
++// column has the same identity as the output column, or an explicit NULL
++// where out names a column whose identity did not exist at capture time.
++// If row is nil, nil is returned.
++//
++// Matching by identity rather than by name or by position is what keeps a
++// schema change made after the row was captured, but before it is
++// reconciled, from re-labelling one column's value as another's -- a
++// rename does not lose the value, since the identity survives even though
++// the name changes, and a column dropped and later recreated under the
++// same name is not mistaken for the column it replaced, since the two
++// never share an identity. A column dropped and never recreated is simply
++// never selected, which is also why an excluded column's value cannot
++// reach the output: out never contains it.
++func remapCDCRow(row *command.CDCRow, capture, out *colLayout) *command.CDCRow {
++	if row == nil {
++		return nil
++	}
++	captureIdx := make(map[int]int, len(capture.ids))
++	for i, id := range capture.ids {
++		captureIdx[id] = i
++	}
++	values := make([]*command.CDCValue, 0, len(out.ids))
++	for _, id := range out.ids {
++		if i, ok := captureIdx[id]; ok && i < len(row.Values) {
++			values = append(values, row.Values[i])
++		} else {
++			values = append(values, &command.CDCValue{})
++		}
++	}
++	return &command.CDCRow{Values: values}
++}
+diff --git a/db/cdc_test.go b/db/cdc_test.go
+index b277c68d..52538fe5 100644
+--- a/db/cdc_test.go
++++ b/db/cdc_test.go
+@@ -11,7 +11,7 @@ import (
+ 
+ func Test_CDCStreamer_New(t *testing.T) {
+ 	ch := make(chan *command.CDCIndexedEventGroup, 10)
+-	streamer, err := NewCDCStreamer(ch, &mockColumnNamesProvider{})
++	streamer, err := NewCDCStreamer(ch, &mockColumnNamesProvider{}, nil)
+ 	if err != nil {
+ 		t.Fatalf("expected no error, got %v", err)
+ 	}
+@@ -33,7 +33,7 @@ func Test_CDCStreamer_CommitOne(t *testing.T) {
+ 			"test_table": {"id", "name", "value"},
+ 		},
+ 	}
+-	streamer, err := NewCDCStreamer(ch, np)
++	streamer, err := NewCDCStreamer(ch, np, nil)
+ 	if err != nil {
+ 		t.Fatalf("error creating CDCStreamer: %v", err)
+ 	}
+@@ -84,7 +84,7 @@ func Test_CDCStreamer_CommitTwo(t *testing.T) {
+ 			"test_table": {"id", "name", "value"},
+ 		},
+ 	}
+-	streamer, err := NewCDCStreamer(ch, np)
++	streamer, err := NewCDCStreamer(ch, np, nil)
+ 	if err != nil {
+ 		t.Fatalf("error creating CDCStreamer: %v", err)
+ 	}
+@@ -151,7 +151,7 @@ func Test_CDCStreamer_ResetThenPreupdate(t *testing.T) {
+ 			"test_table": {"id", "name", "value"},
+ 		},
+ 	}
+-	streamer, err := NewCDCStreamer(ch, np)
++	streamer, err := NewCDCStreamer(ch, np, nil)
+ 	if err != nil {
+ 		t.Fatalf("error creating CDCStreamer: %v", err)
+ 	}
+@@ -222,3 +222,13 @@ func (m *mockColumnNamesProvider) ColumnNames(table string) ([]string, error) {
+ 	}
+ 	return []string{}, nil
+ }
++
++// SchemaVersion satisfies the ColumnsNameProvider interface. It always
++// reports a fixed, unchanging version, since the tests that use this mock
++// don't exercise schema-change/cache-invalidation behavior; tests that need
++// to control a schema-version value directly (for example, to exercise
++// CDCStreamer's cache-invalidation logic) use schemaVersionedProvider
++// instead.
++func (m *mockColumnNamesProvider) SchemaVersion() (int64, error) {
++	return 0, nil
++}
+diff --git a/db/db.go b/db/db.go
+index ead58409..eaa92692 100644
+--- a/db/db.go
++++ b/db/db.go
+@@ -196,6 +196,15 @@ type DB struct {
+ 	allOptimized   bool
+ 	allOptimizedMu sync.Mutex
+ 
++	preCommitTxHook   PreCommitTxHookCallback
++	preCommitTxHookMu sync.Mutex
++
++	preStatementTxHook   PreStatementTxHookCallback
++	preStatementTxHookMu sync.Mutex
++
++	commitFailedHook   CommitFailedCallback
++	commitFailedHookMu sync.Mutex
++
+ 	logger *log.Logger
+ }
+ 
+@@ -367,89 +376,92 @@ type PreUpdateHookCallback func(ev *command.CDCEvent) error
+ func (db *DB) RegisterPreUpdateHook(hook PreUpdateHookCallback, tblRe *regexp.Regexp, rowIDsOnly bool) error {
+ 	// Convert from SQLite hook data to rqlite hook data.
+ 	tableMatch := rsync.NewAtomicMap[string, bool]()
+-	convertFn := func(d sqlite3.SQLitePreUpdateData) (*command.CDCEvent, error) {
+-		if tblRe != nil {
+-			m, ok := tableMatch.Get(d.TableName)
+-			if !ok {
+-				m = tblRe.MatchString(d.TableName)
+-				tableMatch.Set(d.TableName, m)
+-			}
+-			if !m {
+-				return nil, nil
+-			}
+-		}
+ 
+-		ev := &command.CDCEvent{
+-			Table: d.TableName,
+-		}
++	f := func(driverConn any) error {
++		conn := driverConn.(*sqlite3.SQLiteConn)
+ 
+-		switch d.Op {
+-		case sqlite3.SQLITE_INSERT:
+-			ev.Op = command.CDCEvent_INSERT
+-			ev.NewRowId = d.NewRowID
+-		case sqlite3.SQLITE_UPDATE:
+-			ev.Op = command.CDCEvent_UPDATE
+-			ev.OldRowId = d.OldRowID
+-			ev.NewRowId = d.NewRowID
+-		case sqlite3.SQLITE_DELETE:
+-			ev.Op = command.CDCEvent_DELETE
+-			ev.OldRowId = d.OldRowID
+-		default:
+-			return ev, fmt.Errorf("unknown preupdate hook operation %d", d.Op)
+-		}
++		convertFn := func(d sqlite3.SQLitePreUpdateData) (*command.CDCEvent, error) {
++			if tblRe != nil {
++				m, ok := tableMatch.Get(d.TableName)
++				if !ok {
++					m = tblRe.MatchString(d.TableName)
++					tableMatch.Set(d.TableName, m)
++				}
++				if !m {
++					return nil, nil
++				}
++			}
+ 
+-		// Are we done?
+-		if rowIDsOnly {
+-			return ev, nil
+-		}
++			ev := &command.CDCEvent{
++				Table: d.TableName,
++			}
+ 
+-		c := d.Count()
+-		if d.Op != sqlite3.SQLITE_INSERT {
+-			oldRow := make([]any, c)
+-			err := d.Old(oldRow...)
+-			if err != nil {
+-				return ev, fmt.Errorf("failed to get old row data: %w", err)
++			switch d.Op {
++			case sqlite3.SQLITE_INSERT:
++				ev.Op = command.CDCEvent_INSERT
++				ev.NewRowId = d.NewRowID
++			case sqlite3.SQLITE_UPDATE:
++				ev.Op = command.CDCEvent_UPDATE
++				ev.OldRowId = d.OldRowID
++				ev.NewRowId = d.NewRowID
++			case sqlite3.SQLITE_DELETE:
++				ev.Op = command.CDCEvent_DELETE
++				ev.OldRowId = d.OldRowID
++			default:
++				return ev, fmt.Errorf("unknown preupdate hook operation %d", d.Op)
+ 			}
+-			ev.OldRow, err = normalizeCDCValues(oldRow)
+-			if err != nil {
+-				return ev, fmt.Errorf("failed to normalize old row data: %w", err)
++
++			// Are we done?
++			if rowIDsOnly {
++				return ev, nil
+ 			}
+-		}
+ 
+-		if d.Op != sqlite3.SQLITE_DELETE {
+-			newRow := make([]any, c)
+-			err := d.New(newRow...)
+-			if err != nil {
+-				return ev, fmt.Errorf("failed to get new row data: %w", err)
++			c := d.Count()
++			if d.Op != sqlite3.SQLITE_INSERT {
++				oldRow := make([]any, c)
++				err := d.Old(oldRow...)
++				if err != nil {
++					return ev, fmt.Errorf("failed to get old row data: %w", err)
++				}
++				ev.OldRow, err = normalizeCDCValues(oldRow)
++				if err != nil {
++					return ev, fmt.Errorf("failed to normalize old row data: %w", err)
++				}
+ 			}
+-			ev.NewRow, err = normalizeCDCValues(newRow)
+-			if err != nil {
+-				return ev, fmt.Errorf("failed to normalize new row data: %w", err)
++
++			if d.Op != sqlite3.SQLITE_DELETE {
++				newRow := make([]any, c)
++				err := d.New(newRow...)
++				if err != nil {
++					return ev, fmt.Errorf("failed to get new row data: %w", err)
++				}
++				ev.NewRow, err = normalizeCDCValues(newRow)
++				if err != nil {
++					return ev, fmt.Errorf("failed to normalize new row data: %w", err)
++				}
+ 			}
++
++			return ev, nil
+ 		}
+-		return ev, nil
+-	}
+ 
+-	// Register the callback with the SQLite connection.
+-	var cb func(d sqlite3.SQLitePreUpdateData)
+-	if hook != nil {
+-		cb = func(d sqlite3.SQLitePreUpdateData) {
+-			stats.Add(numPreupdates, 1)
+-			ev, err := convertFn(d)
+-			if err != nil {
+-				stats.Add(numPreupdatesErrors, 1)
+-				ev.Error = err.Error()
+-			}
+-			if ev == nil {
+-				return
+-			}
+-			if err := hook(ev); err != nil {
+-				stats.Add(numPreupdatesCBErrors, 1)
++		// Register the callback with the SQLite connection.
++		var cb func(d sqlite3.SQLitePreUpdateData)
++		if hook != nil {
++			cb = func(d sqlite3.SQLitePreUpdateData) {
++				stats.Add(numPreupdates, 1)
++				ev, err := convertFn(d)
++				if err != nil {
++					stats.Add(numPreupdatesErrors, 1)
++					ev.Error = err.Error()
++				}
++				if ev == nil {
++					return
++				}
++				if err := hook(ev); err != nil {
++					stats.Add(numPreupdatesCBErrors, 1)
++				}
+ 			}
+ 		}
+-	}
+-	f := func(driverConn any) error {
+-		conn := driverConn.(*sqlite3.SQLiteConn)
+ 		conn.RegisterPreUpdateHook(cb)
+ 		return nil
+ 	}
+@@ -465,6 +477,86 @@ func (db *DB) RegisterPreUpdateHook(hook PreUpdateHookCallback, tblRe *regexp.Re
+ 	return nil
+ }
+ 
++// PreCommitTxHookCallback is invoked as ordinary, sequential Go code --
++// never from within a SQLite callback -- immediately before an explicit,
++// multi-statement transaction (a Request with Transaction set) commits. tx
++// is the same, still-open transaction that already ran every one of that
++// request's statements, DDL included; the callback may issue further reads
++// against it. Because this runs before SQLite's own commit hook, on the
++// same connection, through ordinary database/sql calls rather than a
++// hook-reentrant one, it can see this transaction's own uncommitted
++// effects in a way nothing invoked from within a SQLite hook safely can.
++// See executeWithConn, the sole caller, and CDCStreamer.PreCommitRefresh,
++// its only current use.
++type PreCommitTxHookCallback func(ctx context.Context, tx *sql.Tx)
++
++// RegisterPreCommitTxHook registers hook to be invoked immediately before
++// every explicit, multi-statement transaction commits -- see
++// PreCommitTxHookCallback. If a callback is already registered, it is
++// replaced. A nil hook removes it.
++func (db *DB) RegisterPreCommitTxHook(hook PreCommitTxHookCallback) {
++	db.preCommitTxHookMu.Lock()
++	defer db.preCommitTxHookMu.Unlock()
++	db.preCommitTxHook = hook
++}
++
++func (db *DB) getPreCommitTxHook() PreCommitTxHookCallback {
++	db.preCommitTxHookMu.Lock()
++	defer db.preCommitTxHookMu.Unlock()
++	return db.preCommitTxHook
++}
++
++// PreStatementTxHookCallback is invoked as ordinary, sequential Go code --
++// never from within a SQLite callback -- immediately before each statement of
++// an explicit, multi-statement transaction is executed, with that
++// transaction's own still-open tx. Like PreCommitTxHookCallback it may read
++// through tx and so observes the transaction's uncommitted effects, but it
++// runs between statements rather than once at the end, which is what lets a
++// callback record schema state that a later statement in the same transaction
++// is about to change. See CDCStreamer.SnapshotCaptureLayouts, its only
++// current use.
++type PreStatementTxHookCallback func(ctx context.Context, tx *sql.Tx)
++
++// RegisterPreStatementTxHook registers hook to be invoked before each
++// statement of every explicit, multi-statement transaction -- see
++// PreStatementTxHookCallback. If a callback is already registered, it is
++// replaced. A nil hook removes it.
++func (db *DB) RegisterPreStatementTxHook(hook PreStatementTxHookCallback) {
++	db.preStatementTxHookMu.Lock()
++	defer db.preStatementTxHookMu.Unlock()
++	db.preStatementTxHook = hook
++}
++
++func (db *DB) getPreStatementTxHook() PreStatementTxHookCallback {
++	db.preStatementTxHookMu.Lock()
++	defer db.preStatementTxHookMu.Unlock()
++	return db.preStatementTxHook
++}
++
++// CommitFailedCallback is invoked if an explicit, multi-statement
++// transaction's tx.Commit() call itself fails -- for example, a deferred
++// foreign-key violation caught only at commit time, after
++// PreCommitTxHookCallback already ran for that same transaction and
++// derived state assuming it would commit. Since it didn't, that state must
++// be discarded rather than trusted by a later, unrelated commit.
++type CommitFailedCallback func()
++
++// RegisterCommitFailedHook registers hook to be invoked whenever an
++// explicit, multi-statement transaction's commit fails -- see
++// CommitFailedCallback. If a callback is already registered, it is
++// replaced. A nil hook removes it.
++func (db *DB) RegisterCommitFailedHook(hook CommitFailedCallback) {
++	db.commitFailedHookMu.Lock()
++	defer db.commitFailedHookMu.Unlock()
++	db.commitFailedHook = hook
++}
++
++func (db *DB) getCommitFailedHook() CommitFailedCallback {
++	db.commitFailedHookMu.Lock()
++	defer db.commitFailedHookMu.Unlock()
++	return db.commitFailedHook
++}
++
+ // UpdateHookCallback is a callback function that is called before a row is modified
+ // in the database.
+ type UpdateHookCallback func(ev *command.UpdateHookEvent) error
+@@ -1062,15 +1154,77 @@ func (db *DB) ConnectionPoolStats(sqlDB *sql.DB) *PoolStats {
+ 	}
+ }
+ 
+-// ColumnNames returns the names of all columns in the given table.
++// ColumnNames returns the names of all columns in the given table, in
++// column-declaration order.
++//
++// This is implemented via a PRAGMA rather than, say, "SELECT * FROM table
++// LIMIT 0", and that choice matters for freshness. A pooled read-only
++// connection can still have an earlier schema cached in memory when it's
++// reused for this call, even though a DDL statement committed against the
++// table (on a different connection) since then: SQLite resolves "SELECT *"
++// into a concrete column list at statement-parse time, against whatever
++// schema the connection currently has cached, and only reconciles that
++// cache against the database's actual, possibly newer, schema while a
++// statement is executing -- too late to affect a column list already
++// resolved during parsing. A PRAGMA instead reports its columns as ordinary
++// result rows, which requires this call to step through those rows to read
++// them, forcing that reconciliation to happen before any column name is
++// returned. TableColumnTypes, just below, relies on PRAGMA table_info for
++// the same freshness reason; ColumnNames itself uses PRAGMA table_xinfo
++// instead of table_info, so that generated columns -- part of the column
++// set "SELECT *" returns, but silently omitted by table_info -- are still
++// included.
+ func (db *DB) ColumnNames(table string) ([]string, error) {
++	// table_xinfo (rather than table_info) is required so that generated
++	// columns are included, matching the column set SELECT * returns:
++	// table_info silently omits them. table_xinfo's extra "hidden" column
++	// distinguishes that case (2 for a VIRTUAL generated column, 3 for
++	// STORED) from a genuinely hidden column (1, such as a virtual table's
++	// hidden column) that SELECT * does not return and must stay excluded.
+ 	rows, err := db.queryStmtWithConn(context.Background(), &command.Statement{
+-		Sql: fmt.Sprintf(`SELECT * FROM "%s" LIMIT 0`, strings.ReplaceAll(table, `"`, `""`)),
++		Sql: fmt.Sprintf(`PRAGMA table_xinfo("%s")`, strings.ReplaceAll(table, `"`, `""`)),
+ 	}, false, db.roDB)
+ 	if err != nil {
+ 		return nil, err
+ 	}
+-	return rows.Columns, nil
++	if len(rows.Values) < 1 {
++		return nil, fmt.Errorf("no such table: %s", table)
++	}
++	names := make([]string, 0, len(rows.Values))
++	for _, v := range rows.Values {
++		if len(v.Parameters) < 7 {
++			return nil, fmt.Errorf("unexpected result from PRAGMA table_xinfo")
++		}
++		if v.Parameters[6].GetI() == 1 {
++			continue
++		}
++		names = append(names, v.Parameters[1].GetS())
++	}
++	return names, nil
++}
++
++// SchemaVersion returns SQLite's internal schema-version counter, which
++// SQLite increments every time the database's schema changes -- for example
++// on a CREATE TABLE, ALTER TABLE, or DROP TABLE. It never repeats a value
++// for the life of a given database file, which makes it a cheap, reliable
++// way for a caller to detect that schema information it has cached (such as
++// a table's column names) may now be stale, without needing to parse DDL
++// itself. See https://www.sqlite.org/pragma.html#pragma_schema_version.
++func (db *DB) SchemaVersion() (int64, error) {
++	rows, err := db.QueryStringStmt("PRAGMA schema_version")
++	if err != nil {
++		return 0, err
++	}
++	if len(rows) < 1 {
++		return 0, fmt.Errorf("no rows returned for PRAGMA schema_version")
++	}
++	if rows[0].Error != "" {
++		return 0, errors.New(rows[0].Error)
++	}
++	if len(rows[0].Values) < 1 || len(rows[0].Values[0].Parameters) < 1 {
++		return 0, fmt.Errorf("unexpected result from PRAGMA schema_version")
++	}
++	return rows[0].Values[0].Parameters[0].GetI(), nil
+ }
+ 
+ // TableColumnTypes returns the declared types of all columns in the given table.
+@@ -1200,6 +1354,12 @@ func (db *DB) executeWithConn(ctx context.Context, req *command.Request, xTime b
+ 			continue
+ 		}
+ 
++		if tx != nil {
++			if hook := db.getPreStatementTxHook(); hook != nil {
++				hook(ctx, tx)
++			}
++		}
++
+ 		result, err := db.executeStmtWithConn(ctx, stmt, xTime, eqer, time.Duration(req.DbTimeout))
+ 		if err != nil {
+ 			if handleError(result, err) {
+@@ -1211,7 +1371,15 @@ func (db *DB) executeWithConn(ctx context.Context, req *command.Request, xTime b
+ 	}
+ 
+ 	if tx != nil {
++		if hook := db.getPreCommitTxHook(); hook != nil {
++			hook(ctx, tx)
++		}
+ 		err = tx.Commit()
++		if err != nil {
++			if failedHook := db.getCommitFailedHook(); failedHook != nil {
++				failedHook()
++			}
++		}
+ 	}
+ 	return allResults, err
+ }
+@@ -1589,6 +1757,12 @@ func (db *DB) RequestWithContext(ctx context.Context, req *command.Request, xTim
+ 			continue
+ 		}
+ 
++		if tx != nil {
++			if hook := db.getPreStatementTxHook(); hook != nil {
++				hook(ctx, tx)
++			}
++		}
++
+ 		if ro {
+ 			rows, opErr := db.queryStmtWithConn(ctx, stmt, xTime, eq)
+ 			if req.QualifyColumns && rows != nil && rows.Error == "" {
+@@ -1610,7 +1784,15 @@ func (db *DB) RequestWithContext(ctx context.Context, req *command.Request, xTim
+ 	}
+ 
+ 	if tx != nil {
++		if hook := db.getPreCommitTxHook(); hook != nil {
++			hook(ctx, tx)
++		}
+ 		err = tx.Commit()
++		if err != nil {
++			if failedHook := db.getCommitFailedHook(); failedHook != nil {
++				failedHook()
++			}
++		}
+ 	}
+ 	return eqResponse, err
+ }
+diff --git a/db/swappable_db.go b/db/swappable_db.go
+index c616e9cc..700090f7 100644
+--- a/db/swappable_db.go
++++ b/db/swappable_db.go
+@@ -256,6 +256,30 @@ func (s *SwappableDB) RegisterCommitHook(hook CommitHookCallback) error {
+ 	return s.db.RegisterCommitHook(hook)
+ }
+ 
++// RegisterPreCommitTxHook registers a pre-commit transaction hook on the
++// underlying database -- see DB.RegisterPreCommitTxHook.
++func (s *SwappableDB) RegisterPreCommitTxHook(hook PreCommitTxHookCallback) {
++	s.dbMu.RLock()
++	defer s.dbMu.RUnlock()
++	s.db.RegisterPreCommitTxHook(hook)
++}
++
++// RegisterPreStatementTxHook registers a pre-statement transaction hook on
++// the underlying database -- see DB.RegisterPreStatementTxHook.
++func (s *SwappableDB) RegisterPreStatementTxHook(hook PreStatementTxHookCallback) {
++	s.dbMu.RLock()
++	defer s.dbMu.RUnlock()
++	s.db.RegisterPreStatementTxHook(hook)
++}
++
++// RegisterCommitFailedHook registers a commit-failure hook on the
++// underlying database -- see DB.RegisterCommitFailedHook.
++func (s *SwappableDB) RegisterCommitFailedHook(hook CommitFailedCallback) {
++	s.dbMu.RLock()
++	defer s.dbMu.RUnlock()
++	s.db.RegisterCommitFailedHook(hook)
++}
++
+ // ColumnNames returns the column names for the given table from the underlying database.
+ func (s *SwappableDB) ColumnNames(table string) ([]string, error) {
+ 	s.dbMu.RLock()
+@@ -263,6 +287,18 @@ func (s *SwappableDB) ColumnNames(table string) ([]string, error) {
+ 	return s.db.ColumnNames(table)
+ }
+ 
++// SchemaVersion returns the schema-version counter of the underlying database.
++// Note that Swap replaces the underlying database outright, so a value read
++// after a Swap belongs to a different database file's schema history than one
++// read before it -- the two are not comparable, and a caller that caches
++// schema information keyed on this value must treat a Swap as an invalidation
++// in its own right, not rely on this value having changed.
++func (s *SwappableDB) SchemaVersion() (int64, error) {
++	s.dbMu.RLock()
++	defer s.dbMu.RUnlock()
++	return s.db.SchemaVersion()
++}
++
+ // Checkpoint performs a checkpoint of the underlying database.
+ func (s *SwappableDB) Checkpoint(w io.Writer, timeout time.Duration) (*CheckpointManagerMeta, int64, error) {
+ 	s.dbMu.RLock()
+diff --git a/store/store.go b/store/store.go
+index e11e6609..517b411f 100644
+--- a/store/store.go
++++ b/store/store.go
+@@ -7,6 +7,7 @@ import (
+ 	"bytes"
+ 	"compress/gzip"
+ 	"context"
++	stdsql "database/sql"
+ 	"encoding/binary"
+ 	"errors"
+ 	"expvar"
+@@ -336,13 +337,14 @@ type Store struct {
+ 	db           *sql.SwappableDB // The underlying SQLite store.
+ 	checkpointer Checkpointer
+ 
+-	cdcMu         sync.RWMutex
+-	cdcStreamer   *sql.CDCStreamer
+-	cdcOutCh      chan<- *proto.CDCIndexedEventGroup
+-	cdcIDsOnly    bool
+-	cdcTableRe    *regexp.Regexp
+-	cdcEnabled    rsync.AtomicBool
+-	cdcRegistered rsync.AtomicBool
++	cdcMu           sync.RWMutex
++	cdcStreamer     *sql.CDCStreamer
++	cdcOutCh        chan<- *proto.CDCIndexedEventGroup
++	cdcIDsOnly      bool
++	cdcTableRe      *regexp.Regexp
++	cdcColumnFilter map[string][]string
++	cdcEnabled      rsync.AtomicBool
++	cdcRegistered   rsync.AtomicBool
+ 
+ 	dechunkManager *chunking.DechunkerManager
+ 	cmdProc        *CommandProcessor
+@@ -2016,6 +2018,10 @@ func (s *Store) ReadFrom(r io.Reader) (int64, error) {
+ 	// Swapping in a new database unregisters any registered CDC hooks, so signal that it
+ 	// needs to be reregistered on the next change.
+ 	s.cdcRegistered.Unset()
++	// The just-swapped-in database is a different file with its own schema
++	// history, so any cached CDC column-name/filter information belongs to
++	// the database that's no longer there.
++	s.invalidateCDCCache()
+ 
+ 	// Snapshot, so we load the new database into the Raft system.
+ 	if err := s.snapshotStore.SetDueNext(snapshot.Full); err != nil {
+@@ -2052,10 +2058,15 @@ func (s *Store) Database(leader bool) ([]byte, error) {
+ // to the provided channel. It is the caller's responsibility to ensure that the
+ // channel is read from, as the CDCStreamer will drop events if the channel is full.
+ //
++// columnFilter, if non-nil, maps a table name to the column names that should be
++// excluded from the before/after row data of events for that table. A nil or empty
++// columnFilter excludes no columns.
++//
+ // If the Store is open then CDC will begin immediately. If the Store is not open
+ // yet, then CDC will begin when the Store is opened. This function will return
+ // an error if CDC is already enabled.
+-func (s *Store) EnableCDC(out chan<- *proto.CDCIndexedEventGroup, tableRe *regexp.Regexp, rowIDsOnly bool) error {
++func (s *Store) EnableCDC(out chan<- *proto.CDCIndexedEventGroup, tableRe *regexp.Regexp, rowIDsOnly bool,
++	columnFilter map[string][]string) error {
+ 	s.cdcMu.Lock()
+ 	defer s.cdcMu.Unlock()
+ 
+@@ -2065,6 +2076,7 @@ func (s *Store) EnableCDC(out chan<- *proto.CDCIndexedEventGroup, tableRe *regex
+ 	s.cdcOutCh = out
+ 	s.cdcIDsOnly = rowIDsOnly
+ 	s.cdcTableRe = tableRe
++	s.cdcColumnFilter = columnFilter
+ 	s.cdcEnabled.Set()
+ 	return nil
+ }
+@@ -2084,6 +2096,9 @@ func (s *Store) DisableCDC() error {
+ 		if err := s.db.RegisterCommitHook(nil); err != nil {
+ 			return fmt.Errorf("failed to unregister commit hook: %w", err)
+ 		}
++		s.db.RegisterPreCommitTxHook(nil)
++		s.db.RegisterPreStatementTxHook(nil)
++		s.db.RegisterCommitFailedHook(nil)
+ 	}
+ 	if s.cdcStreamer != nil {
+ 		s.cdcStreamer.Close()
+@@ -2094,6 +2109,22 @@ func (s *Store) DisableCDC() error {
+ 	return nil
+ }
+ 
++// invalidateCDCCache discards any column-name/filter information the CDC
++// streamer has cached, forcing it to be re-derived from the database on the
++// next commit. It must be called after any event that can make that cache
++// stale in a way the streamer cannot detect on its own: swapping in a new
++// database file (its schema-version counter starts a new history, and could
++// coincidentally collide with the value the cache was built from) or this
++// node transitioning to Raft leader (guarding against staleness accumulated
++// while it was not driving CDC). It is a no-op if CDC isn't enabled.
++func (s *Store) invalidateCDCCache() {
++	s.cdcMu.RLock()
++	defer s.cdcMu.RUnlock()
++	if s.cdcStreamer != nil {
++		s.cdcStreamer.InvalidateAll()
++	}
++}
++
+ // Notify notifies this Store that a node is ready for bootstrapping at the
+ // given address. Once the number of known nodes reaches the expected level
+ // bootstrapping will be attempted using this Store. "Expected level" includes
+@@ -2321,6 +2352,9 @@ func (s *Store) cleanupCDC() error {
+ 	if err := s.db.RegisterCommitHook(nil); err != nil {
+ 		return fmt.Errorf("failed to unregister commit hook: %w", err)
+ 	}
++	s.db.RegisterPreCommitTxHook(nil)
++	s.db.RegisterPreStatementTxHook(nil)
++	s.db.RegisterCommitFailedHook(nil)
+ 	return nil
+ }
+ 
+@@ -2513,11 +2547,17 @@ func (s *Store) fsmApply(l *raft.Log) (e any) {
+ 	cmd, mutated, r := func() (*proto.Command, bool, any) {
+ 		// Reset CDC streamer with the current log index before processing if CDC is enabled
+ 		if s.cdcEnabled.Is() {
+-			s.cdcMu.RLock()
+-			defer s.cdcMu.RUnlock()
++			// A write lock, not a read lock: this block can lazily assign
++			// s.cdcStreamer below, and invalidateCDCCache reads that same
++			// field under RLock from the independently running leader
++			// -observer goroutine. fsmApply itself is always single
++			// -threaded (Raft serializes log application), so this buys no
++			// concurrency here, only correctness against that other reader.
++			s.cdcMu.Lock()
++			defer s.cdcMu.Unlock()
+ 			if s.cdcStreamer == nil {
+ 				var err error
+-				s.cdcStreamer, err = sql.NewCDCStreamer(s.cdcOutCh, s.db)
++				s.cdcStreamer, err = sql.NewCDCStreamer(s.cdcOutCh, s.db, s.cdcColumnFilter)
+ 				if err != nil {
+ 					s.logger.Fatalf("failed to create CDC streamer: %s", err)
+ 				}
+@@ -2526,12 +2566,38 @@ func (s *Store) fsmApply(l *raft.Log) (e any) {
+ 			// If CDC is enabled but not yet activated, do so now. By doing it here we keep
+ 			// CDC registration in a single place in the code.
+ 			if s.cdcRegistered.IsNot() {
+-				if err := s.db.RegisterPreUpdateHook(s.cdcStreamer.PreupdateHook, s.cdcTableRe, s.cdcIDsOnly); err != nil {
++				if err := s.db.RegisterPreUpdateHook(s.cdcStreamer.PreupdateHook, s.cdcTableRe,
++					s.cdcIDsOnly); err != nil {
+ 					s.logger.Fatalf("failed to register preupdate hook for CDC: %s", err)
+ 				}
+ 				if err := s.db.RegisterCommitHook(s.cdcStreamer.CommitHook); err != nil {
+ 					s.logger.Fatalf("failed to register commit hook for CDC: %s", err)
+ 				}
++				// Lets a filtered table's cache be refreshed live, through
++				// an explicit multi-statement transaction's own connection,
++				// before that transaction commits -- the one case
++				// CDCStreamer's default, pooled-connection cache source
++				// cannot handle correctly. See the CDCStreamer doc comment
++				// and CDCStreamer.PreCommitRefresh.
++				s.db.RegisterPreCommitTxHook(func(ctx context.Context, tx *stdsql.Tx) {
++					s.cdcStreamer.PreCommitRefresh(ctx, tx)
++				})
++				// Pins the columns each already-captured row was read
++				// under, before the next statement in the same transaction
++				// gets a chance to change them, so those rows can be
++				// reconciled by column identity rather than by position.
++				// See CDCStreamer.SnapshotCaptureLayouts.
++				s.db.RegisterPreStatementTxHook(func(ctx context.Context, tx *stdsql.Tx) {
++					s.cdcStreamer.SnapshotCaptureLayouts(ctx, tx)
++				})
++				// If that transaction's own tx.Commit() then fails (a
++				// deferred foreign-key violation, say), whatever
++				// PreCommitRefresh just derived assumed a commit that
++				// didn't happen and must not be trusted by whatever
++				// commits next.
++				s.db.RegisterCommitFailedHook(func() {
++					s.cdcStreamer.InvalidateAll()
++				})
+ 				s.cdcRegistered.Set()
+ 			}
+ 			s.cdcStreamer.Reset(l.Index)
+@@ -2546,14 +2612,22 @@ func (s *Store) fsmApply(l *raft.Log) (e any) {
+ 	switch cmd.Type {
+ 	case proto.Command_COMMAND_TYPE_NOOP:
+ 		s.numNoops.Add(1)
+-	case proto.Command_COMMAND_TYPE_LOAD:
+-		// Swapping in a new database invalidates any existing snapshot.
++	case proto.Command_COMMAND_TYPE_LOAD, proto.Command_COMMAND_TYPE_LOAD_CHUNK:
++		// Swapping in a new database invalidates any existing snapshot. For
++		// LOAD_CHUNK, the swap itself only actually happens once the final
++		// chunk of the stream is processed, but cmd.Type here can't tell an
++		// intermediate chunk apart from the final one -- both operations
++		// below are cheap and idempotent, so doing them for every chunk,
++		// not just the last, is harmless.
+ 		if err := s.snapshotStore.SetDueNext(snapshot.Full); err != nil {
+ 			s.logger.Fatalf("failed to set full snapshot needed: %s", err)
+ 		}
+ 		// Swapping in a new database deactivates the CDC hooks, so signal that it
+ 		// needs to be reregistered on the next commit.
+ 		s.cdcRegistered.Unset()
++		// Same reasoning as in Boot: a swapped-in database is a different
++		// file, so drop any cached CDC column-name/filter information.
++		s.invalidateCDCCache()
+ 	}
+ 	return r
+ }
+@@ -2830,6 +2904,9 @@ func (s *Store) fsmRestore(rc io.ReadCloser) (retErr error) {
+ 	// Swapping in a new database deactivates the CDC hooks, so signal that it
+ 	// needs to be reregistered on the next commit.
+ 	s.cdcRegistered.Unset()
++	// Same reasoning as in Boot: a swapped-in database is a different file,
++	// so drop any cached CDC column-name/filter information.
++	s.invalidateCDCCache()
+ 
+ 	stats.Add(numRestores, 1)
+ 	s.logger.Printf("node restored in %s", time.Since(startT))
+@@ -2925,6 +3002,11 @@ func (s *Store) observe() (closeCh, doneCh chan struct{}) {
+ 					s.leaderObserversMu.RUnlock()
+ 					s.selfLeaderChange(isLeader)
+ 					if isLeader {
++						// This node may have just taken over CDC duties after a
++						// stretch as a follower (or after never having led
++						// before), so don't trust any column-name/filter
++						// information the streamer accumulated up to now.
++						s.invalidateCDCCache()
+ 						s.logger.Printf("this node (ID=%s, addr=%s) is now Leader", s.raftID, s.raftTn.LocalAddr())
+ 					} else {
+ 						if signal.LeaderID == "" {
+diff --git a/store/store_cdc_test.go b/store/store_cdc_test.go
+index 22f99690..340f21ef 100644
+--- a/store/store_cdc_test.go
++++ b/store/store_cdc_test.go
+@@ -28,7 +28,7 @@ func Test_StoreEnableCDC(t *testing.T) {
+ 	ch := make(chan *proto.CDCIndexedEventGroup, 10)
+ 
+ 	// Enable CDC
+-	if err := s.EnableCDC(ch, nil, false); err != nil {
++	if err := s.EnableCDC(ch, nil, false, nil); err != nil {
+ 		t.Fatalf("failed to enable CDC: %v", err)
+ 	}
+ 	if s.cdcEnabled.IsNot() {
+@@ -59,12 +59,12 @@ func Test_StoreEnableDisableCDC(t *testing.T) {
+ 	ch3 := make(chan *proto.CDCIndexedEventGroup, 10)
+ 
+ 	// Enable CDC with first channel
+-	if err := s.EnableCDC(ch1, nil, false); err != nil {
++	if err := s.EnableCDC(ch1, nil, false, nil); err != nil {
+ 		t.Fatalf("failed to enable CDC: %v", err)
+ 	}
+ 
+ 	// Enable CDC with second channel (should return error)
+-	if err := s.EnableCDC(ch2, nil, false); err != ErrCDCEnabled {
++	if err := s.EnableCDC(ch2, nil, false, nil); err != ErrCDCEnabled {
+ 		t.Fatalf("expected ErrCDCEnabled, got: %v", err)
+ 	}
+ 
+@@ -74,7 +74,7 @@ func Test_StoreEnableDisableCDC(t *testing.T) {
+ 	}
+ 
+ 	// Enable again
+-	if err := s.EnableCDC(ch3, nil, false); err != nil {
++	if err := s.EnableCDC(ch3, nil, false, nil); err != nil {
+ 		t.Fatalf("failed to enable CDC again: %v", err)
+ 	}
+ }
+@@ -105,7 +105,7 @@ func Test_StoreCDC_Events_Single(t *testing.T) {
+ 		t.Fatalf("failed to execute INSERT on single node: %s", err.Error())
+ 	}
+ 
+-	if err := s.EnableCDC(cdcChannel, nil, false); err != nil {
++	if err := s.EnableCDC(cdcChannel, nil, false, nil); err != nil {
+ 		t.Fatalf("failed to enable CDC: %v", err)
+ 	}
+ 
+diff --git a/system_test/cdc_test.go b/system_test/cdc_test.go
+index 333207c5..372b4dd6 100644
+--- a/system_test/cdc_test.go
++++ b/system_test/cdc_test.go
+@@ -30,7 +30,7 @@ func Test_CDC_SingleNode(t *testing.T) {
+ 		node.CDC.Start()
+ 		node.CDC.SetLeader(true)
+ 
+-		node.Store.EnableCDC(node.CDC.C(), nil, false)
++		node.Store.EnableCDC(node.CDC.C(), nil, false, nil)
+ 
+ 		_, err = node.Execute(`CREATE TABLE foo (id integer not null primary key, name text)`)
+ 		if err != nil {
+@@ -86,7 +86,7 @@ func Test_CDC_SingleNode_Snapshot(t *testing.T) {
+ 		node.CDC.Start()
+ 		node.CDC.SetLeader(true)
+ 
+-		node.Store.EnableCDC(node.CDC.C(), nil, false)
++		node.Store.EnableCDC(node.CDC.C(), nil, false, nil)
+ 
+ 		_, err = node.Execute(`CREATE TABLE foo (id integer not null primary key, name text)`)
+ 		if err != nil {
+@@ -140,7 +140,7 @@ func Test_CDC_SingleNode_LaterStart(t *testing.T) {
+ 	node.CDC.Start()
+ 	node.CDC.SetLeader(true)
+ 
+-	node.Store.EnableCDC(node.CDC.C(), nil, false)
++	node.Store.EnableCDC(node.CDC.C(), nil, false, nil)
+ 
+ 	_, err = node.Execute(`CREATE TABLE foo (id integer not null primary key, name text)`)
+ 	if err != nil {
+@@ -186,7 +186,7 @@ func Test_CDC_SingleNode_PostLoadBoot(t *testing.T) {
+ 	node.CDC.Start()
+ 	node.CDC.SetLeader(true)
+ 
+-	node.Store.EnableCDC(node.CDC.C(), nil, false)
++	node.Store.EnableCDC(node.CDC.C(), nil, false, nil)
+ 
+ 	_, err = node.Execute(`CREATE TABLE foo (id integer not null primary key, name text)`)
+ 	if err != nil {
+@@ -284,7 +284,7 @@ func Test_CDC_MultiNode(t *testing.T) {
+ 			}
+ 			node.CDC = cdcService
+ 			node.CDC.Start()
+-			node.Store.EnableCDC(node.CDC.C(), nil, false)
++			node.Store.EnableCDC(node.CDC.C(), nil, false, nil)
+ 		}
+ 
+ 		node1.CDC.SetLeader(true)
+@@ -369,7 +369,7 @@ func Test_CDC_MultiNode(t *testing.T) {
+ 		}
+ 		node4.CDC = cdcService
+ 		node4.CDC.Start()
+-		node4.Store.EnableCDC(node4.CDC.C(), nil, false)
++		node4.Store.EnableCDC(node4.CDC.C(), nil, false, nil)
+ 		testPoll(t, func() (bool, error) {
+ 			return node4.CDC.HighWatermark() == testEndpoint.GetHighestMessageIndex(), nil
+ 		}, 100*time.Millisecond, 10*time.Second)

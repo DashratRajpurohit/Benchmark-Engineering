@@ -1,0 +1,3021 @@
+diff --git a/cdc/config_columnfilter_f3c841_test.go b/cdc/config_columnfilter_f3c841_test.go
+new file mode 100644
+index 00000000..362d9abd
+--- /dev/null
++++ b/cdc/config_columnfilter_f3c841_test.go
+@@ -0,0 +1,96 @@
++//go:build cdccolumnfilter
++
++package cdc
++
++import (
++	"os"
++	"reflect"
++	"testing"
++)
++
++func mustWriteCDCConfigFile(t *testing.T, contents string) string {
++	t.Helper()
++	tmpFile, err := os.CreateTemp("", "cdc_columnfilter_config_*.json")
++	if err != nil {
++		t.Fatal(err)
++	}
++	if _, err := tmpFile.WriteString(contents); err != nil {
++		t.Fatal(err)
++	}
++	if err := tmpFile.Close(); err != nil {
++		t.Fatal(err)
++	}
++	t.Cleanup(func() { os.Remove(tmpFile.Name()) })
++	return tmpFile.Name()
++}
++
++func Test_CDCColFilter_Config_Parsed(t *testing.T) {
++	path := mustWriteCDCConfigFile(t, `{
++		"endpoint": "https://example.com/cdc",
++		"column_filter": {
++			"users": ["ssn", "password"],
++			"orders": ["card_number"]
++		}
++	}`)
++
++	cfg, err := NewConfig(path)
++	if err != nil {
++		t.Fatalf("NewConfig() failed: %v", err)
++	}
++
++	want := map[string][]string{
++		"users":  {"ssn", "password"},
++		"orders": {"card_number"},
++	}
++	if !reflect.DeepEqual(cfg.ColumnFilter, want) {
++		t.Fatalf("expected ColumnFilter %v, got %v", want, cfg.ColumnFilter)
++	}
++}
++
++func Test_CDCColFilter_Config_AbsentByDefault(t *testing.T) {
++	path := mustWriteCDCConfigFile(t, `{"endpoint": "https://example.com/cdc"}`)
++
++	cfg, err := NewConfig(path)
++	if err != nil {
++		t.Fatalf("NewConfig() failed: %v", err)
++	}
++	if len(cfg.ColumnFilter) != 0 {
++		t.Fatalf("expected empty ColumnFilter by default, got %v", cfg.ColumnFilter)
++	}
++
++	// Confirm the simple URL and "stdout" forms, which don't go through file parsing,
++	// also leave ColumnFilter unset.
++	urlCfg, err := NewConfig("https://example.com/cdc")
++	if err != nil {
++		t.Fatalf("NewConfig() failed for URL form: %v", err)
++	}
++	if len(urlCfg.ColumnFilter) != 0 {
++		t.Fatalf("expected empty ColumnFilter for URL form, got %v", urlCfg.ColumnFilter)
++	}
++}
++
++func Test_CDCColFilter_Config_RejectsEmptyTableName(t *testing.T) {
++	path := mustWriteCDCConfigFile(t, `{
++		"endpoint": "https://example.com/cdc",
++		"column_filter": {
++			"": ["ssn"]
++		}
++	}`)
++
++	if _, err := NewConfig(path); err == nil {
++		t.Fatalf("expected NewConfig() to reject an empty table name in column_filter")
++	}
++}
++
++func Test_CDCColFilter_Config_RejectsEmptyColumnName(t *testing.T) {
++	path := mustWriteCDCConfigFile(t, `{
++		"endpoint": "https://example.com/cdc",
++		"column_filter": {
++			"users": ["ssn", ""]
++		}
++	}`)
++
++	if _, err := NewConfig(path); err == nil {
++		t.Fatalf("expected NewConfig() to reject an empty column name in column_filter")
++	}
++}
+diff --git a/cmd/rqlited/cdc_columnfilter_wiring_test.go b/cmd/rqlited/cdc_columnfilter_wiring_test.go
+new file mode 100644
+index 00000000..a13ed0df
+--- /dev/null
++++ b/cmd/rqlited/cdc_columnfilter_wiring_test.go
+@@ -0,0 +1,158 @@
++//go:build cdccolumnfilter
++
++package main
++
++import (
++	"context"
++	"encoding/json"
++	"net"
++	"os"
++	"path/filepath"
++	"testing"
++	"time"
++
++	"github.com/rqlite/rqlite/v10/cdc/cdctest"
++	cdcjson "github.com/rqlite/rqlite/v10/cdc/json"
++	"github.com/rqlite/rqlite/v10/cluster"
++	"github.com/rqlite/rqlite/v10/command/proto"
++	"github.com/rqlite/rqlite/v10/store"
++	"github.com/rqlite/rqlite/v10/tcp"
++)
++
++// Test_CDCColFilter_CreateCDC_ProductionWiring drives this command's own,
++// unexported createCDC -- the function main() calls to enable CDC on a
++// real node -- through a real, config-file-driven column_filter, instead
++// of calling Store.EnableCDC directly the way an in-process test harness
++// would.
++func Test_CDCColFilter_CreateCDC_ProductionWiring(t *testing.T) {
++	dir := t.TempDir()
++
++	ln, err := net.Listen("tcp", "127.0.0.1:0")
++	if err != nil {
++		t.Fatalf("failed to listen: %s", err.Error())
++	}
++	mux, err := tcp.NewMux(ln, nil)
++	if err != nil {
++		t.Fatalf("failed to create mux: %s", err.Error())
++	}
++	go mux.Serve()
++
++	raftLn := mux.Listen(cluster.MuxRaftHeader)
++	raftDialer := tcp.NewDialer(cluster.MuxRaftHeader, nil)
++	raftTn := tcp.NewLayer(raftLn, raftDialer)
++
++	cfg := &Config{
++		DataPath:              dir,
++		NodeID:                raftTn.Addr().String(),
++		RaftAddr:              raftTn.Addr().String(),
++		RaftAdv:               raftTn.Addr().String(),
++		HTTPAdv:               "127.0.0.1:0",
++		ClusterConnectTimeout: 30 * time.Second,
++	}
++
++	str, err := createStore(cfg, raftTn, nil)
++	if err != nil {
++		t.Fatalf("failed to create store: %s", err.Error())
++	}
++	defer str.Close(true)
++
++	credStr, err := credentialStore(cfg)
++	if err != nil {
++		t.Fatalf("failed to create credential store: %s", err.Error())
++	}
++	clstrServ, err := clusterService(cfg, mux.Listen(cluster.MuxClusterHeader), str, str, credStr)
++	if err != nil {
++		t.Fatalf("failed to create cluster service: %s", err.Error())
++	}
++	defer clstrServ.Close()
++
++	clstrClient, err := createClusterClient(cfg, clstrServ)
++	if err != nil {
++		t.Fatalf("failed to create cluster client: %s", err.Error())
++	}
++
++	testEndpoint := cdctest.NewHTTPTestServer()
++	testEndpoint.Start()
++	defer testEndpoint.Close()
++
++	// This is the crux of the test: the column_filter comes only from this
++	// on-disk CDC config file, parsed by the real cdc.NewConfig exactly as
++	// production reads it -- never passed to Store.EnableCDC by the test
++	// itself. If createCDC fails to forward it, "ssn" will not be excluded
++	// from the delivered event.
++	cdcCfgPath := filepath.Join(dir, "cdc-config.json")
++	cdcCfgJSON, err := json.Marshal(map[string]any{
++		"endpoint":      testEndpoint.URL(),
++		"column_filter": map[string][]string{"users": {"ssn"}},
++	})
++	if err != nil {
++		t.Fatalf("failed to marshal CDC config: %s", err.Error())
++	}
++	if err := os.WriteFile(cdcCfgPath, cdcCfgJSON, 0644); err != nil {
++		t.Fatalf("failed to write CDC config: %s", err.Error())
++	}
++	cfg.CDCConfig = cdcCfgPath
++
++	cdcServ, err := createCDC(cfg, str, clstrServ, clstrClient)
++	if err != nil {
++		t.Fatalf("createCDC failed: %s", err.Error())
++	}
++	defer cdcServ.Stop()
++
++	if err := str.Open(); err != nil {
++		t.Fatalf("failed to open store: %s", err.Error())
++	}
++	if err := str.Bootstrap(store.NewServer(str.ID(), str.Addr(), true)); err != nil {
++		t.Fatalf("failed to bootstrap store: %s", err.Error())
++	}
++	if _, err := str.WaitForLeader(10 * time.Second); err != nil {
++		t.Fatalf("store never became leader: %s", err.Error())
++	}
++
++	execute := func(sql string) {
++		t.Helper()
++		req := &proto.ExecuteRequest{Request: &proto.Request{Statements: []*proto.Statement{{Sql: sql}}}}
++		if _, _, err := str.Execute(context.Background(), req); err != nil {
++			t.Fatalf("failed to execute %q: %s", sql, err.Error())
++		}
++	}
++	execute(`CREATE TABLE users (id INTEGER NOT NULL PRIMARY KEY, ssn TEXT, name TEXT)`)
++	execute(`INSERT INTO users (id, ssn, name) VALUES (1, '111-22-3333', 'Alice')`)
++
++	deadline := time.Now().Add(10 * time.Second)
++	for testEndpoint.GetMessageCount() == 0 {
++		if time.Now().After(deadline) {
++			t.Fatal("timed out waiting for a CDC event to be delivered")
++		}
++		time.Sleep(50 * time.Millisecond)
++	}
++
++	var usersAfter map[string]any
++	for _, req := range testEndpoint.GetRequests() {
++		var envelope cdcjson.CDCMessagesEnvelope
++		if err := cdcjson.UnmarshalFromEnvelopeJSON(req, &envelope); err != nil {
++			t.Fatalf("failed to unmarshal CDC envelope: %s", err.Error())
++		}
++		for _, msg := range envelope.Payload {
++			for _, ev := range msg.Events {
++				if ev.Error != "" {
++					t.Fatalf("CDC event reported an error: %s", ev.Error)
++				}
++				if ev.Table == "users" {
++					usersAfter = ev.After
++				}
++			}
++		}
++	}
++
++	if usersAfter == nil {
++		t.Fatal("never received a CDC event for the users table")
++	}
++	if _, ok := usersAfter["ssn"]; ok {
++		t.Fatalf("column_filter from the CDC config file was not applied through createCDC's "+
++			"production wiring: 'ssn' present in delivered event: %v", usersAfter)
++	}
++	if usersAfter["name"] != "Alice" {
++		t.Fatalf("expected unfiltered column 'name' to still be delivered, got %v", usersAfter)
++	}
++}
+diff --git a/db/cdc_columnfilter_f3c841_test.go b/db/cdc_columnfilter_f3c841_test.go
+new file mode 100644
+index 00000000..f8717ea7
+--- /dev/null
++++ b/db/cdc_columnfilter_f3c841_test.go
+@@ -0,0 +1,811 @@
++//go:build cdccolumnfilter
++
++package db
++
++import (
++	"fmt"
++	"os"
++	"reflect"
++	"slices"
++	"testing"
++	"time"
++
++	command "github.com/rqlite/rqlite/v10/command/proto"
++)
++
++// cdcColFilterStr, cdcColFilterInt, and cdcColFilterRowValuesAsAny are
++// deliberately prefixed (rather than the shorter cdcStr/cdcInt/etc.) so they
++// can't collide with a same-named regression-test helper a solution might
++// legitimately add to cdc_test.go in this same package.
++func cdcColFilterStr(v string) *command.CDCValue {
++	return &command.CDCValue{Value: &command.CDCValue_S{S: v}}
++}
++
++func cdcColFilterInt(v int64) *command.CDCValue {
++	return &command.CDCValue{Value: &command.CDCValue_I{I: v}}
++}
++
++func cdcColFilterRowValuesAsAny(r *command.CDCRow) []any {
++	if r == nil {
++		return nil
++	}
++	out := make([]any, len(r.Values))
++	for i, v := range r.Values {
++		switch x := v.Value.(type) {
++		case *command.CDCValue_S:
++			out[i] = x.S
++		case *command.CDCValue_I:
++			out[i] = x.I
++		default:
++			out[i] = nil
++		}
++	}
++	return out
++}
++
++func Test_CDCColFilter_Streamer_ExcludesConfiguredColumn(t *testing.T) {
++	ch := make(chan *command.CDCIndexedEventGroup, 10)
++	np := &mockColumnNamesProvider{
++		columns: map[string][]string{
++			"users": {"id", "ssn", "name"},
++		},
++	}
++	streamer, err := NewCDCStreamer(ch, np, map[string][]string{"users": {"ssn"}})
++	if err != nil {
++		t.Fatalf("error creating CDCStreamer: %v", err)
++	}
++
++	streamer.Reset(1)
++	ev := &command.CDCEvent{
++		Table: "users",
++		Op:    command.CDCEvent_INSERT,
++		NewRow: &command.CDCRow{
++			Values: []*command.CDCValue{cdcColFilterInt(7), cdcColFilterStr("111-22-3333"), cdcColFilterStr("alice")},
++		},
++	}
++	if err := streamer.PreupdateHook(ev); err != nil {
++		t.Fatalf("PreupdateHook: %v", err)
++	}
++	streamer.CommitHook()
++
++	select {
++	case group := <-ch:
++		if len(group.Events) != 1 {
++			t.Fatalf("expected 1 event, got %d", len(group.Events))
++		}
++		got := group.Events[0]
++		if !slices.Equal(got.ColumnNames, []string{"id", "name"}) {
++			t.Fatalf("expected column names [id name], got %v", got.ColumnNames)
++		}
++		if !reflect.DeepEqual(cdcColFilterRowValuesAsAny(got.NewRow), []any{int64(7), "alice"}) {
++			t.Fatalf("expected new row [7 alice], got %v", cdcColFilterRowValuesAsAny(got.NewRow))
++		}
++		if len(got.ColumnNames) != len(got.NewRow.Values) {
++			t.Fatalf("column count %d does not match row value count %d",
++				len(got.ColumnNames), len(got.NewRow.Values))
++		}
++	case <-time.After(2 * time.Second):
++		t.Fatal("timeout waiting for CDC event")
++	}
++}
++
++func Test_CDCColFilter_Streamer_UnfilteredTableUnaffected(t *testing.T) {
++	ch := make(chan *command.CDCIndexedEventGroup, 10)
++	np := &mockColumnNamesProvider{
++		columns: map[string][]string{
++			"users":  {"id", "ssn", "name"},
++			"orders": {"id", "total"},
++		},
++	}
++	streamer, err := NewCDCStreamer(ch, np, map[string][]string{"users": {"ssn"}})
++	if err != nil {
++		t.Fatalf("error creating CDCStreamer: %v", err)
++	}
++
++	streamer.Reset(2)
++	ev := &command.CDCEvent{
++		Table:  "orders",
++		Op:     command.CDCEvent_INSERT,
++		NewRow: &command.CDCRow{Values: []*command.CDCValue{cdcColFilterInt(1), cdcColFilterInt(100)}},
++	}
++	if err := streamer.PreupdateHook(ev); err != nil {
++		t.Fatalf("PreupdateHook: %v", err)
++	}
++	streamer.CommitHook()
++
++	select {
++	case group := <-ch:
++		got := group.Events[0]
++		if !slices.Equal(got.ColumnNames, []string{"id", "total"}) {
++			t.Fatalf("expected unaffected column names [id total], got %v", got.ColumnNames)
++		}
++		if !reflect.DeepEqual(cdcColFilterRowValuesAsAny(got.NewRow), []any{int64(1), int64(100)}) {
++			t.Fatalf("expected unaffected row [1 100], got %v", cdcColFilterRowValuesAsAny(got.NewRow))
++		}
++	case <-time.After(2 * time.Second):
++		t.Fatal("timeout waiting for CDC event")
++	}
++}
++
++func Test_CDCColFilter_Streamer_UpdateFiltersBothRows(t *testing.T) {
++	ch := make(chan *command.CDCIndexedEventGroup, 10)
++	np := &mockColumnNamesProvider{
++		columns: map[string][]string{"users": {"id", "ssn", "name"}},
++	}
++	streamer, err := NewCDCStreamer(ch, np, map[string][]string{"users": {"ssn"}})
++	if err != nil {
++		t.Fatalf("error creating CDCStreamer: %v", err)
++	}
++
++	streamer.Reset(3)
++	ev := &command.CDCEvent{
++		Table:  "users",
++		Op:     command.CDCEvent_UPDATE,
++		OldRow: &command.CDCRow{Values: []*command.CDCValue{cdcColFilterInt(1), cdcColFilterStr("111"), cdcColFilterStr("alice")}},
++		NewRow: &command.CDCRow{Values: []*command.CDCValue{cdcColFilterInt(1), cdcColFilterStr("111"), cdcColFilterStr("alice2")}},
++	}
++	if err := streamer.PreupdateHook(ev); err != nil {
++		t.Fatalf("PreupdateHook: %v", err)
++	}
++	streamer.CommitHook()
++
++	select {
++	case group := <-ch:
++		got := group.Events[0]
++		if !slices.Equal(got.ColumnNames, []string{"id", "name"}) {
++			t.Fatalf("expected column names [id name], got %v", got.ColumnNames)
++		}
++		if !reflect.DeepEqual(cdcColFilterRowValuesAsAny(got.OldRow), []any{int64(1), "alice"}) {
++			t.Fatalf("expected old row [1 alice], got %v", cdcColFilterRowValuesAsAny(got.OldRow))
++		}
++		if !reflect.DeepEqual(cdcColFilterRowValuesAsAny(got.NewRow), []any{int64(1), "alice2"}) {
++			t.Fatalf("expected new row [1 alice2], got %v", cdcColFilterRowValuesAsAny(got.NewRow))
++		}
++		if len(got.ColumnNames) != len(got.OldRow.Values) || len(got.ColumnNames) != len(got.NewRow.Values) {
++			t.Fatalf("column count %d must match both old (%d) and new (%d) row value counts",
++				len(got.ColumnNames), len(got.OldRow.Values), len(got.NewRow.Values))
++		}
++	case <-time.After(2 * time.Second):
++		t.Fatal("timeout waiting for CDC event")
++	}
++}
++
++func Test_CDCColFilter_Streamer_DeleteOnlyOldRow(t *testing.T) {
++	ch := make(chan *command.CDCIndexedEventGroup, 10)
++	np := &mockColumnNamesProvider{
++		columns: map[string][]string{"users": {"id", "ssn", "name"}},
++	}
++	streamer, err := NewCDCStreamer(ch, np, map[string][]string{"users": {"ssn"}})
++	if err != nil {
++		t.Fatalf("error creating CDCStreamer: %v", err)
++	}
++
++	streamer.Reset(4)
++	ev := &command.CDCEvent{
++		Table:  "users",
++		Op:     command.CDCEvent_DELETE,
++		OldRow: &command.CDCRow{Values: []*command.CDCValue{cdcColFilterInt(1), cdcColFilterStr("111"), cdcColFilterStr("alice")}},
++	}
++	if err := streamer.PreupdateHook(ev); err != nil {
++		t.Fatalf("PreupdateHook: %v", err)
++	}
++	streamer.CommitHook()
++
++	select {
++	case group := <-ch:
++		got := group.Events[0]
++		if !slices.Equal(got.ColumnNames, []string{"id", "name"}) {
++			t.Fatalf("expected column names [id name], got %v", got.ColumnNames)
++		}
++		if got.NewRow != nil {
++			t.Fatalf("expected nil new row for DELETE, got %v", got.NewRow)
++		}
++		if !reflect.DeepEqual(cdcColFilterRowValuesAsAny(got.OldRow), []any{int64(1), "alice"}) {
++			t.Fatalf("expected old row [1 alice], got %v", cdcColFilterRowValuesAsAny(got.OldRow))
++		}
++		if len(got.ColumnNames) != len(got.OldRow.Values) {
++			t.Fatalf("column count %d must match old row value count %d",
++				len(got.ColumnNames), len(got.OldRow.Values))
++		}
++	case <-time.After(2 * time.Second):
++		t.Fatal("timeout waiting for CDC event")
++	}
++}
++
++func Test_CDCColFilter_Streamer_UnknownColumnIsNoOp(t *testing.T) {
++	ch := make(chan *command.CDCIndexedEventGroup, 10)
++	np := &mockColumnNamesProvider{
++		columns: map[string][]string{"users": {"id", "name"}},
++	}
++	streamer, err := NewCDCStreamer(ch, np, map[string][]string{"users": {"does_not_exist"}})
++	if err != nil {
++		t.Fatalf("error creating CDCStreamer: %v", err)
++	}
++
++	streamer.Reset(5)
++	ev := &command.CDCEvent{
++		Table:  "users",
++		Op:     command.CDCEvent_INSERT,
++		NewRow: &command.CDCRow{Values: []*command.CDCValue{cdcColFilterInt(1), cdcColFilterStr("alice")}},
++	}
++	if err := streamer.PreupdateHook(ev); err != nil {
++		t.Fatalf("PreupdateHook: %v", err)
++	}
++	streamer.CommitHook()
++
++	select {
++	case group := <-ch:
++		got := group.Events[0]
++		if got.Error != "" {
++			t.Fatalf("unexpected event error: %s", got.Error)
++		}
++		if !slices.Equal(got.ColumnNames, []string{"id", "name"}) {
++			t.Fatalf("expected unaffected column names, got %v", got.ColumnNames)
++		}
++		if !reflect.DeepEqual(cdcColFilterRowValuesAsAny(got.NewRow), []any{int64(1), "alice"}) {
++			t.Fatalf("expected unaffected row [1 alice], got %v", cdcColFilterRowValuesAsAny(got.NewRow))
++		}
++		if len(got.ColumnNames) != len(got.NewRow.Values) {
++			t.Fatalf("column count %d does not match row value count %d",
++				len(got.ColumnNames), len(got.NewRow.Values))
++		}
++	case <-time.After(2 * time.Second):
++		t.Fatal("timeout waiting for CDC event")
++	}
++}
++
++func Test_CDCColFilter_Streamer_MultipleTablesInOneCommit(t *testing.T) {
++	ch := make(chan *command.CDCIndexedEventGroup, 10)
++	np := &mockColumnNamesProvider{
++		columns: map[string][]string{
++			"users":  {"id", "ssn", "name"},
++			"orders": {"id", "card_number", "total"},
++		},
++	}
++	streamer, err := NewCDCStreamer(ch, np, map[string][]string{
++		"users":  {"ssn"},
++		"orders": {"card_number"},
++	})
++	if err != nil {
++		t.Fatalf("error creating CDCStreamer: %v", err)
++	}
++
++	streamer.Reset(6)
++	evUsers := &command.CDCEvent{
++		Table:  "users",
++		Op:     command.CDCEvent_INSERT,
++		NewRow: &command.CDCRow{Values: []*command.CDCValue{cdcColFilterInt(1), cdcColFilterStr("111"), cdcColFilterStr("alice")}},
++	}
++	evOrders := &command.CDCEvent{
++		Table:  "orders",
++		Op:     command.CDCEvent_INSERT,
++		NewRow: &command.CDCRow{Values: []*command.CDCValue{cdcColFilterInt(9), cdcColFilterStr("4111"), cdcColFilterInt(42)}},
++	}
++	if err := streamer.PreupdateHook(evUsers); err != nil {
++		t.Fatalf("PreupdateHook: %v", err)
++	}
++	if err := streamer.PreupdateHook(evOrders); err != nil {
++		t.Fatalf("PreupdateHook: %v", err)
++	}
++	streamer.CommitHook()
++
++	select {
++	case group := <-ch:
++		if len(group.Events) != 2 {
++			t.Fatalf("expected 2 events, got %d", len(group.Events))
++		}
++		u, o := group.Events[0], group.Events[1]
++		if !slices.Equal(u.ColumnNames, []string{"id", "name"}) {
++			t.Fatalf("users: expected [id name], got %v", u.ColumnNames)
++		}
++		if !slices.Equal(o.ColumnNames, []string{"id", "total"}) {
++			t.Fatalf("orders: expected [id total], got %v", o.ColumnNames)
++		}
++		if !reflect.DeepEqual(cdcColFilterRowValuesAsAny(u.NewRow), []any{int64(1), "alice"}) {
++			t.Fatalf("users: unexpected row %v", cdcColFilterRowValuesAsAny(u.NewRow))
++		}
++		if !reflect.DeepEqual(cdcColFilterRowValuesAsAny(o.NewRow), []any{int64(9), int64(42)}) {
++			t.Fatalf("orders: unexpected row %v", cdcColFilterRowValuesAsAny(o.NewRow))
++		}
++	case <-time.After(2 * time.Second):
++		t.Fatal("timeout waiting for CDC event")
++	}
++}
++
++// schemaVersionedProvider is a ColumnsNameProvider defined entirely in this
++// test file, for tests that need to control SchemaVersion directly. It's
++// deliberately separate from mockColumnNamesProvider (defined in
++// cdc_test.go): that type is extended by the implementation under test to
++// add SchemaVersion support, so its internal field names are an
++// implementation detail, not something these tests should assume.
++type schemaVersionedProvider struct {
++	Columns    map[string][]string
++	Version    int64
++	VersionErr error
++}
++
++func (p *schemaVersionedProvider) ColumnNames(table string) ([]string, error) {
++	if cols, ok := p.Columns[table]; ok {
++		return cols, nil
++	}
++	return []string{}, nil
++}
++
++func (p *schemaVersionedProvider) SchemaVersion() (int64, error) {
++	if p.VersionErr != nil {
++		return 0, p.VersionErr
++	}
++	return p.Version, nil
++}
++
++// Test_CDCColFilter_Streamer_CacheInvalidatedOnSchemaVersionChange confirms
++// that once the ColumnsNameProvider's SchemaVersion moves on, the CDCStreamer
++// re-derives both the column-name cache and the filterInfo built from it --
++// including correctly re-deriving keepIdx, the row-value indices to keep,
++// which must track the table's new column layout, not the old one.
++func Test_CDCColFilter_Streamer_CacheInvalidatedOnSchemaVersionChange(t *testing.T) {
++	ch := make(chan *command.CDCIndexedEventGroup, 10)
++	np := &schemaVersionedProvider{
++		Columns: map[string][]string{
++			"users": {"id", "ssn", "name"},
++		},
++	}
++	streamer, err := NewCDCStreamer(ch, np, map[string][]string{"users": {"ssn"}})
++	if err != nil {
++		t.Fatalf("error creating CDCStreamer: %v", err)
++	}
++
++	streamer.Reset(1)
++	if err := streamer.PreupdateHook(&command.CDCEvent{
++		Table:  "users",
++		Op:     command.CDCEvent_INSERT,
++		NewRow: &command.CDCRow{Values: []*command.CDCValue{cdcColFilterInt(1), cdcColFilterStr("111"), cdcColFilterStr("alice")}},
++	}); err != nil {
++		t.Fatalf("PreupdateHook: %v", err)
++	}
++	streamer.CommitHook()
++	select {
++	case group := <-ch:
++		got := group.Events[0]
++		if !slices.Equal(got.ColumnNames, []string{"id", "name"}) {
++			t.Fatalf("expected [id name] on first commit, got %v", got.ColumnNames)
++		}
++	case <-time.After(2 * time.Second):
++		t.Fatal("timeout waiting for CDC event")
++	}
++
++	// Simulate ALTER TABLE users ADD COLUMN email, which in SQLite bumps
++	// schema_version. The new column lands at the end, after "name", so
++	// "ssn"'s index (1) is unchanged, but a stale keepIdx built for a
++	// 3-column table would silently mis-slice a 4-column row.
++	np.Columns["users"] = []string{"id", "ssn", "name", "email"}
++	np.Version++
++
++	streamer.Reset(2)
++	if err := streamer.PreupdateHook(&command.CDCEvent{
++		Table: "users",
++		Op:    command.CDCEvent_INSERT,
++		NewRow: &command.CDCRow{
++			Values: []*command.CDCValue{cdcColFilterInt(2), cdcColFilterStr("222"), cdcColFilterStr("bob"), cdcColFilterStr("bob@example.com")},
++		},
++	}); err != nil {
++		t.Fatalf("PreupdateHook: %v", err)
++	}
++	streamer.CommitHook()
++
++	select {
++	case group := <-ch:
++		got := group.Events[0]
++		if !slices.Equal(got.ColumnNames, []string{"id", "name", "email"}) {
++			t.Fatalf("expected [id name email] after schema change, got %v", got.ColumnNames)
++		}
++		if !reflect.DeepEqual(cdcColFilterRowValuesAsAny(got.NewRow), []any{int64(2), "bob", "bob@example.com"}) {
++			t.Fatalf("expected new row [2 bob bob@example.com], got %v", cdcColFilterRowValuesAsAny(got.NewRow))
++		}
++	case <-time.After(2 * time.Second):
++		t.Fatal("timeout waiting for CDC event")
++	}
++}
++
++// Test_CDCColFilter_Streamer_InvalidateAll confirms that InvalidateAll forces
++// a fresh lookup on the next commit even when SchemaVersion hasn't changed --
++// the case that matters after a database restore (a new file's schema
++// version can coincidentally collide with the cached one) or a leadership
++// transition, neither of which SchemaVersion alone is trusted to catch.
++func Test_CDCColFilter_Streamer_InvalidateAll(t *testing.T) {
++	ch := make(chan *command.CDCIndexedEventGroup, 10)
++	np := &mockColumnNamesProvider{
++		columns: map[string][]string{
++			"users": {"id", "ssn", "name"},
++		},
++	}
++	streamer, err := NewCDCStreamer(ch, np, map[string][]string{"users": {"ssn"}})
++	if err != nil {
++		t.Fatalf("error creating CDCStreamer: %v", err)
++	}
++
++	streamer.Reset(1)
++	if err := streamer.PreupdateHook(&command.CDCEvent{
++		Table:  "users",
++		Op:     command.CDCEvent_INSERT,
++		NewRow: &command.CDCRow{Values: []*command.CDCValue{cdcColFilterInt(1), cdcColFilterStr("111"), cdcColFilterStr("alice")}},
++	}); err != nil {
++		t.Fatalf("PreupdateHook: %v", err)
++	}
++	streamer.CommitHook()
++	<-ch // drain, cache is now populated
++
++	// Simulate a restore to a database whose users table happens to report
++	// the same SchemaVersion (e.g. both are freshly-created single-table
++	// databases) but has a different, incompatible column layout.
++	np.columns["users"] = []string{"id", "name"} // "ssn" column no longer exists at all
++	streamer.InvalidateAll()
++
++	streamer.Reset(2)
++	if err := streamer.PreupdateHook(&command.CDCEvent{
++		Table:  "users",
++		Op:     command.CDCEvent_INSERT,
++		NewRow: &command.CDCRow{Values: []*command.CDCValue{cdcColFilterInt(2), cdcColFilterStr("carol")}},
++	}); err != nil {
++		t.Fatalf("PreupdateHook: %v", err)
++	}
++	streamer.CommitHook()
++
++	select {
++	case group := <-ch:
++		got := group.Events[0]
++		// "ssn" is absent from the post-restore schema entirely, so the
++		// filter has nothing to exclude: both remaining columns pass through.
++		if !slices.Equal(got.ColumnNames, []string{"id", "name"}) {
++			t.Fatalf("expected [id name] after InvalidateAll, got %v", got.ColumnNames)
++		}
++		if !reflect.DeepEqual(cdcColFilterRowValuesAsAny(got.NewRow), []any{int64(2), "carol"}) {
++			t.Fatalf("expected new row [2 carol], got %v", cdcColFilterRowValuesAsAny(got.NewRow))
++		}
++	case <-time.After(2 * time.Second):
++		t.Fatal("timeout waiting for CDC event")
++	}
++}
++
++// Test_CDCColFilter_Streamer_SchemaVersionErrorFailsSafe confirms that if the
++// ColumnsNameProvider can't report a SchemaVersion, the CDCStreamer treats
++// that as "cache unknown" and re-derives from scratch, rather than trusting
++// (and continuing to serve) whatever it had cached before.
++func Test_CDCColFilter_Streamer_SchemaVersionErrorFailsSafe(t *testing.T) {
++	ch := make(chan *command.CDCIndexedEventGroup, 10)
++	np := &schemaVersionedProvider{
++		Columns: map[string][]string{
++			"users": {"id", "ssn", "name"},
++		},
++	}
++	streamer, err := NewCDCStreamer(ch, np, map[string][]string{"users": {"ssn"}})
++	if err != nil {
++		t.Fatalf("error creating CDCStreamer: %v", err)
++	}
++
++	streamer.Reset(1)
++	if err := streamer.PreupdateHook(&command.CDCEvent{
++		Table:  "users",
++		Op:     command.CDCEvent_INSERT,
++		NewRow: &command.CDCRow{Values: []*command.CDCValue{cdcColFilterInt(1), cdcColFilterStr("111"), cdcColFilterStr("alice")}},
++	}); err != nil {
++		t.Fatalf("PreupdateHook: %v", err)
++	}
++	streamer.CommitHook()
++	<-ch // drain, cache is now populated
++
++	np.VersionErr = fmt.Errorf("simulated: can't read schema_version")
++	np.Columns["users"] = []string{"id", "name", "ssn"} // column order changed too
++
++	streamer.Reset(2)
++	if err := streamer.PreupdateHook(&command.CDCEvent{
++		Table:  "users",
++		Op:     command.CDCEvent_INSERT,
++		NewRow: &command.CDCRow{Values: []*command.CDCValue{cdcColFilterInt(2), cdcColFilterStr("bob"), cdcColFilterStr("222")}},
++	}); err != nil {
++		t.Fatalf("PreupdateHook: %v", err)
++	}
++	streamer.CommitHook()
++
++	select {
++	case group := <-ch:
++		got := group.Events[0]
++		if got.Error != "" {
++			t.Fatalf("expected the event to still be delivered normally despite the transient "+
++				"SchemaVersion error, got Error=%q", got.Error)
++		}
++		if !slices.Equal(got.ColumnNames, []string{"id", "name"}) {
++			t.Fatalf("expected [id name] re-derived after SchemaVersion error, got %v", got.ColumnNames)
++		}
++		if !reflect.DeepEqual(cdcColFilterRowValuesAsAny(got.NewRow), []any{int64(2), "bob"}) {
++			t.Fatalf("expected new row [2 bob], got %v -- a stale cache would have kept the old "+
++				"column order and returned the wrong values", cdcColFilterRowValuesAsAny(got.NewRow))
++		}
++	case <-time.After(2 * time.Second):
++		t.Fatal("timeout waiting for CDC event")
++	}
++}
++
++func Test_CDCColFilter_Streamer_NilColumnFilterUnaffected(t *testing.T) {
++	ch := make(chan *command.CDCIndexedEventGroup, 10)
++	np := &mockColumnNamesProvider{
++		columns: map[string][]string{"users": {"id", "ssn", "name"}},
++	}
++	streamer, err := NewCDCStreamer(ch, np, nil)
++	if err != nil {
++		t.Fatalf("error creating CDCStreamer: %v", err)
++	}
++
++	streamer.Reset(7)
++	ev := &command.CDCEvent{
++		Table:  "users",
++		Op:     command.CDCEvent_INSERT,
++		NewRow: &command.CDCRow{Values: []*command.CDCValue{cdcColFilterInt(1), cdcColFilterStr("111"), cdcColFilterStr("alice")}},
++	}
++	if err := streamer.PreupdateHook(ev); err != nil {
++		t.Fatalf("PreupdateHook: %v", err)
++	}
++	streamer.CommitHook()
++
++	select {
++	case group := <-ch:
++		got := group.Events[0]
++		if !slices.Equal(got.ColumnNames, []string{"id", "ssn", "name"}) {
++			t.Fatalf("expected all columns with nil filter, got %v", got.ColumnNames)
++		}
++	case <-time.After(2 * time.Second):
++		t.Fatal("timeout waiting for CDC event")
++	}
++}
++
++// Test_CDCColFilter_Streamer_ExcludesMultipleColumns confirms that every
++// column named for a table -- not just the first -- is excluded. A filter
++// implementation that only inspects columnFilter[table][0] would still pass
++// every other test in this file, since none of them configure more than one
++// excluded column for the same table.
++func Test_CDCColFilter_Streamer_ExcludesMultipleColumns(t *testing.T) {
++	ch := make(chan *command.CDCIndexedEventGroup, 10)
++	np := &mockColumnNamesProvider{
++		columns: map[string][]string{
++			"users": {"id", "ssn", "name", "salary"},
++		},
++	}
++	streamer, err := NewCDCStreamer(ch, np, map[string][]string{"users": {"ssn", "salary"}})
++	if err != nil {
++		t.Fatalf("error creating CDCStreamer: %v", err)
++	}
++
++	streamer.Reset(8)
++	ev := &command.CDCEvent{
++		Table: "users",
++		Op:    command.CDCEvent_INSERT,
++		NewRow: &command.CDCRow{
++			Values: []*command.CDCValue{
++				cdcColFilterInt(1), cdcColFilterStr("111-22-3333"), cdcColFilterStr("alice"), cdcColFilterInt(90000),
++			},
++		},
++	}
++	if err := streamer.PreupdateHook(ev); err != nil {
++		t.Fatalf("PreupdateHook: %v", err)
++	}
++	streamer.CommitHook()
++
++	select {
++	case group := <-ch:
++		got := group.Events[0]
++		if !slices.Equal(got.ColumnNames, []string{"id", "name"}) {
++			t.Fatalf("expected both excluded columns dropped, got column names %v", got.ColumnNames)
++		}
++		if !reflect.DeepEqual(cdcColFilterRowValuesAsAny(got.NewRow), []any{int64(1), "alice"}) {
++			t.Fatalf("expected row [1 alice] with both excluded values removed, got %v",
++				cdcColFilterRowValuesAsAny(got.NewRow))
++		}
++	case <-time.After(2 * time.Second):
++		t.Fatal("timeout waiting for CDC event")
++	}
++}
++
++// Test_CDCColFilter_Streamer_LeadershipInvalidationRequired confirms that
++// InvalidateAll(), which Store calls on Raft leadership transition, makes
++// the first post-transition event correct even when a stale cache's
++// remembered SchemaVersion happens to collide with the current one, so a
++// plain version comparison alone would wrongly trust stale columns.
++func Test_CDCColFilter_Streamer_LeadershipInvalidationRequired(t *testing.T) {
++	ch := make(chan *command.CDCIndexedEventGroup, 10)
++	np := &schemaVersionedProvider{
++		Columns: map[string][]string{"users": {"id", "ssn", "name"}},
++		Version: 5,
++	}
++	streamer, err := NewCDCStreamer(ch, np, map[string][]string{"users": {"ssn"}})
++	if err != nil {
++		t.Fatalf("error creating CDCStreamer: %v", err)
++	}
++
++	streamer.Reset(1)
++	if err := streamer.PreupdateHook(&command.CDCEvent{
++		Table:  "users",
++		Op:     command.CDCEvent_INSERT,
++		NewRow: &command.CDCRow{Values: []*command.CDCValue{cdcColFilterInt(1), cdcColFilterStr("111"), cdcColFilterStr("alice")}},
++	}); err != nil {
++		t.Fatalf("PreupdateHook: %v", err)
++	}
++	streamer.CommitHook()
++	<-ch // drain, cache built at Version 5 with columns [id ssn name]
++
++	// This node was a follower and never processed a commit for "users"
++	// while a schema change happened elsewhere, so its cache is stale.
++	// SchemaVersion() now reports "5" again -- a collision with the stale
++	// cache's remembered version, standing in for a real repeated value
++	// (e.g. after a restore, or an implementation detail of how a given
++	// backend assigns version numbers). The columns underneath disagree
++	// with what was cached: "email" replaces "ssn".
++	np.Columns["users"] = []string{"id", "email", "name"}
++
++	// This node just became leader. Store.selfLeaderChange's caller invokes
++	// exactly this before trusting the streamer for the first time.
++	streamer.InvalidateAll()
++
++	streamer.Reset(2)
++	if err := streamer.PreupdateHook(&command.CDCEvent{
++		Table:  "users",
++		Op:     command.CDCEvent_INSERT,
++		NewRow: &command.CDCRow{Values: []*command.CDCValue{cdcColFilterInt(2), cdcColFilterStr("bob@example.com"), cdcColFilterStr("bob")}},
++	}); err != nil {
++		t.Fatalf("PreupdateHook: %v", err)
++	}
++	streamer.CommitHook()
++
++	select {
++	case group := <-ch:
++		got := group.Events[0]
++		// The filter names "ssn", which no longer exists -- a stale cache
++		// would still exclude index 1 (where "ssn" used to be), silently
++		// dropping the new "email" column's value instead.
++		if !slices.Equal(got.ColumnNames, []string{"id", "email", "name"}) {
++			t.Fatalf("expected fresh column names [id email name] after leadership transition, got %v -- "+
++				"a schema-version collision without the explicit InvalidateAll() call would still trust "+
++				"the stale [id ssn name] cache", got.ColumnNames)
++		}
++		if !reflect.DeepEqual(cdcColFilterRowValuesAsAny(got.NewRow), []any{int64(2), "bob@example.com", "bob"}) {
++			t.Fatalf("expected new row [2 bob@example.com bob], got %v",
++				cdcColFilterRowValuesAsAny(got.NewRow))
++		}
++	case <-time.After(2 * time.Second):
++		t.Fatal("timeout waiting for CDC event")
++	}
++}
++
++// Test_CDCColFilter_DB_SchemaVersionChangesOnDDL confirms, against a real
++// on-disk database rather than a mock, that (*DB).SchemaVersion() actually
++// changes its return value after ADD, DROP, and RENAME operations. Every
++// other test in this file drives SchemaVersion() through a mock instead.
++func Test_CDCColFilter_DB_SchemaVersionChangesOnDDL(t *testing.T) {
++	path := mustTempPath()
++	defer os.Remove(path)
++	db, err := Open(path, false, false)
++	if err != nil {
++		t.Fatalf("failed to open database: %s", err.Error())
++	}
++	defer db.Close()
++
++	mustExecute(db, "CREATE TABLE users (id INTEGER NOT NULL PRIMARY KEY, ssn TEXT, name TEXT)")
++	v0, err := db.SchemaVersion()
++	if err != nil {
++		t.Fatalf("SchemaVersion after CREATE TABLE: %v", err)
++	}
++
++	mustExecute(db, "ALTER TABLE users ADD COLUMN email TEXT")
++	v1, err := db.SchemaVersion()
++	if err != nil {
++		t.Fatalf("SchemaVersion after ADD COLUMN: %v", err)
++	}
++	if v1 == v0 {
++		t.Fatalf("expected SchemaVersion to change after ADD COLUMN, stayed at %d", v0)
++	}
++
++	mustExecute(db, "ALTER TABLE users DROP COLUMN email")
++	v2, err := db.SchemaVersion()
++	if err != nil {
++		t.Fatalf("SchemaVersion after DROP COLUMN: %v", err)
++	}
++	if v2 == v1 {
++		t.Fatalf("expected SchemaVersion to change after DROP COLUMN, stayed at %d", v1)
++	}
++
++	mustExecute(db, "ALTER TABLE users RENAME COLUMN name TO full_name")
++	v3, err := db.SchemaVersion()
++	if err != nil {
++		t.Fatalf("SchemaVersion after RENAME COLUMN: %v", err)
++	}
++	if v3 == v2 {
++		t.Fatalf("expected SchemaVersion to change after RENAME COLUMN, stayed at %d", v2)
++	}
++}
++
++// Test_CDCColFilter_Streamer_SchemaVersionErrorRecoveryReDerives covers the
++// commit *after* a transient SchemaVersion failure: the streamer holds
++// metadata for which it never confirmed a version, and the columns really
++// did move while the version was unreadable. Trusting that unconfirmed
++// metadata once the version becomes readable again would publish the
++// excluded ssn value under the name column.
++func Test_CDCColFilter_Streamer_SchemaVersionErrorRecoveryReDerives(t *testing.T) {
++	ch := make(chan *command.CDCIndexedEventGroup, 10)
++	np := &schemaVersionedProvider{
++		Columns: map[string][]string{
++			"users": {"id", "ssn", "name"},
++		},
++		Version: 1,
++	}
++	streamer, err := NewCDCStreamer(ch, np, map[string][]string{"users": {"ssn"}})
++	if err != nil {
++		t.Fatalf("error creating CDCStreamer: %v", err)
++	}
++
++	// A first, ordinary commit, so metadata is cached against a version the
++	// streamer was able to read.
++	streamer.Reset(1)
++	if err := streamer.PreupdateHook(&command.CDCEvent{
++		Table:  "users",
++		Op:     command.CDCEvent_INSERT,
++		NewRow: &command.CDCRow{Values: []*command.CDCValue{cdcColFilterInt(1), cdcColFilterStr("111"), cdcColFilterStr("alice")}},
++	}); err != nil {
++		t.Fatalf("PreupdateHook: %v", err)
++	}
++	streamer.CommitHook()
++	<-ch
++
++	// A commit during which the version cannot be read at all.
++	np.VersionErr = fmt.Errorf("simulated: can't read schema_version")
++	streamer.Reset(2)
++	if err := streamer.PreupdateHook(&command.CDCEvent{
++		Table:  "users",
++		Op:     command.CDCEvent_INSERT,
++		NewRow: &command.CDCRow{Values: []*command.CDCValue{cdcColFilterInt(2), cdcColFilterStr("222"), cdcColFilterStr("bob")}},
++	}); err != nil {
++		t.Fatalf("PreupdateHook: %v", err)
++	}
++	streamer.CommitHook()
++	<-ch
++
++	// The version is readable again and has moved, because the table really
++	// was altered while it could not be read: ssn is now last, so a row's
++	// retained positions are no longer the ones the earlier layout implied.
++	np.VersionErr = nil
++	np.Version = 2
++	np.Columns["users"] = []string{"id", "name", "ssn"}
++
++	streamer.Reset(3)
++	if err := streamer.PreupdateHook(&command.CDCEvent{
++		Table:  "users",
++		Op:     command.CDCEvent_INSERT,
++		NewRow: &command.CDCRow{Values: []*command.CDCValue{cdcColFilterInt(3), cdcColFilterStr("carol"), cdcColFilterStr("333-44-5555")}},
++	}); err != nil {
++		t.Fatalf("PreupdateHook: %v", err)
++	}
++	streamer.CommitHook()
++
++	select {
++	case group := <-ch:
++		got := group.Events[0]
++		if got.Error != "" {
++			t.Fatalf("expected the event to be delivered normally once the version was readable "+
++				"again, got Error=%q", got.Error)
++		}
++		if !slices.Equal(got.ColumnNames, []string{"id", "name"}) {
++			t.Fatalf("expected [id name] re-derived once the version was readable again, got %v -- "+
++				"metadata held across a commit whose version was never confirmed must not be reused",
++				got.ColumnNames)
++		}
++		if !reflect.DeepEqual(cdcColFilterRowValuesAsAny(got.NewRow), []any{int64(3), "carol"}) {
++			t.Fatalf("expected new row [3 carol], got %v", cdcColFilterRowValuesAsAny(got.NewRow))
++		}
++		for _, v := range cdcColFilterRowValuesAsAny(got.NewRow) {
++			if v == "333-44-5555" {
++				t.Fatalf("excluded ssn value was published under column names %v: %v",
++					got.ColumnNames, cdcColFilterRowValuesAsAny(got.NewRow))
++			}
++		}
++	case <-time.After(2 * time.Second):
++		t.Fatal("timeout waiting for CDC event")
++	}
++}
+diff --git a/store/store_cdc_columnfilter_test.go b/store/store_cdc_columnfilter_test.go
+new file mode 100644
+index 00000000..f4d118d2
+--- /dev/null
++++ b/store/store_cdc_columnfilter_test.go
+@@ -0,0 +1,1654 @@
++//go:build cdccolumnfilter
++
++package store
++
++import (
++	"bytes"
++	"context"
++	"os"
++	"path/filepath"
++	"regexp"
++	"slices"
++	"testing"
++	"time"
++
++	"github.com/rqlite/rqlite/v10/command"
++	"github.com/rqlite/rqlite/v10/command/chunking"
++	"github.com/rqlite/rqlite/v10/command/proto"
++)
++
++// drainCDCEvent waits up to 5 seconds for exactly one CDC event group on ch
++// and returns its single event, failing the test on timeout or an unexpected
++// event count.
++func drainCDCEvent(t *testing.T, ch <-chan *proto.CDCIndexedEventGroup) *proto.CDCEvent {
++	t.Helper()
++	select {
++	case events := <-ch:
++		if len(events.Events) != 1 {
++			t.Fatalf("expected 1 CDC event, got %d", len(events.Events))
++		}
++		return events.Events[0]
++	case <-time.After(5 * time.Second):
++		t.Fatal("timeout waiting for CDC event")
++		return nil
++	}
++}
++
++// drainCDCGroup waits up to 5 seconds for exactly one CDC event group
++// carrying want events and returns it, failing the test on timeout or an
++// unexpected event count.
++func drainCDCGroup(t *testing.T, ch <-chan *proto.CDCIndexedEventGroup, want int) *proto.CDCIndexedEventGroup {
++	t.Helper()
++	select {
++	case events := <-ch:
++		if len(events.Events) != want {
++			t.Fatalf("expected %d CDC events, got %d", want, len(events.Events))
++		}
++		return events
++	case <-time.After(5 * time.Second):
++		t.Fatal("timeout waiting for CDC event group")
++		return nil
++	}
++}
++
++// Test_CDCColFilter_Store_ExcludesColumn confirms that a column named in the
++// columnFilter passed to EnableCDC is absent from both the column-name list and the
++// row values of CDC events for that table, while other columns are delivered as usual.
++func Test_CDCColFilter_Store_ExcludesColumn(t *testing.T) {
++	s, ln := mustNewStore(t)
++	defer ln.Close()
++
++	cdcChannel := make(chan *proto.CDCIndexedEventGroup, 100)
++
++	if err := s.Open(); err != nil {
++		t.Fatalf("failed to open single-node store: %s", err.Error())
++	}
++	if err := s.Bootstrap(NewServer(s.ID(), s.Addr(), true)); err != nil {
++		t.Fatalf("failed to bootstrap single-node store: %s", err.Error())
++	}
++	defer s.Close(true)
++	if _, err := s.WaitForLeader(10 * time.Second); err != nil {
++		t.Fatalf("Error waiting for leader: %s", err)
++	}
++
++	er := executeRequestFromString(
++		`CREATE TABLE users (id INTEGER NOT NULL PRIMARY KEY, ssn TEXT, name TEXT)`, false, false)
++	if _, _, err := s.Execute(context.Background(), er); err != nil {
++		t.Fatalf("failed to create table: %s", err.Error())
++	}
++
++	if err := s.EnableCDC(cdcChannel, nil, false, map[string][]string{"users": {"ssn"}}); err != nil {
++		t.Fatalf("failed to enable CDC: %v", err)
++	}
++
++	er = executeRequestFromString(
++		`INSERT INTO users(id, ssn, name) VALUES(101, "111-22-3333", "fiona")`, false, false)
++	if _, _, err := s.Execute(context.Background(), er); err != nil {
++		t.Fatalf("failed to execute INSERT: %s", err.Error())
++	}
++
++	timeout := time.After(5 * time.Second)
++	select {
++	case events := <-cdcChannel:
++		if len(events.Events) != 1 {
++			t.Fatalf("expected 1 CDC event, got %d", len(events.Events))
++		}
++		ev := events.Events[0]
++		if !slices.Equal(ev.ColumnNames, []string{"id", "name"}) {
++			t.Fatalf("expected column names [id name], got %v", ev.ColumnNames)
++		}
++		if len(ev.NewRow.Values) != 2 {
++			t.Fatalf("expected 2 row values, got %d", len(ev.NewRow.Values))
++		}
++		if ev.NewRow.Values[0].GetI() != 101 {
++			t.Fatalf("expected first value to be id 101, got %v", ev.NewRow.Values[0])
++		}
++		if ev.NewRow.Values[1].GetS() != "fiona" {
++			t.Fatalf("expected second value to be name 'fiona', got %v", ev.NewRow.Values[1])
++		}
++	case <-timeout:
++		t.Fatal("timeout waiting for CDC INSERT event")
++	}
++}
++
++// Test_CDCColFilter_Store_TableNotInFilterUnaffected confirms a table absent from the
++// columnFilter map is captured exactly as it would be with no filter at all.
++func Test_CDCColFilter_Store_TableNotInFilterUnaffected(t *testing.T) {
++	s, ln := mustNewStore(t)
++	defer ln.Close()
++
++	cdcChannel := make(chan *proto.CDCIndexedEventGroup, 100)
++
++	if err := s.Open(); err != nil {
++		t.Fatalf("failed to open single-node store: %s", err.Error())
++	}
++	if err := s.Bootstrap(NewServer(s.ID(), s.Addr(), true)); err != nil {
++		t.Fatalf("failed to bootstrap single-node store: %s", err.Error())
++	}
++	defer s.Close(true)
++	if _, err := s.WaitForLeader(10 * time.Second); err != nil {
++		t.Fatalf("Error waiting for leader: %s", err)
++	}
++
++	er := executeRequestFromString(
++		`CREATE TABLE orders (id INTEGER NOT NULL PRIMARY KEY, total REAL)`, false, false)
++	if _, _, err := s.Execute(context.Background(), er); err != nil {
++		t.Fatalf("failed to create table: %s", err.Error())
++	}
++
++	// The filter names a different table entirely, so "orders" must be unaffected.
++	if err := s.EnableCDC(cdcChannel, nil, false, map[string][]string{"users": {"ssn"}}); err != nil {
++		t.Fatalf("failed to enable CDC: %v", err)
++	}
++
++	er = executeRequestFromString(`INSERT INTO orders(id, total) VALUES(1, 42.5)`, false, false)
++	if _, _, err := s.Execute(context.Background(), er); err != nil {
++		t.Fatalf("failed to execute INSERT: %s", err.Error())
++	}
++
++	timeout := time.After(5 * time.Second)
++	select {
++	case events := <-cdcChannel:
++		ev := events.Events[0]
++		if !slices.Equal(ev.ColumnNames, []string{"id", "total"}) {
++			t.Fatalf("expected column names [id total], got %v", ev.ColumnNames)
++		}
++		if len(ev.NewRow.Values) != 2 {
++			t.Fatalf("expected 2 row values, got %d", len(ev.NewRow.Values))
++		}
++	case <-timeout:
++		t.Fatal("timeout waiting for CDC INSERT event")
++	}
++}
++
++// Test_CDCColFilter_Store_SchemaEvolution_AddColumn confirms that adding a
++// column to a filtered table via ALTER TABLE is picked up by subsequent CDC
++// events -- the streamer's cached column-name list, built by the first
++// INSERT below, must not still be in effect for the second.
++func Test_CDCColFilter_Store_SchemaEvolution_AddColumn(t *testing.T) {
++	s, ln := mustNewStore(t)
++	defer ln.Close()
++
++	cdcChannel := make(chan *proto.CDCIndexedEventGroup, 100)
++
++	if err := s.Open(); err != nil {
++		t.Fatalf("failed to open single-node store: %s", err.Error())
++	}
++	if err := s.Bootstrap(NewServer(s.ID(), s.Addr(), true)); err != nil {
++		t.Fatalf("failed to bootstrap single-node store: %s", err.Error())
++	}
++	defer s.Close(true)
++	if _, err := s.WaitForLeader(10 * time.Second); err != nil {
++		t.Fatalf("Error waiting for leader: %s", err)
++	}
++
++	er := executeRequestFromString(
++		`CREATE TABLE users (id INTEGER NOT NULL PRIMARY KEY, ssn TEXT, name TEXT)`, false, false)
++	if _, _, err := s.Execute(context.Background(), er); err != nil {
++		t.Fatalf("failed to create table: %s", err.Error())
++	}
++
++	if err := s.EnableCDC(cdcChannel, nil, false, map[string][]string{"users": {"ssn"}}); err != nil {
++		t.Fatalf("failed to enable CDC: %v", err)
++	}
++
++	er = executeRequestFromString(
++		`INSERT INTO users(id, ssn, name) VALUES(1, "111-22-3333", "alice")`, false, false)
++	if _, _, err := s.Execute(context.Background(), er); err != nil {
++		t.Fatalf("failed to execute INSERT: %s", err.Error())
++	}
++	ev := drainCDCEvent(t, cdcChannel)
++	if !slices.Equal(ev.ColumnNames, []string{"id", "name"}) {
++		t.Fatalf("expected column names [id name] before schema change, got %v", ev.ColumnNames)
++	}
++
++	// This populated the streamer's column-name cache for "users" as a
++	// 3-column table. Now change the schema underneath it.
++	er = executeRequestFromString(`ALTER TABLE users ADD COLUMN email TEXT`, false, false)
++	if _, _, err := s.Execute(context.Background(), er); err != nil {
++		t.Fatalf("failed to add column: %s", err.Error())
++	}
++
++	er = executeRequestFromString(
++		`INSERT INTO users(id, ssn, name, email) VALUES(2, "444-55-6666", "bob", "bob@example.com")`,
++		false, false)
++	if _, _, err := s.Execute(context.Background(), er); err != nil {
++		t.Fatalf("failed to execute second INSERT: %s", err.Error())
++	}
++	ev = drainCDCEvent(t, cdcChannel)
++	if !slices.Equal(ev.ColumnNames, []string{"id", "name", "email"}) {
++		t.Fatalf("expected column names [id name email] after ADD COLUMN, got %v", ev.ColumnNames)
++	}
++	if len(ev.NewRow.Values) != 3 {
++		t.Fatalf("expected 3 row values, got %d", len(ev.NewRow.Values))
++	}
++	if ev.NewRow.Values[2].GetS() != "bob@example.com" {
++		t.Fatalf("expected third value to be the new email column, got %v", ev.NewRow.Values[2])
++	}
++}
++
++// Test_CDCColFilter_Store_SchemaEvolution_SameTransaction confirms that an
++// ALTER TABLE ADD COLUMN and a row change to the same filtered table, in one
++// explicit transaction, produce an event reflecting the transaction's final
++// schema regardless of statement order, never the excluded column under a
++// stale or wrong name.
++func Test_CDCColFilter_Store_SchemaEvolution_SameTransaction(t *testing.T) {
++	s, ln := mustNewStore(t)
++	defer ln.Close()
++
++	cdcChannel := make(chan *proto.CDCIndexedEventGroup, 100)
++
++	if err := s.Open(); err != nil {
++		t.Fatalf("failed to open single-node store: %s", err.Error())
++	}
++	if err := s.Bootstrap(NewServer(s.ID(), s.Addr(), true)); err != nil {
++		t.Fatalf("failed to bootstrap single-node store: %s", err.Error())
++	}
++	defer s.Close(true)
++	if _, err := s.WaitForLeader(10 * time.Second); err != nil {
++		t.Fatalf("Error waiting for leader: %s", err)
++	}
++
++	er := executeRequestFromString(
++		`CREATE TABLE users (id INTEGER NOT NULL PRIMARY KEY, ssn TEXT, name TEXT)`, false, false)
++	if _, _, err := s.Execute(context.Background(), er); err != nil {
++		t.Fatalf("failed to create table: %s", err.Error())
++	}
++
++	if err := s.EnableCDC(cdcChannel, nil, false, map[string][]string{"users": {"ssn"}}); err != nil {
++		t.Fatalf("failed to enable CDC: %v", err)
++	}
++
++	// DDL before the row change: the INSERT's own preupdate hook already
++	// sees the post-ALTER, 4-column schema, so this exercises schema
++	// resolution against an uncommitted transaction more than row-value
++	// reconciliation.
++	er = executeRequestFromStrings([]string{
++		`ALTER TABLE users ADD COLUMN email TEXT`,
++		`INSERT INTO users(id, ssn, name, email) VALUES(3, "777-88-9999", "carol", "carol@example.com")`,
++	}, false, true)
++	if _, _, err := s.Execute(context.Background(), er); err != nil {
++		t.Fatalf("failed to execute same-transaction ALTER-then-INSERT: %s", err.Error())
++	}
++
++	ev := drainCDCEvent(t, cdcChannel)
++	if ev.Error != "" {
++		t.Fatalf("unexpected event error: %s", ev.Error)
++	}
++	if !slices.Equal(ev.ColumnNames, []string{"id", "name", "email"}) {
++		t.Fatalf("expected column names [id name email], got %v", ev.ColumnNames)
++	}
++	if len(ev.NewRow.Values) != 3 {
++		t.Fatalf("expected 3 row values, got %d", len(ev.NewRow.Values))
++	}
++	if ev.NewRow.Values[0].GetI() != 3 {
++		t.Fatalf("expected first value to be id 3, got %v", ev.NewRow.Values[0])
++	}
++	if ev.NewRow.Values[1].GetS() != "carol" {
++		t.Fatalf("expected second value to be name 'carol', got %v", ev.NewRow.Values[1])
++	}
++	if ev.NewRow.Values[2].GetS() != "carol@example.com" {
++		t.Fatalf("expected third value to be the new email column, got %v", ev.NewRow.Values[2])
++	}
++	for _, v := range ev.NewRow.Values {
++		if v.GetS() == "777-88-9999" {
++			t.Fatalf("excluded ssn value leaked into the event: %v", ev.NewRow.Values)
++		}
++	}
++
++	// Row change before the DDL, in a second, separate same-transaction
++	// request: the INSERT's own preupdate hook captures a 4-column row
++	// under the schema as it stands at that instant, but the ALTER that
++	// follows, still within this same transaction, appends a 5th column
++	// -- exercising row-value reconciliation itself, not just schema
++	// resolution.
++	er = executeRequestFromStrings([]string{
++		`INSERT INTO users(id, ssn, name, email) VALUES(4, "222-33-4444", "dave", "dave@example.com")`,
++		`ALTER TABLE users ADD COLUMN phone TEXT`,
++	}, false, true)
++	if _, _, err := s.Execute(context.Background(), er); err != nil {
++		t.Fatalf("failed to execute same-transaction INSERT-then-ALTER: %s", err.Error())
++	}
++
++	ev = drainCDCEvent(t, cdcChannel)
++	if ev.Error != "" {
++		t.Fatalf("unexpected event error: %s", ev.Error)
++	}
++	if !slices.Equal(ev.ColumnNames, []string{"id", "name", "email", "phone"}) {
++		t.Fatalf("expected column names [id name email phone], got %v", ev.ColumnNames)
++	}
++	if len(ev.NewRow.Values) != 4 {
++		t.Fatalf("expected 4 row values, got %d", len(ev.NewRow.Values))
++	}
++	if ev.NewRow.Values[0].GetI() != 4 {
++		t.Fatalf("expected first value to be id 4, got %v", ev.NewRow.Values[0])
++	}
++	if ev.NewRow.Values[1].GetS() != "dave" {
++		t.Fatalf("expected second value to be name 'dave', got %v", ev.NewRow.Values[1])
++	}
++	if ev.NewRow.Values[2].GetS() != "dave@example.com" {
++		t.Fatalf("expected third value to be email, got %v", ev.NewRow.Values[2])
++	}
++	// phone was added after this row's own INSERT ran; its value isn't
++	// knowable through any supported read, so it must come through as
++	// NULL rather than any guessed or leaked value.
++	if ev.NewRow.Values[3].Value != nil {
++		t.Fatalf("expected phone placeholder to be NULL, got %v", ev.NewRow.Values[3])
++	}
++	for _, v := range ev.NewRow.Values {
++		if v.GetS() == "222-33-4444" {
++			t.Fatalf("excluded ssn value leaked into the event: %v", ev.NewRow.Values)
++		}
++	}
++}
++
++// Test_CDCColFilter_Store_SchemaEvolution_DropColumn confirms that dropping
++// a column from a filtered table is picked up: row values delivered
++// afterward line up with the table's new, smaller column layout, not a
++// stale, wider one.
++func Test_CDCColFilter_Store_SchemaEvolution_DropColumn(t *testing.T) {
++	s, ln := mustNewStore(t)
++	defer ln.Close()
++
++	cdcChannel := make(chan *proto.CDCIndexedEventGroup, 100)
++
++	if err := s.Open(); err != nil {
++		t.Fatalf("failed to open single-node store: %s", err.Error())
++	}
++	if err := s.Bootstrap(NewServer(s.ID(), s.Addr(), true)); err != nil {
++		t.Fatalf("failed to bootstrap single-node store: %s", err.Error())
++	}
++	defer s.Close(true)
++	if _, err := s.WaitForLeader(10 * time.Second); err != nil {
++		t.Fatalf("Error waiting for leader: %s", err)
++	}
++
++	er := executeRequestFromString(
++		`CREATE TABLE users (id INTEGER NOT NULL PRIMARY KEY, ssn TEXT, name TEXT, temp_note TEXT)`,
++		false, false)
++	if _, _, err := s.Execute(context.Background(), er); err != nil {
++		t.Fatalf("failed to create table: %s", err.Error())
++	}
++
++	if err := s.EnableCDC(cdcChannel, nil, false, map[string][]string{"users": {"ssn"}}); err != nil {
++		t.Fatalf("failed to enable CDC: %v", err)
++	}
++
++	er = executeRequestFromString(
++		`INSERT INTO users(id, ssn, name, temp_note) VALUES(1, "111-22-3333", "alice", "scratch")`,
++		false, false)
++	if _, _, err := s.Execute(context.Background(), er); err != nil {
++		t.Fatalf("failed to execute INSERT: %s", err.Error())
++	}
++	ev := drainCDCEvent(t, cdcChannel)
++	if !slices.Equal(ev.ColumnNames, []string{"id", "name", "temp_note"}) {
++		t.Fatalf("expected column names [id name temp_note] before schema change, got %v", ev.ColumnNames)
++	}
++
++	er = executeRequestFromString(`ALTER TABLE users DROP COLUMN temp_note`, false, false)
++	if _, _, err := s.Execute(context.Background(), er); err != nil {
++		t.Fatalf("failed to drop column: %s", err.Error())
++	}
++
++	er = executeRequestFromString(
++		`INSERT INTO users(id, ssn, name) VALUES(2, "444-55-6666", "bob")`, false, false)
++	if _, _, err := s.Execute(context.Background(), er); err != nil {
++		t.Fatalf("failed to execute second INSERT: %s", err.Error())
++	}
++	ev = drainCDCEvent(t, cdcChannel)
++	if !slices.Equal(ev.ColumnNames, []string{"id", "name"}) {
++		t.Fatalf("expected column names [id name] after DROP COLUMN, got %v", ev.ColumnNames)
++	}
++	if len(ev.NewRow.Values) != 2 {
++		t.Fatalf("expected 2 row values, got %d", len(ev.NewRow.Values))
++	}
++	if ev.NewRow.Values[0].GetI() != 2 {
++		t.Fatalf("expected first value to be id 2, got %v", ev.NewRow.Values[0])
++	}
++	if ev.NewRow.Values[1].GetS() != "bob" {
++		t.Fatalf("expected second value to be name 'bob', got %v -- a stale cache would misalign "+
++			"row values against the table's old, wider column layout", ev.NewRow.Values[1])
++	}
++}
++
++// Test_CDCColFilter_Store_SchemaEvolution_RenameColumn confirms that
++// renaming a filtered column is picked up: once "ssn" is renamed to
++// "tax_id" the filter, which matches by name, must stop excluding it.
++func Test_CDCColFilter_Store_SchemaEvolution_RenameColumn(t *testing.T) {
++	s, ln := mustNewStore(t)
++	defer ln.Close()
++
++	cdcChannel := make(chan *proto.CDCIndexedEventGroup, 100)
++
++	if err := s.Open(); err != nil {
++		t.Fatalf("failed to open single-node store: %s", err.Error())
++	}
++	if err := s.Bootstrap(NewServer(s.ID(), s.Addr(), true)); err != nil {
++		t.Fatalf("failed to bootstrap single-node store: %s", err.Error())
++	}
++	defer s.Close(true)
++	if _, err := s.WaitForLeader(10 * time.Second); err != nil {
++		t.Fatalf("Error waiting for leader: %s", err)
++	}
++
++	er := executeRequestFromString(
++		`CREATE TABLE users (id INTEGER NOT NULL PRIMARY KEY, ssn TEXT, name TEXT)`, false, false)
++	if _, _, err := s.Execute(context.Background(), er); err != nil {
++		t.Fatalf("failed to create table: %s", err.Error())
++	}
++
++	if err := s.EnableCDC(cdcChannel, nil, false, map[string][]string{"users": {"ssn"}}); err != nil {
++		t.Fatalf("failed to enable CDC: %v", err)
++	}
++
++	er = executeRequestFromString(
++		`INSERT INTO users(id, ssn, name) VALUES(1, "111-22-3333", "alice")`, false, false)
++	if _, _, err := s.Execute(context.Background(), er); err != nil {
++		t.Fatalf("failed to execute INSERT: %s", err.Error())
++	}
++	ev := drainCDCEvent(t, cdcChannel)
++	if !slices.Equal(ev.ColumnNames, []string{"id", "name"}) {
++		t.Fatalf("expected column names [id name] before rename, got %v", ev.ColumnNames)
++	}
++
++	er = executeRequestFromString(`ALTER TABLE users RENAME COLUMN ssn TO tax_id`, false, false)
++	if _, _, err := s.Execute(context.Background(), er); err != nil {
++		t.Fatalf("failed to rename column: %s", err.Error())
++	}
++
++	er = executeRequestFromString(
++		`INSERT INTO users(id, tax_id, name) VALUES(2, "444-55-6666", "bob")`, false, false)
++	if _, _, err := s.Execute(context.Background(), er); err != nil {
++		t.Fatalf("failed to execute second INSERT: %s", err.Error())
++	}
++	ev = drainCDCEvent(t, cdcChannel)
++	if !slices.Equal(ev.ColumnNames, []string{"id", "tax_id", "name"}) {
++		t.Fatalf("expected column names [id tax_id name] after RENAME COLUMN (the filter no longer "+
++			"matches, since the column is not named \"ssn\" any more), got %v", ev.ColumnNames)
++	}
++	if len(ev.NewRow.Values) != 3 {
++		t.Fatalf("expected 3 row values, got %d", len(ev.NewRow.Values))
++	}
++	if ev.NewRow.Values[1].GetS() != "444-55-6666" {
++		t.Fatalf("expected second value to be the renamed tax_id column, got %v", ev.NewRow.Values[1])
++	}
++}
++
++// Test_CDCColFilter_Store_RestoreInvalidatesCache confirms that restoring a
++// different database file over a running Store -- via Load -- clears any
++// column-name/filter information the CDC streamer had cached from the
++// pre-restore database, so events after the restore reflect the restored
++// database's actual schema.
++func Test_CDCColFilter_Store_RestoreInvalidatesCache(t *testing.T) {
++	s, ln := mustNewStore(t)
++	defer ln.Close()
++
++	cdcChannel := make(chan *proto.CDCIndexedEventGroup, 100)
++
++	if err := s.Open(); err != nil {
++		t.Fatalf("failed to open single-node store: %s", err.Error())
++	}
++	if err := s.Bootstrap(NewServer(s.ID(), s.Addr(), true)); err != nil {
++		t.Fatalf("failed to bootstrap single-node store: %s", err.Error())
++	}
++	defer s.Close(true)
++	if _, err := s.WaitForLeader(10 * time.Second); err != nil {
++		t.Fatalf("Error waiting for leader: %s", err)
++	}
++
++	er := executeRequestFromString(
++		`CREATE TABLE users (id INTEGER NOT NULL PRIMARY KEY, ssn TEXT, name TEXT)`, false, false)
++	if _, _, err := s.Execute(context.Background(), er); err != nil {
++		t.Fatalf("failed to create table: %s", err.Error())
++	}
++
++	if err := s.EnableCDC(cdcChannel, nil, false, map[string][]string{"users": {"ssn"}}); err != nil {
++		t.Fatalf("failed to enable CDC: %v", err)
++	}
++
++	er = executeRequestFromString(
++		`INSERT INTO users(id, ssn, name) VALUES(1, "111-22-3333", "alice")`, false, false)
++	if _, _, err := s.Execute(context.Background(), er); err != nil {
++		t.Fatalf("failed to execute INSERT: %s", err.Error())
++	}
++	ev := drainCDCEvent(t, cdcChannel)
++	if !slices.Equal(ev.ColumnNames, []string{"id", "name"}) {
++		t.Fatalf("expected column names [id name] before restore, got %v", ev.ColumnNames)
++	}
++
++	// Build, in a throwaway second store, a database whose "users" table has
++	// a different column layout, then restore it into s via Load. A restored
++	// file's own schema-version counter starts fresh, so it could
++	// coincidentally match the one s's CDC streamer cached above -- Load must
++	// invalidate the cache regardless of that counter.
++	src, srcLn := mustNewStore(t)
++	defer srcLn.Close()
++	if err := src.Open(); err != nil {
++		t.Fatalf("failed to open source store: %s", err.Error())
++	}
++	if err := src.Bootstrap(NewServer(src.ID(), src.Addr(), true)); err != nil {
++		t.Fatalf("failed to bootstrap source store: %s", err.Error())
++	}
++	defer src.Close(true)
++	if _, err := src.WaitForLeader(10 * time.Second); err != nil {
++		t.Fatalf("Error waiting for leader on source store: %s", err)
++	}
++	srcEr := executeRequestFromString(
++		`CREATE TABLE users (id INTEGER NOT NULL PRIMARY KEY, ssn TEXT, name TEXT, dept TEXT)`,
++		false, false)
++	if _, _, err := src.Execute(context.Background(), srcEr); err != nil {
++		t.Fatalf("failed to create table on source store: %s", err.Error())
++	}
++	dbBytes, err := src.Database(false)
++	if err != nil {
++		t.Fatalf("failed to serialize source database: %s", err.Error())
++	}
++
++	if err := s.Load(context.Background(), &proto.LoadRequest{Data: dbBytes}); err != nil {
++		t.Fatalf("failed to load restored database: %s", err.Error())
++	}
++
++	er = executeRequestFromString(
++		`INSERT INTO users(id, ssn, name, dept) VALUES(2, "444-55-6666", "bob", "eng")`, false, false)
++	if _, _, err := s.Execute(context.Background(), er); err != nil {
++		t.Fatalf("failed to execute post-restore INSERT: %s", err.Error())
++	}
++	ev = drainCDCEvent(t, cdcChannel)
++	if !slices.Equal(ev.ColumnNames, []string{"id", "name", "dept"}) {
++		t.Fatalf("expected column names [id name dept] after restore, got %v -- a stale cache would "+
++			"still report the pre-restore 3-column [id name] layout", ev.ColumnNames)
++	}
++	if len(ev.NewRow.Values) != 3 {
++		t.Fatalf("expected 3 row values, got %d", len(ev.NewRow.Values))
++	}
++	if ev.NewRow.Values[2].GetS() != "eng" {
++		t.Fatalf("expected third value to be the new dept column, got %v", ev.NewRow.Values[2])
++	}
++}
++
++// Test_CDCColFilter_Store_LeadershipTransitionInvalidatesCache confirms that
++// after a node becomes the Raft leader, filtered CDC events it produces
++// reflect the table's current schema rather than anything it may have cached
++// while it was a follower.
++func Test_CDCColFilter_Store_LeadershipTransitionInvalidatesCache(t *testing.T) {
++	s0, ln0 := mustNewStore(t)
++	defer ln0.Close()
++	if err := s0.Open(); err != nil {
++		t.Fatalf("failed to open s0: %s", err.Error())
++	}
++	defer s0.Close(true)
++
++	s1, ln1 := mustNewStore(t)
++	defer ln1.Close()
++	if err := s1.Open(); err != nil {
++		t.Fatalf("failed to open s1: %s", err.Error())
++	}
++	defer s1.Close(true)
++
++	if err := s0.Bootstrap(NewServer(s0.ID(), s0.Addr(), true)); err != nil {
++		t.Fatalf("failed to bootstrap s0: %s", err.Error())
++	}
++	if _, err := s0.WaitForLeader(10 * time.Second); err != nil {
++		t.Fatalf("Error waiting for leader: %s", err)
++	}
++	if err := s0.Join(joinRequest(s1.ID(), s1.Addr(), true)); err != nil {
++		t.Fatalf("failed to join s1 to the cluster: %s", err.Error())
++	}
++	if _, err := s1.WaitForLeader(10 * time.Second); err != nil {
++		t.Fatalf("Error waiting for leader on s1: %s", err)
++	}
++
++	er := executeRequestFromString(
++		`CREATE TABLE users (id INTEGER NOT NULL PRIMARY KEY, ssn TEXT, name TEXT)`, false, false)
++	if _, _, err := s0.Execute(context.Background(), er); err != nil {
++		t.Fatalf("failed to create table: %s", err.Error())
++	}
++
++	// Enable CDC identically on both nodes, as a real deployment streaming
++	// from whichever node is leader would. Both apply every Raft log entry
++	// (that's how the FSM works), so s1's streamer caches "users" columns
++	// too, despite never being leader yet.
++	s0Channel := make(chan *proto.CDCIndexedEventGroup, 100)
++	s1Channel := make(chan *proto.CDCIndexedEventGroup, 100)
++	if err := s0.EnableCDC(s0Channel, nil, false, map[string][]string{"users": {"ssn"}}); err != nil {
++		t.Fatalf("failed to enable CDC on s0: %v", err)
++	}
++	if err := s1.EnableCDC(s1Channel, nil, false, map[string][]string{"users": {"ssn"}}); err != nil {
++		t.Fatalf("failed to enable CDC on s1: %v", err)
++	}
++
++	er = executeRequestFromString(
++		`INSERT INTO users(id, ssn, name) VALUES(1, "111-22-3333", "alice")`, false, false)
++	if _, _, err := s0.Execute(context.Background(), er); err != nil {
++		t.Fatalf("failed to execute INSERT: %s", err.Error())
++	}
++	drainCDCEvent(t, s0Channel) // s0 is leader and actually streams
++	drainCDCEvent(t, s1Channel) // s1 also applies the log entry and caches columns as a follower
++
++	// Change the schema while s0 is still leader.
++	er = executeRequestFromString(`ALTER TABLE users ADD COLUMN email TEXT`, false, false)
++	if _, _, err := s0.Execute(context.Background(), er); err != nil {
++		t.Fatalf("failed to add column: %s", err.Error())
++	}
++	er = executeRequestFromString(
++		`INSERT INTO users(id, ssn, name, email) VALUES(2, "222", "bob", "bob@example.com")`,
++		false, false)
++	if _, _, err := s0.Execute(context.Background(), er); err != nil {
++		t.Fatalf("failed to execute INSERT after ALTER TABLE: %s", err.Error())
++	}
++	drainCDCEvent(t, s0Channel)
++	drainCDCEvent(t, s1Channel) // s1's own SchemaVersion check keeps it correct too, as a control
++
++	// Now make s1 the leader.
++	if err := s0.Stepdown(true, s1.ID()); err != nil {
++		t.Fatalf("leader failed to step down to s1: %s", err.Error())
++	}
++	if _, err := s0.WaitForLeader(10 * time.Second); err != nil {
++		t.Fatalf("Error waiting for new leader: %s", err)
++	}
++	leader, err := s1.Leader()
++	if err != nil || leader.ID != s1.ID() {
++		t.Fatalf("expected s1 to become leader, got %v (err: %v)", leader, err)
++	}
++
++	er = executeRequestFromString(
++		`INSERT INTO users(id, ssn, name, email) VALUES(3, "333", "carol", "carol@example.com")`,
++		false, false)
++	if _, _, err := s1.Execute(context.Background(), er); err != nil {
++		t.Fatalf("failed to execute INSERT on new leader: %s", err.Error())
++	}
++	ev := drainCDCEvent(t, s1Channel)
++	if !slices.Equal(ev.ColumnNames, []string{"id", "name", "email"}) {
++		t.Fatalf("expected column names [id name email] from new leader, got %v", ev.ColumnNames)
++	}
++	if len(ev.NewRow.Values) != 3 {
++		t.Fatalf("expected 3 row values, got %d", len(ev.NewRow.Values))
++	}
++	if ev.NewRow.Values[2].GetS() != "carol@example.com" {
++		t.Fatalf("expected third value to be the email column, got %v", ev.NewRow.Values[2])
++	}
++}
++
++// Test_CDCColFilter_Store_RowIDsOnlyComposition confirms that a column_filter
++// composes with the existing row-IDs-only setting: with rowIDsOnly set, no row
++// data of any kind is ever captured, so there is nothing for the column filter
++// to exclude and it must not error, panic, or otherwise interfere with the
++// row-ID-only event still being delivered normally.
++func Test_CDCColFilter_Store_RowIDsOnlyComposition(t *testing.T) {
++	s, ln := mustNewStore(t)
++	defer ln.Close()
++
++	cdcChannel := make(chan *proto.CDCIndexedEventGroup, 100)
++
++	if err := s.Open(); err != nil {
++		t.Fatalf("failed to open single-node store: %s", err.Error())
++	}
++	if err := s.Bootstrap(NewServer(s.ID(), s.Addr(), true)); err != nil {
++		t.Fatalf("failed to bootstrap single-node store: %s", err.Error())
++	}
++	defer s.Close(true)
++	if _, err := s.WaitForLeader(10 * time.Second); err != nil {
++		t.Fatalf("Error waiting for leader: %s", err)
++	}
++
++	er := executeRequestFromString(
++		`CREATE TABLE users (id INTEGER NOT NULL PRIMARY KEY, ssn TEXT, name TEXT)`, false, false)
++	if _, _, err := s.Execute(context.Background(), er); err != nil {
++		t.Fatalf("failed to create table: %s", err.Error())
++	}
++
++	if err := s.EnableCDC(cdcChannel, nil, true, map[string][]string{"users": {"ssn"}}); err != nil {
++		t.Fatalf("failed to enable CDC: %v", err)
++	}
++
++	er = executeRequestFromString(
++		`INSERT INTO users(id, ssn, name) VALUES(1, "111-22-3333", "alice")`, false, false)
++	if _, _, err := s.Execute(context.Background(), er); err != nil {
++		t.Fatalf("failed to execute INSERT: %s", err.Error())
++	}
++
++	ev := drainCDCEvent(t, cdcChannel)
++	if ev.Error != "" {
++		t.Fatalf("unexpected event error: %s", ev.Error)
++	}
++	if ev.NewRowId != 1 {
++		t.Fatalf("expected NewRowId 1, got %d", ev.NewRowId)
++	}
++	if ev.NewRow != nil {
++		t.Fatalf("expected no row data in row-IDs-only mode, got %v", ev.NewRow)
++	}
++	if ev.OldRow != nil {
++		t.Fatalf("expected no old-row data in row-IDs-only mode, got %v", ev.OldRow)
++	}
++}
++
++// Test_CDCColFilter_Store_TableFilterComposition confirms that a column_filter
++// composes with the existing table filter: a table excluded by the table
++// filter must produce no CDC events at all, regardless of a column_filter
++// entry naming it, while a table the table filter admits still has its
++// column_filter applied as usual.
++func Test_CDCColFilter_Store_TableFilterComposition(t *testing.T) {
++	s, ln := mustNewStore(t)
++	defer ln.Close()
++
++	cdcChannel := make(chan *proto.CDCIndexedEventGroup, 100)
++
++	if err := s.Open(); err != nil {
++		t.Fatalf("failed to open single-node store: %s", err.Error())
++	}
++	if err := s.Bootstrap(NewServer(s.ID(), s.Addr(), true)); err != nil {
++		t.Fatalf("failed to bootstrap single-node store: %s", err.Error())
++	}
++	defer s.Close(true)
++	if _, err := s.WaitForLeader(10 * time.Second); err != nil {
++		t.Fatalf("Error waiting for leader: %s", err)
++	}
++
++	er := executeRequestFromStrings([]string{
++		`CREATE TABLE users (id INTEGER NOT NULL PRIMARY KEY, ssn TEXT, name TEXT)`,
++		`CREATE TABLE logins (id INTEGER NOT NULL PRIMARY KEY, ssn TEXT, ip TEXT)`,
++	}, false, false)
++	if _, _, err := s.Execute(context.Background(), er); err != nil {
++		t.Fatalf("failed to create tables: %s", err.Error())
++	}
++
++	// The table filter admits only "users"; "logins" also carries a
++	// column_filter entry, but must never produce an event at all.
++	tableRe := regexp.MustCompile(`^users$`)
++	columnFilter := map[string][]string{"users": {"ssn"}, "logins": {"ssn"}}
++	if err := s.EnableCDC(cdcChannel, tableRe, false, columnFilter); err != nil {
++		t.Fatalf("failed to enable CDC: %v", err)
++	}
++
++	er = executeRequestFromStrings([]string{
++		`INSERT INTO logins(id, ssn, ip) VALUES(1, "999-00-1111", "10.0.0.1")`,
++		`INSERT INTO users(id, ssn, name) VALUES(1, "111-22-3333", "alice")`,
++	}, false, false)
++	if _, _, err := s.Execute(context.Background(), er); err != nil {
++		t.Fatalf("failed to execute inserts: %s", err.Error())
++	}
++
++	// Only the "users" INSERT should surface: the "logins" one is excluded
++	// by the table filter before the column filter ever sees it.
++	ev := drainCDCEvent(t, cdcChannel)
++	if ev.Table != "users" {
++		t.Fatalf("expected event for table \"users\" only (\"logins\" is outside the table filter), got table %q", ev.Table)
++	}
++	if !slices.Equal(ev.ColumnNames, []string{"id", "name"}) {
++		t.Fatalf("expected column names [id name], got %v", ev.ColumnNames)
++	}
++	if len(ev.NewRow.Values) != 2 {
++		t.Fatalf("expected 2 row values, got %d", len(ev.NewRow.Values))
++	}
++	if ev.NewRow.Values[1].GetS() != "alice" {
++		t.Fatalf("expected second value to be name 'alice', got %v", ev.NewRow.Values[1])
++	}
++	for _, v := range ev.NewRow.Values {
++		if v.GetS() == "111-22-3333" {
++			t.Fatalf("excluded ssn value leaked into the event: %v", ev.NewRow.Values)
++		}
++	}
++}
++
++// Test_CDCColFilter_Store_ExcludesMultipleColumns confirms that every column
++// named for a table in the runtime column_filter, not just the first, is
++// excluded from a real, end-to-end delivered event -- an implementation that
++// only consulted the first configured column name per table would still pass
++// every single-column runtime test in this file.
++func Test_CDCColFilter_Store_ExcludesMultipleColumns(t *testing.T) {
++	s, ln := mustNewStore(t)
++	defer ln.Close()
++
++	cdcChannel := make(chan *proto.CDCIndexedEventGroup, 100)
++
++	if err := s.Open(); err != nil {
++		t.Fatalf("failed to open single-node store: %s", err.Error())
++	}
++	if err := s.Bootstrap(NewServer(s.ID(), s.Addr(), true)); err != nil {
++		t.Fatalf("failed to bootstrap single-node store: %s", err.Error())
++	}
++	defer s.Close(true)
++	if _, err := s.WaitForLeader(10 * time.Second); err != nil {
++		t.Fatalf("Error waiting for leader: %s", err)
++	}
++
++	er := executeRequestFromString(
++		`CREATE TABLE users (id INTEGER NOT NULL PRIMARY KEY, ssn TEXT, name TEXT, salary INTEGER)`,
++		false, false)
++	if _, _, err := s.Execute(context.Background(), er); err != nil {
++		t.Fatalf("failed to create table: %s", err.Error())
++	}
++
++	if err := s.EnableCDC(cdcChannel, nil, false, map[string][]string{"users": {"ssn", "salary"}}); err != nil {
++		t.Fatalf("failed to enable CDC: %v", err)
++	}
++
++	er = executeRequestFromString(
++		`INSERT INTO users(id, ssn, name, salary) VALUES(1, "111-22-3333", "alice", 90000)`, false, false)
++	if _, _, err := s.Execute(context.Background(), er); err != nil {
++		t.Fatalf("failed to execute INSERT: %s", err.Error())
++	}
++
++	ev := drainCDCEvent(t, cdcChannel)
++	if !slices.Equal(ev.ColumnNames, []string{"id", "name"}) {
++		t.Fatalf("expected both excluded columns dropped, got column names %v", ev.ColumnNames)
++	}
++	if len(ev.NewRow.Values) != 2 {
++		t.Fatalf("expected 2 row values, got %d", len(ev.NewRow.Values))
++	}
++	if ev.NewRow.Values[1].GetS() != "alice" {
++		t.Fatalf("expected second value to be name 'alice', got %v", ev.NewRow.Values[1])
++	}
++	for _, v := range ev.NewRow.Values {
++		if v.GetS() == "111-22-3333" || v.GetI() == 90000 {
++			t.Fatalf("an excluded value leaked into the event: %v", ev.NewRow.Values)
++		}
++	}
++}
++
++func Test_CDCColFilter_Store_UnfilteredTable_SameTransactionFinalSchema(t *testing.T) {
++	s, ln := mustNewStore(t)
++	defer ln.Close()
++
++	cdcChannel := make(chan *proto.CDCIndexedEventGroup, 100)
++
++	if err := s.Open(); err != nil {
++		t.Fatalf("failed to open single-node store: %s", err.Error())
++	}
++	if err := s.Bootstrap(NewServer(s.ID(), s.Addr(), true)); err != nil {
++		t.Fatalf("failed to bootstrap single-node store: %s", err.Error())
++	}
++	defer s.Close(true)
++	if _, err := s.WaitForLeader(10 * time.Second); err != nil {
++		t.Fatalf("Error waiting for leader: %s", err)
++	}
++
++	er := executeRequestFromString(
++		`CREATE TABLE orders (id INTEGER NOT NULL PRIMARY KEY, name TEXT)`, false, false)
++	if _, _, err := s.Execute(context.Background(), er); err != nil {
++		t.Fatalf("failed to create table: %s", err.Error())
++	}
++
++	// The column_filter names a different table entirely; "orders" is
++	// unfiltered but still gets the same live pre-commit treatment.
++	if err := s.EnableCDC(cdcChannel, nil, false, map[string][]string{"users": {"ssn"}}); err != nil {
++		t.Fatalf("failed to enable CDC: %v", err)
++	}
++
++	er = executeRequestFromStrings([]string{
++		`INSERT INTO orders(id, name) VALUES(2, "widget")`,
++		`ALTER TABLE orders ADD COLUMN email TEXT`,
++	}, false, true)
++	if _, _, err := s.Execute(context.Background(), er); err != nil {
++		t.Fatalf("failed to execute same-transaction INSERT-then-ADD on an unfiltered table: %s", err.Error())
++	}
++
++	ev := drainCDCEvent(t, cdcChannel)
++	if ev.Error != "" {
++		t.Fatalf("unexpected event error: %s", ev.Error)
++	}
++	if !slices.Equal(ev.ColumnNames, []string{"id", "name", "email"}) {
++		t.Fatalf("expected column names [id name email], got %v", ev.ColumnNames)
++	}
++	if len(ev.NewRow.Values) != 3 {
++		t.Fatalf("expected 3 row values, got %d", len(ev.NewRow.Values))
++	}
++	if ev.NewRow.Values[1].GetS() != "widget" {
++		t.Fatalf("expected second value to be name 'widget', got %v", ev.NewRow.Values[1])
++	}
++	if ev.NewRow.Values[2].Value != nil {
++		t.Fatalf("expected email placeholder to be NULL, got %v", ev.NewRow.Values[2])
++	}
++}
++
++// Test_CDCColFilter_Store_SchemaEvolution_RenameAfterWrite covers a single
++// explicit transaction that writes a row and then renames the column it
++// wrote a value into: the value's column identity didn't change, only its
++// name, so the event must still carry that value under the new name.
++func Test_CDCColFilter_Store_SchemaEvolution_RenameAfterWrite(t *testing.T) {
++	s, ln := mustNewStore(t)
++	defer ln.Close()
++
++	cdcChannel := make(chan *proto.CDCIndexedEventGroup, 100)
++
++	if err := s.Open(); err != nil {
++		t.Fatalf("failed to open single-node store: %s", err.Error())
++	}
++	if err := s.Bootstrap(NewServer(s.ID(), s.Addr(), true)); err != nil {
++		t.Fatalf("failed to bootstrap single-node store: %s", err.Error())
++	}
++	defer s.Close(true)
++	if _, err := s.WaitForLeader(10 * time.Second); err != nil {
++		t.Fatalf("Error waiting for leader: %s", err)
++	}
++
++	er := executeRequestFromString(
++		`CREATE TABLE users (id INTEGER NOT NULL PRIMARY KEY, ssn TEXT, name TEXT)`, false, false)
++	if _, _, err := s.Execute(context.Background(), er); err != nil {
++		t.Fatalf("failed to create table: %s", err.Error())
++	}
++
++	if err := s.EnableCDC(cdcChannel, nil, false, map[string][]string{"users": {"ssn"}}); err != nil {
++		t.Fatalf("failed to enable CDC: %v", err)
++	}
++
++	// The row is written under (id, ssn, name), and within the same
++	// transaction the unfiltered "name" column is renamed to "full_name".
++	// Final columns are (id, name(=ssn, filtered out), full_name).
++	er = executeRequestFromStrings([]string{
++		`INSERT INTO users(id, ssn, name) VALUES(5, "555-66-7777", "erin")`,
++		`ALTER TABLE users RENAME COLUMN name TO full_name`,
++	}, false, true)
++	if _, _, err := s.Execute(context.Background(), er); err != nil {
++		t.Fatalf("failed to execute same-transaction INSERT-then-RENAME: %s", err.Error())
++	}
++
++	ev := drainCDCEvent(t, cdcChannel)
++	if ev.Error != "" {
++		t.Fatalf("unexpected event error: %s", ev.Error)
++	}
++	if !slices.Equal(ev.ColumnNames, []string{"id", "full_name"}) {
++		t.Fatalf("expected column names [id full_name], got %v", ev.ColumnNames)
++	}
++	if len(ev.NewRow.Values) != 2 {
++		t.Fatalf("expected 2 row values, got %d", len(ev.NewRow.Values))
++	}
++	if ev.NewRow.Values[0].GetI() != 5 {
++		t.Fatalf("expected first value to be id 5, got %v", ev.NewRow.Values[0])
++	}
++	if ev.NewRow.Values[1].GetS() != "erin" {
++		t.Fatalf("expected the renamed column to still carry the value written to it "+
++			"under its old name, got %v", ev.NewRow.Values[1])
++	}
++}
++
++// Test_CDCColFilter_Store_SchemaEvolution_RenameWithoutColumnKeyword covers
++// the same same-transaction write-then-rename identity requirement as
++// Test_CDCColFilter_Store_SchemaEvolution_RenameAfterWrite, but through
++// SQLite's other valid RENAME form: "ALTER TABLE t RENAME old TO new", with
++// no "COLUMN" keyword. SQLite accepts both forms interchangeably; an
++// implementation that recognizes a rename by tokenizing DDL text for the
++// literal "RENAME COLUMN ... TO ..." shape, rather than by comparing the
++// table's column-name list before and after the statement, treats this form
++// as an unrecognized statement and assigns the resulting column a fresh
++// identity -- silently dropping the value written to it back to NULL.
++func Test_CDCColFilter_Store_SchemaEvolution_RenameWithoutColumnKeyword(t *testing.T) {
++	s, ln := mustNewStore(t)
++	defer ln.Close()
++
++	cdcChannel := make(chan *proto.CDCIndexedEventGroup, 100)
++
++	if err := s.Open(); err != nil {
++		t.Fatalf("failed to open single-node store: %s", err.Error())
++	}
++	if err := s.Bootstrap(NewServer(s.ID(), s.Addr(), true)); err != nil {
++		t.Fatalf("failed to bootstrap single-node store: %s", err.Error())
++	}
++	defer s.Close(true)
++	if _, err := s.WaitForLeader(10 * time.Second); err != nil {
++		t.Fatalf("Error waiting for leader: %s", err)
++	}
++
++	er := executeRequestFromString(
++		`CREATE TABLE users (id INTEGER NOT NULL PRIMARY KEY, ssn TEXT, name TEXT)`, false, false)
++	if _, _, err := s.Execute(context.Background(), er); err != nil {
++		t.Fatalf("failed to create table: %s", err.Error())
++	}
++
++	if err := s.EnableCDC(cdcChannel, nil, false, map[string][]string{"users": {"ssn"}}); err != nil {
++		t.Fatalf("failed to enable CDC: %v", err)
++	}
++
++	// Same scenario as RenameAfterWrite, but the RENAME statement omits the
++	// optional "COLUMN" keyword -- a form SQLite parses identically.
++	er = executeRequestFromStrings([]string{
++		`INSERT INTO users(id, ssn, name) VALUES(5, "555-66-7777", "erin")`,
++		`ALTER TABLE users RENAME name TO full_name`,
++	}, false, true)
++	if _, _, err := s.Execute(context.Background(), er); err != nil {
++		t.Fatalf("failed to execute same-transaction INSERT-then-RENAME: %s", err.Error())
++	}
++
++	ev := drainCDCEvent(t, cdcChannel)
++	if ev.Error != "" {
++		t.Fatalf("unexpected event error: %s", ev.Error)
++	}
++	if !slices.Equal(ev.ColumnNames, []string{"id", "full_name"}) {
++		t.Fatalf("expected column names [id full_name], got %v", ev.ColumnNames)
++	}
++	if len(ev.NewRow.Values) != 2 {
++		t.Fatalf("expected 2 row values, got %d", len(ev.NewRow.Values))
++	}
++	if ev.NewRow.Values[0].GetI() != 5 {
++		t.Fatalf("expected first value to be id 5, got %v", ev.NewRow.Values[0])
++	}
++	if ev.NewRow.Values[1].GetS() != "erin" {
++		t.Fatalf("expected the renamed column to still carry the value written to it under its "+
++			"old name even when RENAME omits the COLUMN keyword, got %v", ev.NewRow.Values[1])
++	}
++}
++
++// Test_CDCColFilter_Store_SchemaEvolution_DropAndRecreateSameName covers a
++// single explicit transaction that writes a row, drops the column it wrote
++// a value into, and adds a new column reusing that same name. The new
++// column is a different column with the same name, not the one the value
++// was written to, so it must not inherit that value.
++func Test_CDCColFilter_Store_SchemaEvolution_DropAndRecreateSameName(t *testing.T) {
++	s, ln := mustNewStore(t)
++	defer ln.Close()
++
++	cdcChannel := make(chan *proto.CDCIndexedEventGroup, 100)
++
++	if err := s.Open(); err != nil {
++		t.Fatalf("failed to open single-node store: %s", err.Error())
++	}
++	if err := s.Bootstrap(NewServer(s.ID(), s.Addr(), true)); err != nil {
++		t.Fatalf("failed to bootstrap single-node store: %s", err.Error())
++	}
++	defer s.Close(true)
++	if _, err := s.WaitForLeader(10 * time.Second); err != nil {
++		t.Fatalf("Error waiting for leader: %s", err)
++	}
++
++	er := executeRequestFromString(
++		`CREATE TABLE users (id INTEGER NOT NULL PRIMARY KEY, name TEXT)`, false, false)
++	if _, _, err := s.Execute(context.Background(), er); err != nil {
++		t.Fatalf("failed to create table: %s", err.Error())
++	}
++
++	if err := s.EnableCDC(cdcChannel, nil, false, nil); err != nil {
++		t.Fatalf("failed to enable CDC: %v", err)
++	}
++
++	// The row is written with a value in "name". Within the same
++	// transaction, "name" is dropped and a new, unrelated "name" column is
++	// added -- SQLite always appends an added column at the end, so the
++	// recreated "name" is a different physical column from the one the
++	// row's value was written to, and must come back NULL, not "wendy".
++	er = executeRequestFromStrings([]string{
++		`INSERT INTO users(id, name) VALUES(6, "wendy")`,
++		`ALTER TABLE users DROP COLUMN name`,
++		`ALTER TABLE users ADD COLUMN name TEXT`,
++	}, false, true)
++	if _, _, err := s.Execute(context.Background(), er); err != nil {
++		t.Fatalf("failed to execute same-transaction INSERT-then-DROP-then-ADD: %s", err.Error())
++	}
++
++	ev := drainCDCEvent(t, cdcChannel)
++	if ev.Error != "" {
++		t.Fatalf("unexpected event error: %s", ev.Error)
++	}
++	if !slices.Equal(ev.ColumnNames, []string{"id", "name"}) {
++		t.Fatalf("expected column names [id name], got %v", ev.ColumnNames)
++	}
++	if len(ev.NewRow.Values) != 2 {
++		t.Fatalf("expected 2 row values, got %d", len(ev.NewRow.Values))
++	}
++	if ev.NewRow.Values[0].GetI() != 6 {
++		t.Fatalf("expected first value to be id 6, got %v", ev.NewRow.Values[0])
++	}
++	if ev.NewRow.Values[1].Value != nil {
++		t.Fatalf("expected the recreated column to be NULL, not the dropped column's leftover "+
++			"value, got %v", ev.NewRow.Values[1])
++	}
++}
++
++// Test_CDCColFilter_Store_FilterCacheStableAcrossCommits covers a table
++// whose columns are first observed alongside another table in one ordinary
++// commit, then alone in a later, separate commit. Column identity restarts
++// at zero every commit, so the two commits number the same table
++// differently; the cached, name-based retained-column list is safe to
++// reuse across commits, but a numeric identity taken from an earlier
++// commit's cache is not.
++func Test_CDCColFilter_Store_FilterCacheStableAcrossCommits(t *testing.T) {
++	s, ln := mustNewStore(t)
++	defer ln.Close()
++
++	cdcChannel := make(chan *proto.CDCIndexedEventGroup, 100)
++
++	if err := s.Open(); err != nil {
++		t.Fatalf("failed to open single-node store: %s", err.Error())
++	}
++	if err := s.Bootstrap(NewServer(s.ID(), s.Addr(), true)); err != nil {
++		t.Fatalf("failed to bootstrap single-node store: %s", err.Error())
++	}
++	defer s.Close(true)
++	if _, err := s.WaitForLeader(10 * time.Second); err != nil {
++		t.Fatalf("Error waiting for leader: %s", err)
++	}
++
++	// A trigger, not an explicit transaction, is what gets two tables into
++	// one ordinary commit: an explicit transaction refreshes its cache live
++	// through PreCommitRefresh, which would mask exactly the staleness this
++	// test exists to catch.
++	er := executeRequestFromStrings([]string{
++		`CREATE TABLE accounts (id INTEGER NOT NULL PRIMARY KEY, x TEXT)`,
++		`CREATE TABLE users (id INTEGER NOT NULL PRIMARY KEY, ssn TEXT, name TEXT)`,
++		`CREATE TRIGGER seed_user AFTER INSERT ON accounts BEGIN
++			INSERT INTO users(id, ssn, name) VALUES (NEW.id, 'aaa-11-0001', 'alice');
++		END`,
++	}, false, false)
++	if _, _, err := s.Execute(context.Background(), er); err != nil {
++		t.Fatalf("failed to create tables and trigger: %s", err.Error())
++	}
++
++	if err := s.EnableCDC(cdcChannel, nil, false, map[string][]string{"users": {"ssn"}}); err != nil {
++		t.Fatalf("failed to enable CDC: %v", err)
++	}
++
++	// Commit 1: an ordinary (non-explicit-transaction) single statement,
++	// cascading through the trigger into a second table. Both tables'
++	// columns are first observed here, together, so "users" ends up with
++	// identity numbers offset by "accounts" preceding it.
++	er = executeRequestFromString(`INSERT INTO accounts(id, x) VALUES(1, 'a1')`, false, false)
++	if _, _, err := s.Execute(context.Background(), er); err != nil {
++		t.Fatalf("failed to execute commit 1: %s", err.Error())
++	}
++
++	group := drainCDCGroup(t, cdcChannel, 2)
++	var usersEv1 *proto.CDCEvent
++	for _, ev := range group.Events {
++		if ev.Table == "users" {
++			usersEv1 = ev
++		}
++	}
++	if usersEv1 == nil {
++		t.Fatalf("expected a users event in commit 1's group, got %v", group.Events)
++	}
++	if usersEv1.Error != "" {
++		t.Fatalf("unexpected users event error: %s", usersEv1.Error)
++	}
++	if !slices.Equal(usersEv1.ColumnNames, []string{"id", "name"}) {
++		t.Fatalf("expected users column names [id name] with ssn excluded, got %v", usersEv1.ColumnNames)
++	}
++	if usersEv1.NewRow.Values[0].GetI() != 1 || usersEv1.NewRow.Values[1].GetS() != "alice" {
++		t.Fatalf("expected users row (1 \"alice\"), got %v", usersEv1.NewRow.Values)
++	}
++
++	// Commit 2: a separate, later, ordinary commit touching only "users" --
++	// no trigger involved, so this commit's own identity numbering starts
++	// fresh at zero for "users" alone, unlike commit 1's, where "accounts"
++	// went first. The schema has not changed, so this is exactly the
++	// situation in which s.filterCache legitimately reuses what commit 1
++	// cached for "users".
++	er = executeRequestFromString(
++		`INSERT INTO users(id, ssn, name) VALUES(2, 'bbb-22-0002', 'bob')`, false, false)
++	if _, _, err := s.Execute(context.Background(), er); err != nil {
++		t.Fatalf("failed to execute commit 2: %s", err.Error())
++	}
++
++	ev2 := drainCDCEvent(t, cdcChannel)
++	if ev2.Error != "" {
++		t.Fatalf("unexpected users event error: %s", ev2.Error)
++	}
++	if !slices.Equal(ev2.ColumnNames, []string{"id", "name"}) {
++		t.Fatalf("expected users column names [id name] with ssn excluded, got %v", ev2.ColumnNames)
++	}
++	if len(ev2.NewRow.Values) != 2 {
++		t.Fatalf("expected 2 row values, got %d", len(ev2.NewRow.Values))
++	}
++	if ev2.NewRow.Values[0].GetI() != 2 {
++		t.Fatalf("expected the id field to be 2, got %v", ev2.NewRow.Values[0])
++	}
++	if ev2.NewRow.Values[1].GetS() != "bob" {
++		t.Fatalf("expected the name field to be \"bob\", got %v -- a stale cross-commit "+
++			"identity would misroute or drop it", ev2.NewRow.Values[1])
++	}
++	for _, v := range ev2.NewRow.Values {
++		if v.GetS() == "bbb-22-0002" {
++			t.Fatalf("excluded ssn value leaked into a users event: %v", ev2.NewRow.Values)
++		}
++	}
++}
++
++// Test_CDCColFilter_Store_SchemaEvolution_CommentPrefixedDDL confirms that
++// schema-change detection triggers on the database's actual schema, not on
++// the leading keyword of the SQL text. A DDL statement prefixed by a valid
++// SQL line comment still bumps sqlite3's schema-version counter, and the
++// event below must include the new column.
++func Test_CDCColFilter_Store_SchemaEvolution_CommentPrefixedDDL(t *testing.T) {
++	s, ln := mustNewStore(t)
++	defer ln.Close()
++
++	cdcChannel := make(chan *proto.CDCIndexedEventGroup, 100)
++
++	if err := s.Open(); err != nil {
++		t.Fatalf("failed to open single-node store: %s", err.Error())
++	}
++	if err := s.Bootstrap(NewServer(s.ID(), s.Addr(), true)); err != nil {
++		t.Fatalf("failed to bootstrap single-node store: %s", err.Error())
++	}
++	defer s.Close(true)
++	if _, err := s.WaitForLeader(10 * time.Second); err != nil {
++		t.Fatalf("Error waiting for leader: %s", err)
++	}
++
++	er := executeRequestFromString(
++		`CREATE TABLE users (id INTEGER NOT NULL PRIMARY KEY, name TEXT)`, false, false)
++	if _, _, err := s.Execute(context.Background(), er); err != nil {
++		t.Fatalf("failed to create table: %s", err.Error())
++	}
++
++	if err := s.EnableCDC(cdcChannel, nil, false, nil); err != nil {
++		t.Fatalf("failed to enable CDC: %v", err)
++	}
++
++	er = executeRequestFromString(
++		`INSERT INTO users(id, name) VALUES(1, "alice")`, false, false)
++	if _, _, err := s.Execute(context.Background(), er); err != nil {
++		t.Fatalf("failed to execute INSERT: %s", err.Error())
++	}
++	ev := drainCDCEvent(t, cdcChannel)
++	if !slices.Equal(ev.ColumnNames, []string{"id", "name"}) {
++		t.Fatalf("expected column names [id name] before schema change, got %v", ev.ColumnNames)
++	}
++
++	// This ALTER TABLE is preceded by a valid SQL line comment before the
++	// statement keyword. SQLite parses straight through it; the schema
++	// changes exactly as if the comment were absent.
++	er = executeRequestFromString(
++		"-- add an audit column\nALTER TABLE users ADD COLUMN email TEXT", false, false)
++	if _, _, err := s.Execute(context.Background(), er); err != nil {
++		t.Fatalf("failed to add column via comment-prefixed DDL: %s", err.Error())
++	}
++
++	er = executeRequestFromString(
++		`INSERT INTO users(id, name, email) VALUES(2, "bob", "bob@example.com")`, false, false)
++	if _, _, err := s.Execute(context.Background(), er); err != nil {
++		t.Fatalf("failed to execute second INSERT: %s", err.Error())
++	}
++	ev = drainCDCEvent(t, cdcChannel)
++	if ev.Error != "" {
++		t.Fatalf("unexpected event error: %s", ev.Error)
++	}
++	if !slices.Equal(ev.ColumnNames, []string{"id", "name", "email"}) {
++		t.Fatalf("expected column names [id name email] after comment-prefixed ADD COLUMN, got %v -- "+
++			"schema-change detection must not depend on the SQL text's leading keyword", ev.ColumnNames)
++	}
++	if len(ev.NewRow.Values) != 3 {
++		t.Fatalf("expected 3 row values, got %d", len(ev.NewRow.Values))
++	}
++	if ev.NewRow.Values[2].GetS() != "bob@example.com" {
++		t.Fatalf("expected third value to be the new email column, got %v", ev.NewRow.Values[2])
++	}
++}
++
++// Test_CDCColFilter_Store_RestoreViaSnapshotInvalidatesCache confirms that
++// installing a Raft snapshot (FSM.Restore) also discards cached CDC
++// column-name/filter information, independently of the explicit /db/load
++// path Test_CDCColFilter_Store_RestoreInvalidatesCache covers.
++func Test_CDCColFilter_Store_RestoreViaSnapshotInvalidatesCache(t *testing.T) {
++	s, ln := mustNewStore(t)
++	defer ln.Close()
++
++	cdcChannel := make(chan *proto.CDCIndexedEventGroup, 100)
++
++	if err := s.Open(); err != nil {
++		t.Fatalf("failed to open single-node store: %s", err.Error())
++	}
++	if err := s.Bootstrap(NewServer(s.ID(), s.Addr(), true)); err != nil {
++		t.Fatalf("failed to bootstrap single-node store: %s", err.Error())
++	}
++	defer s.Close(true)
++	if _, err := s.WaitForLeader(10 * time.Second); err != nil {
++		t.Fatalf("Error waiting for leader: %s", err)
++	}
++
++	er := executeRequestFromString(
++		`CREATE TABLE users (id INTEGER NOT NULL PRIMARY KEY, ssn TEXT, name TEXT)`, false, false)
++	if _, _, err := s.Execute(context.Background(), er); err != nil {
++		t.Fatalf("failed to create table: %s", err.Error())
++	}
++	if err := s.EnableCDC(cdcChannel, nil, false, map[string][]string{"users": {"ssn"}}); err != nil {
++		t.Fatalf("failed to enable CDC: %v", err)
++	}
++	er = executeRequestFromString(
++		`INSERT INTO users(id, ssn, name) VALUES(1, "111-22-3333", "alice")`, false, false)
++	if _, _, err := s.Execute(context.Background(), er); err != nil {
++		t.Fatalf("failed to execute INSERT: %s", err.Error())
++	}
++	ev := drainCDCEvent(t, cdcChannel)
++	if !slices.Equal(ev.ColumnNames, []string{"id", "name"}) {
++		t.Fatalf("expected column names [id name] before snapshot restore, got %v", ev.ColumnNames)
++	}
++
++	// Build a snapshot, via a completely separate store, of a "users" table
++	// with a different column layout -- exactly as Test_CDCColFilter_Store_
++	// RestoreInvalidatesCache does for the /db/load path -- but persist and
++	// restore it through FSM.Snapshot/FSM.Restore, the same machinery
++	// hashicorp/raft itself drives when installing a snapshot on a node.
++	src, srcLn := mustNewStore(t)
++	defer srcLn.Close()
++	if err := src.Open(); err != nil {
++		t.Fatalf("failed to open source store: %s", err.Error())
++	}
++	if err := src.Bootstrap(NewServer(src.ID(), src.Addr(), true)); err != nil {
++		t.Fatalf("failed to bootstrap source store: %s", err.Error())
++	}
++	defer src.Close(true)
++	if _, err := src.WaitForLeader(10 * time.Second); err != nil {
++		t.Fatalf("Error waiting for leader on source store: %s", err)
++	}
++	srcEr := executeRequestFromString(
++		`CREATE TABLE users (id INTEGER NOT NULL PRIMARY KEY, ssn TEXT, name TEXT, dept TEXT)`,
++		false, false)
++	if _, _, err := src.Execute(context.Background(), srcEr); err != nil {
++		t.Fatalf("failed to create table on source store: %s", err.Error())
++	}
++
++	srcFSM := NewFSM(src)
++	snap, err := srcFSM.Snapshot()
++	if err != nil {
++		t.Fatalf("failed to snapshot source store: %s", err.Error())
++	}
++	snapDir := t.TempDir()
++	snapPath := filepath.Join(snapDir, "snapshot")
++	snapFile, err := os.Create(snapPath)
++	if err != nil {
++		t.Fatalf("failed to create snapshot file: %s", err.Error())
++	}
++	if err := snap.Persist(&mockSnapshotSink{snapFile, nil, nil}); err != nil {
++		t.Fatalf("failed to persist snapshot: %s", err.Error())
++	}
++	snapFile.Close()
++
++	restoreFile, err := os.Open(snapPath)
++	if err != nil {
++		t.Fatalf("failed to reopen snapshot file: %s", err.Error())
++	}
++	if err := NewFSM(s).Restore(restoreFile); err != nil {
++		t.Fatalf("failed to restore snapshot into s: %s", err.Error())
++	}
++
++	er = executeRequestFromString(
++		`INSERT INTO users(id, ssn, name, dept) VALUES(2, "444-55-6666", "bob", "eng")`, false, false)
++	if _, _, err := s.Execute(context.Background(), er); err != nil {
++		t.Fatalf("failed to execute post-restore INSERT: %s", err.Error())
++	}
++	ev = drainCDCEvent(t, cdcChannel)
++	if !slices.Equal(ev.ColumnNames, []string{"id", "name", "dept"}) {
++		t.Fatalf("expected column names [id name dept] after snapshot restore, got %v -- a stale "+
++			"cache would still report the pre-restore [id name] layout", ev.ColumnNames)
++	}
++	if len(ev.NewRow.Values) != 3 {
++		t.Fatalf("expected 3 row values, got %d", len(ev.NewRow.Values))
++	}
++	if ev.NewRow.Values[2].GetS() != "eng" {
++		t.Fatalf("expected third value to be the new dept column, got %v", ev.NewRow.Values[2])
++	}
++}
++
++// Test_CDCColFilter_Store_RestoreViaChunkedLoadInvalidatesCache confirms
++// that a chunked database load (COMMAND_TYPE_LOAD_CHUNK, for databases too
++// large for one Raft log entry) invalidates cached CDC metadata exactly as
++// the single-shot /db/load path does, by driving a real multi-chunk stream
++// end to end rather than assuming the shared code path for free.
++func Test_CDCColFilter_Store_RestoreViaChunkedLoadInvalidatesCache(t *testing.T) {
++	s, ln := mustNewStore(t)
++	defer ln.Close()
++
++	cdcChannel := make(chan *proto.CDCIndexedEventGroup, 100)
++
++	if err := s.Open(); err != nil {
++		t.Fatalf("failed to open single-node store: %s", err.Error())
++	}
++	if err := s.Bootstrap(NewServer(s.ID(), s.Addr(), true)); err != nil {
++		t.Fatalf("failed to bootstrap single-node store: %s", err.Error())
++	}
++	defer s.Close(true)
++	if _, err := s.WaitForLeader(10 * time.Second); err != nil {
++		t.Fatalf("Error waiting for leader: %s", err)
++	}
++
++	er := executeRequestFromString(
++		`CREATE TABLE users (id INTEGER NOT NULL PRIMARY KEY, ssn TEXT, name TEXT)`, false, false)
++	if _, _, err := s.Execute(context.Background(), er); err != nil {
++		t.Fatalf("failed to create table: %s", err.Error())
++	}
++	if err := s.EnableCDC(cdcChannel, nil, false, map[string][]string{"users": {"ssn"}}); err != nil {
++		t.Fatalf("failed to enable CDC: %v", err)
++	}
++	er = executeRequestFromString(
++		`INSERT INTO users(id, ssn, name) VALUES(1, "111-22-3333", "alice")`, false, false)
++	if _, _, err := s.Execute(context.Background(), er); err != nil {
++		t.Fatalf("failed to execute INSERT: %s", err.Error())
++	}
++	ev := drainCDCEvent(t, cdcChannel)
++	if !slices.Equal(ev.ColumnNames, []string{"id", "name"}) {
++		t.Fatalf("expected column names [id name] before chunked load, got %v", ev.ColumnNames)
++	}
++
++	// A source database with a different "users" layout, sent to s in
++	// multiple small chunks rather than as one LOAD command.
++	src, srcLn := mustNewStore(t)
++	defer srcLn.Close()
++	if err := src.Open(); err != nil {
++		t.Fatalf("failed to open source store: %s", err.Error())
++	}
++	if err := src.Bootstrap(NewServer(src.ID(), src.Addr(), true)); err != nil {
++		t.Fatalf("failed to bootstrap source store: %s", err.Error())
++	}
++	defer src.Close(true)
++	if _, err := src.WaitForLeader(10 * time.Second); err != nil {
++		t.Fatalf("Error waiting for leader on source store: %s", err)
++	}
++	srcEr := executeRequestFromString(
++		`CREATE TABLE users (id INTEGER NOT NULL PRIMARY KEY, ssn TEXT, name TEXT, dept TEXT)`,
++		false, false)
++	if _, _, err := src.Execute(context.Background(), srcEr); err != nil {
++		t.Fatalf("failed to create table on source store: %s", err.Error())
++	}
++	dbBytes, err := src.Database(false)
++	if err != nil {
++		t.Fatalf("failed to serialize source database: %s", err.Error())
++	}
++
++	// Deliberately small so the tiny database above still splits into
++	// several chunks, exercising the multi-chunk path rather than a single
++	// chunk that happens to also be the last one.
++	chunker := chunking.NewChunker(bytes.NewReader(dbBytes), 256)
++	for {
++		req, err := chunker.Next()
++		if err != nil {
++			t.Fatalf("failed to get next chunk: %s", err.Error())
++		}
++		sub, err := command.MarshalLoadChunkRequest(req)
++		if err != nil {
++			t.Fatalf("failed to marshal load-chunk request: %s", err.Error())
++		}
++		b, err := command.Marshal(&proto.Command{
++			Type:       proto.Command_COMMAND_TYPE_LOAD_CHUNK,
++			SubCommand: sub,
++		})
++		if err != nil {
++			t.Fatalf("failed to marshal command: %s", err.Error())
++		}
++		if af := s.raft.Apply(b, s.ApplyTimeout); af.Error() != nil {
++			t.Fatalf("failed to apply load-chunk command: %s", af.Error())
++		}
++		if req.IsLast {
++			break
++		}
++	}
++
++	er = executeRequestFromString(
++		`INSERT INTO users(id, ssn, name, dept) VALUES(2, "444-55-6666", "bob", "eng")`, false, false)
++	if _, _, err := s.Execute(context.Background(), er); err != nil {
++		t.Fatalf("failed to execute post-chunked-load INSERT: %s", err.Error())
++	}
++	ev = drainCDCEvent(t, cdcChannel)
++	if !slices.Equal(ev.ColumnNames, []string{"id", "name", "dept"}) {
++		t.Fatalf("expected column names [id name dept] after chunked load, got %v -- a stale cache "+
++			"would still report the pre-load [id name] layout", ev.ColumnNames)
++	}
++	if len(ev.NewRow.Values) != 3 {
++		t.Fatalf("expected 3 row values, got %d", len(ev.NewRow.Values))
++	}
++	if ev.NewRow.Values[2].GetS() != "eng" {
++		t.Fatalf("expected third value to be the new dept column, got %v", ev.NewRow.Values[2])
++	}
++}
++
++// Test_CDCColFilter_Store_RestoreViaReadFromInvalidatesCache confirms that
++// Store.ReadFrom, the boot/install-database path, also invalidates cached
++// CDC metadata, independently of the /db/load and snapshot-install paths
++// the two tests above cover.
++func Test_CDCColFilter_Store_RestoreViaReadFromInvalidatesCache(t *testing.T) {
++	s, ln := mustNewStore(t)
++	defer ln.Close()
++
++	cdcChannel := make(chan *proto.CDCIndexedEventGroup, 100)
++
++	if err := s.Open(); err != nil {
++		t.Fatalf("failed to open single-node store: %s", err.Error())
++	}
++	if err := s.Bootstrap(NewServer(s.ID(), s.Addr(), true)); err != nil {
++		t.Fatalf("failed to bootstrap single-node store: %s", err.Error())
++	}
++	defer s.Close(true)
++	if _, err := s.WaitForLeader(10 * time.Second); err != nil {
++		t.Fatalf("Error waiting for leader: %s", err)
++	}
++
++	er := executeRequestFromString(
++		`CREATE TABLE users (id INTEGER NOT NULL PRIMARY KEY, ssn TEXT, name TEXT)`, false, false)
++	if _, _, err := s.Execute(context.Background(), er); err != nil {
++		t.Fatalf("failed to create table: %s", err.Error())
++	}
++	if err := s.EnableCDC(cdcChannel, nil, false, map[string][]string{"users": {"ssn"}}); err != nil {
++		t.Fatalf("failed to enable CDC: %v", err)
++	}
++	er = executeRequestFromString(
++		`INSERT INTO users(id, ssn, name) VALUES(1, "111-22-3333", "alice")`, false, false)
++	if _, _, err := s.Execute(context.Background(), er); err != nil {
++		t.Fatalf("failed to execute INSERT: %s", err.Error())
++	}
++	ev := drainCDCEvent(t, cdcChannel)
++	if !slices.Equal(ev.ColumnNames, []string{"id", "name"}) {
++		t.Fatalf("expected column names [id name] before ReadFrom, got %v", ev.ColumnNames)
++	}
++
++	src, srcLn := mustNewStore(t)
++	defer srcLn.Close()
++	if err := src.Open(); err != nil {
++		t.Fatalf("failed to open source store: %s", err.Error())
++	}
++	if err := src.Bootstrap(NewServer(src.ID(), src.Addr(), true)); err != nil {
++		t.Fatalf("failed to bootstrap source store: %s", err.Error())
++	}
++	defer src.Close(true)
++	if _, err := src.WaitForLeader(10 * time.Second); err != nil {
++		t.Fatalf("Error waiting for leader on source store: %s", err)
++	}
++	srcEr := executeRequestFromString(
++		`CREATE TABLE users (id INTEGER NOT NULL PRIMARY KEY, ssn TEXT, name TEXT, dept TEXT)`,
++		false, false)
++	if _, _, err := src.Execute(context.Background(), srcEr); err != nil {
++		t.Fatalf("failed to create table on source store: %s", err.Error())
++	}
++	dbBytes, err := src.Database(false)
++	if err != nil {
++		t.Fatalf("failed to serialize source database: %s", err.Error())
++	}
++
++	if _, err := s.ReadFrom(bytes.NewReader(dbBytes)); err != nil {
++		t.Fatalf("failed to ReadFrom: %s", err.Error())
++	}
++
++	er = executeRequestFromString(
++		`INSERT INTO users(id, ssn, name, dept) VALUES(2, "444-55-6666", "bob", "eng")`, false, false)
++	if _, _, err := s.Execute(context.Background(), er); err != nil {
++		t.Fatalf("failed to execute post-ReadFrom INSERT: %s", err.Error())
++	}
++	ev = drainCDCEvent(t, cdcChannel)
++	if !slices.Equal(ev.ColumnNames, []string{"id", "name", "dept"}) {
++		t.Fatalf("expected column names [id name dept] after ReadFrom, got %v -- a stale cache "+
++			"would still report the pre-install [id name] layout", ev.ColumnNames)
++	}
++	if len(ev.NewRow.Values) != 3 {
++		t.Fatalf("expected 3 row values, got %d", len(ev.NewRow.Values))
++	}
++	if ev.NewRow.Values[2].GetS() != "eng" {
++		t.Fatalf("expected third value to be the new dept column, got %v", ev.NewRow.Values[2])
++	}
++}
++
++// Test_CDCColFilter_Store_SchemaEvolution_UpdateWithDDL confirms that an
++// UPDATE combined with schema-changing DDL in one explicit transaction
++// reconciles both the old and new row images against the transaction's
++// final columns. Every other same-transaction test here uses only INSERT,
++// which never has an OldRow.
++func Test_CDCColFilter_Store_SchemaEvolution_UpdateWithDDL(t *testing.T) {
++	s, ln := mustNewStore(t)
++	defer ln.Close()
++
++	cdcChannel := make(chan *proto.CDCIndexedEventGroup, 100)
++
++	if err := s.Open(); err != nil {
++		t.Fatalf("failed to open single-node store: %s", err.Error())
++	}
++	if err := s.Bootstrap(NewServer(s.ID(), s.Addr(), true)); err != nil {
++		t.Fatalf("failed to bootstrap single-node store: %s", err.Error())
++	}
++	defer s.Close(true)
++	if _, err := s.WaitForLeader(10 * time.Second); err != nil {
++		t.Fatalf("Error waiting for leader: %s", err)
++	}
++
++	er := executeRequestFromString(
++		`CREATE TABLE users (id INTEGER NOT NULL PRIMARY KEY, ssn TEXT, name TEXT)`, false, false)
++	if _, _, err := s.Execute(context.Background(), er); err != nil {
++		t.Fatalf("failed to create table: %s", err.Error())
++	}
++	if err := s.EnableCDC(cdcChannel, nil, false, map[string][]string{"users": {"ssn"}}); err != nil {
++		t.Fatalf("failed to enable CDC: %v", err)
++	}
++
++	// A row that exists before the transaction under test, so the UPDATE
++	// below has a real "before" image to carry.
++	er = executeRequestFromString(
++		`INSERT INTO users(id, ssn, name) VALUES(9, "999-99-9999", "erin")`, false, false)
++	if _, _, err := s.Execute(context.Background(), er); err != nil {
++		t.Fatalf("failed to execute INSERT: %s", err.Error())
++	}
++	drainCDCEvent(t, cdcChannel)
++
++	// One explicit transaction: rename the unfiltered "name" column, then
++	// update the row. Final columns are (id, name(=ssn, filtered out),
++	// full_name); both OldRow and NewRow must reflect that layout, with
++	// the pre-transaction value surviving under the renamed column in
++	// OldRow, and the updated value under it in NewRow.
++	er = executeRequestFromStrings([]string{
++		`ALTER TABLE users RENAME COLUMN name TO full_name`,
++		`UPDATE users SET full_name = "erin2" WHERE id = 9`,
++	}, false, true)
++	if _, _, err := s.Execute(context.Background(), er); err != nil {
++		t.Fatalf("failed to execute same-transaction RENAME-then-UPDATE: %s", err.Error())
++	}
++
++	ev := drainCDCEvent(t, cdcChannel)
++	if ev.Error != "" {
++		t.Fatalf("unexpected event error: %s", ev.Error)
++	}
++	if !slices.Equal(ev.ColumnNames, []string{"id", "full_name"}) {
++		t.Fatalf("expected column names [id full_name], got %v", ev.ColumnNames)
++	}
++	if len(ev.OldRow.Values) != 2 || len(ev.NewRow.Values) != 2 {
++		t.Fatalf("expected 2 values in both old and new rows, got old=%d new=%d",
++			len(ev.OldRow.Values), len(ev.NewRow.Values))
++	}
++	if ev.OldRow.Values[0].GetI() != 9 {
++		t.Fatalf("expected old row id 9, got %v", ev.OldRow.Values[0])
++	}
++	if ev.OldRow.Values[1].GetS() != "erin" {
++		t.Fatalf("expected old row's renamed column to carry the pre-update value 'erin', got %v",
++			ev.OldRow.Values[1])
++	}
++	if ev.NewRow.Values[0].GetI() != 9 {
++		t.Fatalf("expected new row id 9, got %v", ev.NewRow.Values[0])
++	}
++	if ev.NewRow.Values[1].GetS() != "erin2" {
++		t.Fatalf("expected new row's renamed column to carry the updated value 'erin2', got %v",
++			ev.NewRow.Values[1])
++	}
++}
+diff --git a/system_test/cdc_columnfilter_f3c841_test.go b/system_test/cdc_columnfilter_f3c841_test.go
+new file mode 100644
+index 00000000..d2002d09
+--- /dev/null
++++ b/system_test/cdc_columnfilter_f3c841_test.go
+@@ -0,0 +1,100 @@
++//go:build cdccolumnfilter
++
++package system
++
++import (
++	"testing"
++	"time"
++
++	"github.com/rqlite/rqlite/v10/cdc"
++	"github.com/rqlite/rqlite/v10/cdc/cdctest"
++	cdcjson "github.com/rqlite/rqlite/v10/cdc/json"
++)
++
++// Test_CDCColFilter_EndToEnd drives a real single-node cluster, configures CDC with a
++// column filter, and inspects the actual JSON delivered to the webhook endpoint to
++// confirm the filtered column never appears in either the "before" or "after" data,
++// while other columns, and other tables not named in the filter, are delivered as usual.
++func Test_CDCColFilter_EndToEnd(t *testing.T) {
++	node := mustNewLeaderNode("node1")
++	defer node.Deprovision()
++
++	testEndpoint := cdctest.NewHTTPTestServer()
++	testEndpoint.Start()
++	defer testEndpoint.Close()
++
++	cdcCluster := cdc.NewCDCCluster(node.Store, node.Cluster, node.Client)
++	cdcService, err := cdc.NewService(node.ID, node.Dir, cdcCluster, mustCDCConfig(testEndpoint.URL()))
++	if err != nil {
++		t.Fatalf("failed to create CDC service: %s", err.Error())
++	}
++	node.CDC = cdcService
++	node.CDC.Start()
++	node.CDC.SetLeader(true)
++
++	if err := node.Store.EnableCDC(node.CDC.C(), nil, false,
++		map[string][]string{"users": {"ssn"}}); err != nil {
++		t.Fatalf("failed to enable CDC: %v", err)
++	}
++
++	if _, err := node.Execute(
++		`CREATE TABLE users (id INTEGER NOT NULL PRIMARY KEY, ssn TEXT, name TEXT)`); err != nil {
++		t.Fatalf("failed to create users table: %v", err)
++	}
++	if _, err := node.Execute(
++		`CREATE TABLE orders (id INTEGER NOT NULL PRIMARY KEY, total REAL)`); err != nil {
++		t.Fatalf("failed to create orders table: %v", err)
++	}
++	if _, err := node.Execute(
++		`INSERT INTO users (id, ssn, name) VALUES (1, '111-22-3333', 'Alice')`); err != nil {
++		t.Fatalf("failed to insert into users: %v", err)
++	}
++	if _, err := node.Execute(`INSERT INTO orders (id, total) VALUES (1, 42.5)`); err != nil {
++		t.Fatalf("failed to insert into orders: %v", err)
++	}
++
++	testPoll(t, func() (bool, error) {
++		return testEndpoint.GetMessageCount() == 2, nil
++	}, 100*time.Millisecond, 10*time.Second)
++
++	var usersAfter, ordersAfter map[string]any
++	for _, req := range testEndpoint.GetRequests() {
++		var envelope cdcjson.CDCMessagesEnvelope
++		if err := cdcjson.UnmarshalFromEnvelopeJSON(req, &envelope); err != nil {
++			t.Fatalf("failed to unmarshal CDC envelope: %v", err)
++		}
++		for _, msg := range envelope.Payload {
++			for _, ev := range msg.Events {
++				if ev.Error != "" {
++					t.Fatalf("CDC event reported an error: %s", ev.Error)
++				}
++				switch ev.Table {
++				case "users":
++					usersAfter = ev.After
++				case "orders":
++					ordersAfter = ev.After
++				}
++			}
++		}
++	}
++
++	if usersAfter == nil {
++		t.Fatal("never received a CDC event for the users table")
++	}
++	if _, ok := usersAfter["ssn"]; ok {
++		t.Fatalf("filtered column 'ssn' present in delivered payload: %v", usersAfter)
++	}
++	if got, ok := usersAfter["name"]; !ok || got != "Alice" {
++		t.Fatalf("expected name 'Alice' to still be delivered, got %v", usersAfter)
++	}
++	if _, ok := usersAfter["id"]; !ok {
++		t.Fatalf("expected id column to still be delivered, got %v", usersAfter)
++	}
++
++	if ordersAfter == nil {
++		t.Fatal("never received a CDC event for the orders table")
++	}
++	if len(ordersAfter) != 2 {
++		t.Fatalf("expected orders table to be unaffected by the users-only filter, got %v", ordersAfter)
++	}
++}
+diff --git a/test.sh b/test.sh
+new file mode 100755
+index 00000000..391614eb
+--- /dev/null
++++ b/test.sh
+@@ -0,0 +1,166 @@
++#!/usr/bin/env bash
++# Test runner for the CDC column-filter change.
++#
++# Usage:
++#   ./test.sh [--output_path <junit.xml>] <base|new>
++#
++#   base  runs the existing test suite for the packages this change touches
++#         (cdc, db, store, system_test). Must pass both before and after the
++#         solution patch is applied. Skips two pre-existing tests, unrelated
++#         to this change, that are unreliable in this sandbox (see the
++#         comments at their -skip usage below).
++#   new   runs the new tests added for this change. They're gated behind the
++#         "cdccolumnfilter" build tag, so before the solution patch adds the
++#         APIs they exercise, some of the packages they live in fail to
++#         build -- a legitimate failure for this mode. go-junit-report can't
++#         translate a build failure into individual per-test results, so for
++#         each package that failed to build, this mode replaces that one
++#         package's report with a JUnit failure entry for each new test it
++#         defines, using the compiler output as the failure detail, instead
++#         of leaving the whole package as one opaque, unattributed failure.
++#         Every other package -- including ones that build fine even before
++#         the solution patch, and every package once the patch is applied --
++#         keeps its real, individual per-test results untouched.
++set -uo pipefail
++
++cd /app
++
++OUTPUT_PATH=""
++if [ "${1:-}" = "--output_path" ]; then
++  OUTPUT_PATH="$2"
++  shift 2
++fi
++
++MODE="${1:-new}"
++
++TEST_LOG="$(mktemp)"
++STATUS=0
++
++run_tests() {
++  go test -count=1 -v -timeout 20m "$@" 2>&1 | tee -a "$TEST_LOG"
++  status=${PIPESTATUS[0]}
++  if [ "$status" -ne 0 ]; then
++    STATUS=$status
++  fi
++}
++
++# xml_escape escapes the minimum needed for safe JUnit XML text content.
++xml_escape() {
++  local s="$1"
++  s="${s//&/\&amp;}"
++  s="${s//</\&lt;}"
++  s="${s//>/\&gt;}"
++  printf '%s' "$s"
++}
++
++# write_suite writes one <testsuite> with one failing <testcase> per given
++# test name to $outfile, all sharing $body as their failure detail. Used
++# only for a package that failed to build, where no individual per-test
++# result exists to report instead.
++write_suite() {
++  local outfile="$1" pkg="$2" body="$3"
++  shift 3
++  local names=("$@")
++  local n="${#names[@]}"
++  printf '  <testsuite name="%s" tests="%d" failures="%d" errors="0" skipped="0">\n' "$pkg" "$n" "$n" >> "$outfile"
++  local t
++  for t in "${names[@]}"; do
++    printf '    <testcase classname="%s" name="%s">\n' "$pkg" "$t" >> "$outfile"
++    printf '      <failure message="package failed to build">%s</failure>\n' "$body" >> "$outfile"
++    printf '    </testcase>\n' >> "$outfile"
++  done
++  printf '  </testsuite>\n' >> "$outfile"
++}
++
++# Packages this change adds new tests to, and the exact test names each one
++# defines. Used only to synthesize a per-test failure entry for a package
++# that failed to build -- see merge_build_failures below.
++declare -A NEW_TEST_NAMES=(
++  ["github.com/rqlite/rqlite/v10/cdc"]="Test_CDCColFilter_Config_AbsentByDefault Test_CDCColFilter_Config_Parsed Test_CDCColFilter_Config_RejectsEmptyColumnName Test_CDCColFilter_Config_RejectsEmptyTableName"
++  ["github.com/rqlite/rqlite/v10/db"]="Test_CDCColFilter_DB_SchemaVersionChangesOnDDL Test_CDCColFilter_Streamer_CacheInvalidatedOnSchemaVersionChange Test_CDCColFilter_Streamer_DeleteOnlyOldRow Test_CDCColFilter_Streamer_ExcludesConfiguredColumn Test_CDCColFilter_Streamer_ExcludesMultipleColumns Test_CDCColFilter_Streamer_InvalidateAll Test_CDCColFilter_Streamer_LeadershipInvalidationRequired Test_CDCColFilter_Streamer_MultipleTablesInOneCommit Test_CDCColFilter_Streamer_NilColumnFilterUnaffected Test_CDCColFilter_Streamer_SchemaVersionErrorFailsSafe Test_CDCColFilter_Streamer_SchemaVersionErrorRecoveryReDerives Test_CDCColFilter_Streamer_UnfilteredTableUnaffected Test_CDCColFilter_Streamer_UnknownColumnIsNoOp Test_CDCColFilter_Streamer_UpdateFiltersBothRows"
++  ["github.com/rqlite/rqlite/v10/store"]="Test_CDCColFilter_Store_ExcludesColumn Test_CDCColFilter_Store_ExcludesMultipleColumns Test_CDCColFilter_Store_LeadershipTransitionInvalidatesCache Test_CDCColFilter_Store_RestoreInvalidatesCache Test_CDCColFilter_Store_RowIDsOnlyComposition Test_CDCColFilter_Store_SchemaEvolution_AddColumn Test_CDCColFilter_Store_SchemaEvolution_DropColumn Test_CDCColFilter_Store_SchemaEvolution_RenameColumn Test_CDCColFilter_Store_SchemaEvolution_SameTransaction Test_CDCColFilter_Store_SchemaEvolution_RenameAfterWrite Test_CDCColFilter_Store_SchemaEvolution_RenameWithoutColumnKeyword Test_CDCColFilter_Store_SchemaEvolution_DropAndRecreateSameName Test_CDCColFilter_Store_SchemaEvolution_CommentPrefixedDDL Test_CDCColFilter_Store_SchemaEvolution_UpdateWithDDL Test_CDCColFilter_Store_FilterCacheStableAcrossCommits Test_CDCColFilter_Store_TableFilterComposition Test_CDCColFilter_Store_TableNotInFilterUnaffected Test_CDCColFilter_Store_UnfilteredTable_SameTransactionFinalSchema Test_CDCColFilter_Store_RestoreViaSnapshotInvalidatesCache Test_CDCColFilter_Store_RestoreViaChunkedLoadInvalidatesCache Test_CDCColFilter_Store_RestoreViaReadFromInvalidatesCache"
++  ["github.com/rqlite/rqlite/v10/system_test"]="Test_CDCColFilter_EndToEnd"
++  ["github.com/rqlite/rqlite/v10/cmd/rqlited"]="Test_CDCColFilter_CreateCDC_ProductionWiring"
++)
++
++# merge_build_failures takes go-junit-report's real output (built from the
++# full, mixed-package test log) and, only for a package that failed to
++# build, replaces its single, unattributed "[build failed]" pseudo-testcase
++# with one synthetic failing <testcase> per test that package defines --
++# using the compiler output already captured in that package's own report
++# as the failure detail. Every package that built -- whether or not all its
++# tests passed -- is passed through with its real per-test results intact.
++merge_build_failures() {
++  local raw="$1"
++  local pkg body outfile current next
++  current="$raw"
++  for pkg in "${!NEW_TEST_NAMES[@]}"; do
++    if ! grep -qE "^FAIL[[:space:]]+${pkg}[[:space:]]+\[(build|setup) failed\]" "$TEST_LOG"; then
++      continue
++    fi
++    body="$(xml_escape "$(cat "$TEST_LOG")")"
++    outfile="$(mktemp)"
++    # shellcheck disable=SC2086
++    write_suite "$outfile" "$pkg" "$body" ${NEW_TEST_NAMES[$pkg]}
++    next="$(mktemp)"
++    awk -v pat="<testsuite name=\"${pkg}\"" -v replfile="$outfile" '
++      BEGIN { in_target = 0 }
++      {
++        if (!in_target && index($0, pat) > 0) { in_target = 1; next }
++        if (in_target) {
++          if (index($0, "</testsuite>") > 0) {
++            while ((getline line < replfile) > 0) print line
++            close(replfile)
++            in_target = 0
++          }
++          next
++        }
++        print
++      }
++    ' "$current" > "$next"
++    current="$next"
++  done
++  cat "$current"
++}
++
++case "$MODE" in
++  base)
++    # Test_MultiNodeClusterRaftAdv is skipped: it is a pre-existing test,
++    # untouched by this change, that panics in the repo's own
++    # mustGetLocalIPv4Address() test helper (system_test/helpers.go) when run
++    # in this sandbox -- the helper can't find a non-loopback IPv4 interface
++    # to enumerate here. That panic crashes the whole system_test binary,
++    # which is unrelated to and unaffected by the CDC column-filter feature
++    # under test, so it's excluded to avoid an unrelated environment failure
++    # blocking verification of this change.
++    #
++    # Test_OpenStoreSingleNode_VacuumFullNeeded is skipped for the same
++    # reason: it intermittently crashes the store test binary in this
++    # sandbox with "failed to rename snapshot directory: ... file exists",
++    # a timestamp-collision race in the repo's own snapshot directory
++    # naming that reproduces with zero probability tied to this change --
++    # confirmed by running it, and the full store suite, repeatedly against
++    # the pristine, unpatched repo, where it also fires under load.
++    run_tests -skip '^(Test_MultiNodeClusterRaftAdv|Test_OpenStoreSingleNode_VacuumFullNeeded)$' \
++      ./cdc/... ./cmd/rqlited/... ./db/... ./store/... ./system_test/...
++    ;;
++  new)
++    run_tests -tags cdccolumnfilter -run '^Test_CDCColFilter' ./cdc/... ./cmd/rqlited/... ./db/... ./store/... ./system_test/...
++    ;;
++  *)
++    echo "unknown mode: $MODE (expected base or new)" >&2
++    exit 2
++    ;;
++esac
++
++if [ -n "$OUTPUT_PATH" ]; then
++  RAW_JUNIT="$(mktemp)"
++  go-junit-report -set-exit-code < "$TEST_LOG" > "$RAW_JUNIT" || true
++  if [ "$MODE" = "new" ] && [ "$STATUS" -ne 0 ] && grep -q '\[build failed\]' "$TEST_LOG"; then
++    merge_build_failures "$RAW_JUNIT" > "$OUTPUT_PATH"
++  else
++    cp "$RAW_JUNIT" "$OUTPUT_PATH"
++  fi
++fi
++
++exit "$STATUS"

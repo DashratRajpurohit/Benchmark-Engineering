@@ -1,0 +1,17 @@
+{
+  "problemId": "kh79v59g51863kyx5mk9a6zw9x8e0kzk",
+  "title": "Add per-table column filtering to CDC event payloads",
+  "status": "draft",
+  "version": 2,
+  "versionId": "kd724qz9c25e9fxx5j5v1dhb5s8e8htq",
+  "isLocked": false,
+  "language": "go",
+  "difficulty": null,
+  "category": "feature_request",
+  "repoUrl": "https://github.com/rqlite/rqlite",
+  "commitHash": "9d0ac5dcafa3cccc05f809326fe68874e8333833",
+  "githubIssueUrl": null,
+  "estimatedLOC": null,
+  "testOutputMode": null,
+  "downloadedAt": "2026-10-24T17:10:34.730Z"
+}

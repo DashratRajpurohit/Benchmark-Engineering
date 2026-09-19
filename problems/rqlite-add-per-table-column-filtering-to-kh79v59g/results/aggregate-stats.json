@@ -1,0 +1,23 @@
+{
+ "byAgent": {
+  "codex_cli": {
+   "medianLOC": 864,
+   "medianMessages": 140,
+   "passed": 2,
+   "total": 20
+  }
+ },
+ "byModel": {
+  "openrouter/openai/gpt-5.6-luna": {
+   "medianLOC": 864,
+   "medianMessages": 140,
+   "passed": 2,
+   "total": 20
+  }
+ },
+ "medianLocOverall": 864,
+ "medianMessagesOverall": 140,
+ "passedRuns": 2,
+ "totalRuns": 20,
+ "updatedAt": 1789222313444
+}
