@@ -1,0 +1,444 @@
+diff --git a/store/raft_index_7e220d_test.go b/store/raft_index_7e220d_test.go
+new file mode 100644
+index 00000000..1ea99c05
+--- /dev/null
++++ b/store/raft_index_7e220d_test.go
+@@ -0,0 +1,271 @@
++//go:build newtest
++
++package store
++
++import (
++	"context"
++	"fmt"
++	"path/filepath"
++	"testing"
++	"time"
++
++	"github.com/rqlite/rqlite/v10/command/proto"
++)
++
++func mustOpenRaftIndexStore(t *testing.T, fk bool) *Store {
++	t.Helper()
++	var s *Store
++	if fk {
++		var ln interface{ Close() error }
++		s, ln = mustNewStoreFK(t)
++		t.Cleanup(func() { ln.Close() })
++	} else {
++		var ln interface{ Close() error }
++		s, ln = mustNewStore(t)
++		t.Cleanup(func() { ln.Close() })
++	}
++	if err := s.Open(); err != nil {
++		t.Fatalf("failed to open store: %s", err)
++	}
++	t.Cleanup(func() { s.Close(true) })
++	if err := s.Bootstrap(NewServer(s.ID(), s.Addr(), true)); err != nil {
++		t.Fatalf("failed to bootstrap store: %s", err)
++	}
++	if _, err := s.WaitForLeader(10 * time.Second); err != nil {
++		t.Fatalf("failed waiting for leader: %s", err)
++	}
++	return s
++}
++
++func mustRaftIndexExecute(t *testing.T, s *Store, tx bool, stmts ...string) uint64 {
++	t.Helper()
++	res, idx, err := s.Execute(context.Background(), executeRequestFromStrings(stmts, false, tx))
++	if err != nil {
++		t.Fatalf("failed to execute %v: %s", stmts, err)
++	}
++	for _, r := range res {
++		if e := r.GetError(); e != "" {
++			t.Fatalf("statement failed in %v: %s", stmts, e)
++		}
++	}
++	if idx == 0 {
++		t.Fatalf("no Raft index returned for %v", stmts)
++	}
++	return idx
++}
++
++// mustRaftIndexColumn runs a query and returns the first column of every row as an int64.
++func mustRaftIndexColumn(t *testing.T, s *Store, lvl proto.ConsistencyLevel, query string) ([]int64, uint64) {
++	t.Helper()
++	qr := queryRequestFromString(query, false, false, false)
++	qr.Level = lvl
++	rows, _, idx, err := s.Query(context.Background(), qr)
++	if err != nil {
++		t.Fatalf("failed to query %q: %s", query, err)
++	}
++	if len(rows) != 1 || rows[0].Error != "" {
++		t.Fatalf("unexpected result for %q: %s", query, asJSON(rows))
++	}
++	var out []int64
++	for _, v := range rows[0].Values {
++		out = append(out, v.Parameters[0].GetI())
++	}
++	return out, idx
++}
++
++func Test_RaftIndex_Write(t *testing.T) {
++	for _, fk := range []bool{false, true} {
++		t.Run(fmt.Sprintf("fk=%v", fk), func(t *testing.T) {
++			s := mustOpenRaftIndexStore(t, fk)
++			mustRaftIndexExecute(t, s, false, `CREATE TABLE t (id INTEGER PRIMARY KEY, idx INTEGER)`)
++
++			n1 := mustRaftIndexExecute(t, s, false, `INSERT INTO t(id, idx) VALUES (1, rqlite_raft_index())`)
++			n2 := mustRaftIndexExecute(t, s, false, `INSERT INTO t(id, idx) VALUES (2, rqlite_raft_index())`)
++			if n2 <= n1 {
++				t.Fatalf("Raft indexes did not increase: %d then %d", n1, n2)
++			}
++			got, _ := mustRaftIndexColumn(t, s, proto.ConsistencyLevel_NONE, `SELECT idx FROM t ORDER BY id`)
++			if len(got) != 2 || got[0] != int64(n1) || got[1] != int64(n2) {
++				t.Fatalf("expected stored indexes [%d %d], got %v", n1, n2, got)
++			}
++
++			n3 := mustRaftIndexExecute(t, s, false, `UPDATE t SET idx = rqlite_raft_index() WHERE id = 1`)
++			got, _ = mustRaftIndexColumn(t, s, proto.ConsistencyLevel_NONE, `SELECT idx FROM t ORDER BY id`)
++			if got[0] != int64(n3) || got[1] != int64(n2) {
++				t.Fatalf("expected stored indexes [%d %d] after update, got %v", n3, n2, got)
++			}
++		})
++	}
++}
++
++func Test_RaftIndex_SameAcrossRequest(t *testing.T) {
++	s := mustOpenRaftIndexStore(t, false)
++	mustRaftIndexExecute(t, s, false, `CREATE TABLE t (id INTEGER PRIMARY KEY, idx INTEGER)`)
++
++	for i, tx := range []bool{false, true} {
++		base := i * 10
++		n := mustRaftIndexExecute(t, s, tx,
++			fmt.Sprintf(`INSERT INTO t(id, idx) VALUES (%d, rqlite_raft_index())`, base+1),
++			fmt.Sprintf(`INSERT INTO t(id, idx) VALUES (%d, rqlite_raft_index())`, base+2),
++			fmt.Sprintf(`INSERT INTO t(id, idx) VALUES (%d, rqlite_raft_index() + 0)`, base+3),
++		)
++		got, _ := mustRaftIndexColumn(t, s, proto.ConsistencyLevel_NONE,
++			fmt.Sprintf(`SELECT idx FROM t WHERE id > %d AND id < %d ORDER BY id`, base, base+10))
++		if len(got) != 3 {
++			t.Fatalf("tx=%v: expected 3 rows, got %v", tx, got)
++		}
++		for _, g := range got {
++			if g != int64(n) {
++				t.Fatalf("tx=%v: expected every statement to see index %d, got %v", tx, n, got)
++			}
++		}
++	}
++}
++
++func Test_RaftIndex_Trigger(t *testing.T) {
++	s := mustOpenRaftIndexStore(t, false)
++	createIdx := mustRaftIndexExecute(t, s, false,
++		`CREATE TABLE t (id INTEGER PRIMARY KEY)`,
++		`CREATE TABLE audit (id INTEGER, idx INTEGER)`,
++		`CREATE TRIGGER trg AFTER INSERT ON t BEGIN INSERT INTO audit VALUES (NEW.id, rqlite_raft_index()); END`,
++	)
++
++	n := mustRaftIndexExecute(t, s, false, `INSERT INTO t(id) VALUES (1)`)
++	if n == createIdx {
++		t.Fatalf("expected a different index for the insert than for the trigger creation")
++	}
++	got, _ := mustRaftIndexColumn(t, s, proto.ConsistencyLevel_NONE, `SELECT idx FROM audit WHERE id = 1`)
++	if len(got) != 1 || got[0] != int64(n) {
++		t.Fatalf("trigger recorded index %v, expected the index of the insert, %d (the trigger was created at %d)", got, n, createIdx)
++	}
++}
++
++func Test_RaftIndex_Request(t *testing.T) {
++	s := mustOpenRaftIndexStore(t, false)
++	mustRaftIndexExecute(t, s, false, `CREATE TABLE t (id INTEGER PRIMARY KEY, idx INTEGER)`)
++
++	eqr := executeQueryRequestFromStrings([]string{
++		`INSERT INTO t(id, idx) VALUES (1, rqlite_raft_index())`,
++		`SELECT idx, rqlite_raft_index() FROM t WHERE id = 1`,
++	}, proto.ConsistencyLevel_NONE, false, false, false)
++	res, _, idx, err := s.Request(context.Background(), eqr)
++	if err != nil {
++		t.Fatalf("request failed: %s", err)
++	}
++	if len(res) != 2 || res[1].GetQ() == nil || len(res[1].GetQ().Values) != 1 {
++		t.Fatalf("unexpected results: %s", asJSON(res))
++	}
++	row := res[1].GetQ().Values[0].Parameters
++	if row[0].GetI() != int64(idx) || row[1].GetI() != int64(idx) {
++		t.Fatalf("expected both values to be %d, got %s", idx, asJSON(row))
++	}
++}
++
++func Test_RaftIndex_StrongQuery(t *testing.T) {
++	s := mustOpenRaftIndexStore(t, false)
++	mustRaftIndexExecute(t, s, false, `CREATE TABLE t (id INTEGER PRIMARY KEY)`)
++
++	got, idx := mustRaftIndexColumn(t, s, proto.ConsistencyLevel_STRONG, `SELECT rqlite_raft_index()`)
++	if idx == 0 || len(got) != 1 || got[0] != int64(idx) {
++		t.Fatalf("expected a strong query to see its own log index %d, got %v", idx, got)
++	}
++}
++
++func Test_RaftIndex_NonRaftRead(t *testing.T) {
++	s := mustOpenRaftIndexStore(t, false)
++	mustRaftIndexExecute(t, s, false, `CREATE TABLE t (id INTEGER PRIMARY KEY)`)
++	n := mustRaftIndexExecute(t, s, false, `INSERT INTO t(id) VALUES (1)`)
++
++	for _, lvl := range []proto.ConsistencyLevel{proto.ConsistencyLevel_NONE, proto.ConsistencyLevel_WEAK} {
++		got, _ := mustRaftIndexColumn(t, s, lvl, `SELECT rqlite_raft_index()`)
++		if len(got) != 1 || got[0] < int64(n) {
++			t.Fatalf("level %s: expected the latest applied index, at least %d, got %v", lvl, n, got)
++		}
++	}
++
++	n2 := mustRaftIndexExecute(t, s, false, `INSERT INTO t(id) VALUES (2)`)
++	got, _ := mustRaftIndexColumn(t, s, proto.ConsistencyLevel_NONE, `SELECT rqlite_raft_index()`)
++	if got[0] < int64(n2) {
++		t.Fatalf("read after a later write reported index %d, expected at least %d", got[0], n2)
++	}
++}
++
++// Test_RaftIndex_StoresDoNotShareState runs two stores in one process. Each
++// must only ever see the indexes of its own Raft log.
++func Test_RaftIndex_StoresDoNotShareState(t *testing.T) {
++	a := mustOpenRaftIndexStore(t, false)
++	b := mustOpenRaftIndexStore(t, false)
++	for _, s := range []*Store{a, b} {
++		mustRaftIndexExecute(t, s, false, `CREATE TABLE t (id INTEGER PRIMARY KEY, idx INTEGER)`)
++	}
++
++	var wantA, wantB []int64
++	for i := 1; i <= 4; i++ {
++		wantA = append(wantA, int64(mustRaftIndexExecute(t, a, false,
++			fmt.Sprintf(`INSERT INTO t(id, idx) VALUES (%d, rqlite_raft_index())`, i))))
++		if i == 2 {
++			wantB = append(wantB, int64(mustRaftIndexExecute(t, b, false,
++				fmt.Sprintf(`INSERT INTO t(id, idx) VALUES (%d, rqlite_raft_index())`, i))))
++		}
++	}
++
++	for name, c := range map[string]struct {
++		s    *Store
++		want []int64
++	}{"a": {a, wantA}, "b": {b, wantB}} {
++		got, _ := mustRaftIndexColumn(t, c.s, proto.ConsistencyLevel_NONE, `SELECT idx FROM t ORDER BY id`)
++		if fmt.Sprint(got) != fmt.Sprint(c.want) {
++			t.Fatalf("store %s: expected stored indexes %v, got %v", name, c.want, got)
++		}
++	}
++}
++
++// Test_RaftIndex_RecoverReplay checks that replaying the Raft log during node
++// recovery reproduces the same indexes that were stored when the entries were
++// first applied.
++func Test_RaftIndex_RecoverReplay(t *testing.T) {
++	s, ln := mustNewStore(t)
++	defer ln.Close()
++	if err := s.Open(); err != nil {
++		t.Fatalf("failed to open store: %s", err)
++	}
++	if err := s.Bootstrap(NewServer(s.ID(), s.Addr(), true)); err != nil {
++		t.Fatalf("failed to bootstrap store: %s", err)
++	}
++	if _, err := s.WaitForLeader(10 * time.Second); err != nil {
++		t.Fatalf("failed waiting for leader: %s", err)
++	}
++
++	mustRaftIndexExecute(t, s, false,
++		`CREATE TABLE t (id INTEGER PRIMARY KEY, idx INTEGER)`,
++		`CREATE TABLE audit (id INTEGER, idx INTEGER)`,
++		`CREATE TRIGGER trg AFTER INSERT ON t BEGIN INSERT INTO audit VALUES (NEW.id, rqlite_raft_index()); END`,
++	)
++	var want []int64
++	for i := 1; i <= 3; i++ {
++		want = append(want, int64(mustRaftIndexExecute(t, s, false,
++			fmt.Sprintf(`INSERT INTO t(id, idx) VALUES (%d, rqlite_raft_index())`, i))))
++	}
++
++	id, addr := s.ID(), s.Addr()
++	if err := s.Close(true); err != nil {
++		t.Fatalf("failed to close store: %s", err)
++	}
++
++	peers := fmt.Sprintf(`[{"id": "%s","address": "%s"}]`, id, addr)
++	mustWriteFile(filepath.Join(s.Path(), "/raft/peers.json"), peers)
++	if err := s.Open(); err != nil {
++		t.Fatalf("failed to re-open store: %s", err)
++	}
++	defer s.Close(true)
++	if _, err := s.WaitForLeader(10 * time.Second); err != nil {
++		t.Fatalf("failed waiting for leader after recovery: %s", err)
++	}
++
++	for _, q := range []string{`SELECT idx FROM t ORDER BY id`, `SELECT idx FROM audit ORDER BY id`} {
++		got, _ := mustRaftIndexColumn(t, s, proto.ConsistencyLevel_NONE, q)
++		if fmt.Sprint(got) != fmt.Sprint(want) {
++			t.Fatalf("after recovery, %q returned %v, expected %v", q, got, want)
++		}
++	}
++}
+diff --git a/system_test/raft_index_7e220d_test.go b/system_test/raft_index_7e220d_test.go
+new file mode 100644
+index 00000000..68e96251
+--- /dev/null
++++ b/system_test/raft_index_7e220d_test.go
+@@ -0,0 +1,96 @@
++//go:build newtest
++
++package system
++
++import (
++	"encoding/json"
++	"io"
++	"net/http"
++	"net/url"
++	"strings"
++	"testing"
++	"time"
++)
++
++func raftIndexPost(t *testing.T, n *Node, path, body string) (results []json.RawMessage, raftIndex uint64) {
++	t.Helper()
++	resp, err := http.Post("http://"+n.APIAddr+path+"?raft_index", "application/json", strings.NewReader(body))
++	if err != nil {
++		t.Fatalf("request failed: %v", err)
++	}
++	defer resp.Body.Close()
++	b, _ := io.ReadAll(resp.Body)
++	var r struct {
++		Results   []json.RawMessage `json:"results"`
++		RaftIndex uint64            `json:"raft_index"`
++		Error     string            `json:"error"`
++	}
++	if err := json.Unmarshal(b, &r); err != nil || resp.StatusCode != http.StatusOK || r.Error != "" {
++		t.Fatalf("bad response (status %d, err %v): %s", resp.StatusCode, err, b)
++	}
++	return r.Results, r.RaftIndex
++}
++
++func raftIndexStored(t *testing.T, n *Node, query string) string {
++	t.Helper()
++	resp, err := http.Get("http://" + n.APIAddr + "/db/query?level=none&q=" + url.QueryEscape(query))
++	if err != nil {
++		t.Fatalf("query failed: %v", err)
++	}
++	defer resp.Body.Close()
++	b, _ := io.ReadAll(resp.Body)
++	return string(b)
++}
++
++func Test_RaftIndex_Cluster(t *testing.T) {
++	leader := mustNewLeaderNode("leader")
++	defer leader.Deprovision()
++	follower := mustNewNode("follower", false)
++	defer follower.Deprovision()
++	if err := follower.Join(leader); err != nil {
++		t.Fatalf("follower failed to join leader: %v", err)
++	}
++	if _, err := follower.WaitForLeader(); err != nil {
++		t.Fatalf("follower never saw a leader: %v", err)
++	}
++
++	raftIndexPost(t, leader, "/db/execute", `["CREATE TABLE t (id INTEGER PRIMARY KEY, idx INTEGER)"]`)
++	_, n1 := raftIndexPost(t, leader, "/db/execute", `["INSERT INTO t(id, idx) VALUES (1, rqlite_raft_index())"]`)
++	_, n2 := raftIndexPost(t, leader, "/db/request",
++		`["INSERT INTO t(id, idx) VALUES (2, rqlite_raft_index())", "INSERT INTO t(id, idx) VALUES (3, rqlite_raft_index())"]`)
++	if n1 == 0 || n2 <= n1 {
++		t.Fatalf("unexpected Raft indexes %d, %d", n1, n2)
++	}
++
++	want := func(a, b uint64) string {
++		out, _ := json.Marshal([]uint64{a, b, b})
++		return string(out)
++	}(n1, n2)
++
++	// Each node applies the log entries itself, so both must have stored the same values.
++	for _, n := range []*Node{leader, follower} {
++		deadline := time.Now().Add(15 * time.Second)
++		for {
++			body := raftIndexStored(t, n, `SELECT idx FROM t ORDER BY id`)
++			var r struct {
++				Results []struct {
++					Values [][]uint64 `json:"values"`
++				} `json:"results"`
++			}
++			var got []uint64
++			if json.Unmarshal([]byte(body), &r) == nil && len(r.Results) == 1 {
++				for _, v := range r.Results[0].Values {
++					got = append(got, v[0])
++				}
++			}
++			gotJSON, _ := json.Marshal(got)
++			if string(gotJSON) == want {
++				break
++			}
++			if time.Now().After(deadline) {
++				t.Fatalf("node %s stored %s, want %s", n.APIAddr, gotJSON, want)
++			}
++			time.Sleep(200 * time.Millisecond)
++		}
++	}
++}
+diff --git a/test.sh b/test.sh
+new file mode 100755
+index 00000000..cde1db16
+--- /dev/null
++++ b/test.sh
+@@ -0,0 +1,59 @@
++#!/usr/bin/env bash
++# Test runner for the rqlite_raft_index() SQL function.
++#
++# Usage:
++#   ./test.sh [--output_path <junit.xml>] <base|new>
++#
++# base  runs the pre-existing db, command, and http suites plus the single-node store recovery tests.
++#       The new tests are excluded by the "newtest" build tag. Must pass both
++#       before and after the solution.
++# new   runs the new tests, which cover writes, triggers, reads at every
++#       consistency level, node isolation, log replay during recovery, and a
++#       two-node cluster.
++set -uo pipefail
++
++cd /app
++
++OUTPUT_PATH=""
++if [ "${1:-}" = "--output_path" ]; then
++  OUTPUT_PATH="$2"
++  shift 2
++fi
++
++MODE="${1:-new}"
++
++TEST_LOG="$(mktemp)"
++STATUS=0
++
++run_tests() {
++  go test -count=1 -v "$@" 2>&1 | tee -a "$TEST_LOG"
++  status=${PIPESTATUS[0]}
++  if [ "$status" -ne 0 ]; then
++    STATUS=$status
++  fi
++}
++
++case "$MODE" in
++  base)
++    run_tests -timeout 600s ./db/... ./command/... ./http/...
++    run_tests -timeout 600s -run '^Test_SingleNodeRecover' ./store/
++    ;;
++  new)
++    run_tests -timeout 300s -tags newtest -run '^Test_RaftIndex_' ./store/ ./system_test/
++    ;;
++  *)
++    echo "unknown mode: $MODE (expected base or new)" >&2
++    exit 2
++    ;;
++esac
++
++if [ -n "$OUTPUT_PATH" ]; then
++  go-junit-report -set-exit-code < "$TEST_LOG" > "$OUTPUT_PATH"
++  junit_status=$?
++  if [ "$junit_status" -ne 0 ] && [ "$STATUS" -eq 0 ]; then
++    echo "go-junit-report failed to convert the test log (exit $junit_status)" >&2
++    STATUS=$junit_status
++  fi
++fi
++
++exit "$STATUS"

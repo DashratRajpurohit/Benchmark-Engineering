@@ -1,0 +1,17 @@
+{
+  "problemId": "kh75ta7mk7k3gpe7vf1mcqpqp98ergds",
+  "title": "Add an rqlite_raft_index() SQL function that exposes the Raft log index of a write",
+  "status": "draft",
+  "version": 0,
+  "versionId": "kd78pejky5hsc0tamah3ty9x5d8esng9",
+  "isLocked": false,
+  "language": "go",
+  "difficulty": null,
+  "category": "feature_request",
+  "repoUrl": "https://github.com/rqlite/rqlite",
+  "commitHash": "f7dcf0f0c1e7da3378248f0a0a1593b079a1c2e4",
+  "githubIssueUrl": null,
+  "estimatedLOC": null,
+  "testOutputMode": null,
+  "downloadedAt": "2026-10-24T17:10:24.906Z"
+}
