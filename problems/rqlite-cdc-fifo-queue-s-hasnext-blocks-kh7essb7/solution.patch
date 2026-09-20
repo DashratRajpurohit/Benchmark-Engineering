@@ -1,0 +1,160 @@
+diff --git a/cdc/fifo.go b/cdc/fifo.go
+index fda4fb55..862c14e1 100644
+--- a/cdc/fifo.go
++++ b/cdc/fifo.go
+@@ -135,93 +135,116 @@ func (q *Queue) Enqueue(ev *Event) error {
+ 		return errors.New("event cannot be nil")
+ 	}
+ 
++	req := enqueueReq{idx: ev.Index, item: ev.Data, respChan: make(chan enqueueResp, 1)}
+ 	select {
+ 	case <-q.done:
+ 		return ErrQueueClosed
+-	default:
++	case q.enqueueChan <- req:
++	}
++	select {
++	case <-q.done:
++		return ErrQueueClosed
++	case resp := <-req.respChan:
++		return resp.err
+ 	}
+-
+-	req := enqueueReq{idx: ev.Index, item: ev.Data, respChan: make(chan enqueueResp)}
+-	q.enqueueChan <- req
+-	resp := <-req.respChan
+-	return resp.err
+ }
+ 
+ // DeleteRange deletes all items in the queue with indices less than or equal to idx.
+ func (q *Queue) DeleteRange(idx uint64) error {
++	req := deleteRangeReq{
++		idx:      idx,
++		respChan: make(chan error, 1),
++	}
+ 	select {
+ 	case <-q.done:
+ 		return ErrQueueClosed
+-	default:
++	case q.deleteRangeChan <- req:
+ 	}
+-
+-	req := deleteRangeReq{
+-		idx:      idx,
+-		respChan: make(chan error),
++	select {
++	case <-q.done:
++		return ErrQueueClosed
++	case err := <-req.respChan:
++		return err
+ 	}
+-	q.deleteRangeChan <- req
+-	return <-req.respChan
+ }
+ 
+ func (q *Queue) FirstKey() (uint64, error) {
++	req := queryReq{respChan: make(chan queryResp, 1)}
+ 	select {
+ 	case <-q.done:
+ 		return 0, ErrQueueClosed
+-	default:
++	case q.queryChan <- req:
++	}
++	select {
++	case <-q.done:
++		return 0, ErrQueueClosed
++	case resp := <-req.respChan:
++		return resp.firstKey, resp.err
+ 	}
+-	req := queryReq{respChan: make(chan queryResp)}
+-	q.queryChan <- req
+-	resp := <-req.respChan
+-	return resp.firstKey, resp.err
+ }
+ 
+ // HighestKey returns the index of the highest item ever inserted into the queue.
+ func (q *Queue) HighestKey() (uint64, error) {
++	req := queryReq{respChan: make(chan queryResp, 1)}
+ 	select {
+ 	case <-q.done:
+ 		return 0, ErrQueueClosed
+-	default:
++	case q.queryChan <- req:
++	}
++	select {
++	case <-q.done:
++		return 0, ErrQueueClosed
++	case resp := <-req.respChan:
++		return resp.highestKey, resp.err
+ 	}
+-	req := queryReq{respChan: make(chan queryResp)}
+-	q.queryChan <- req
+-	resp := <-req.respChan
+-	return resp.highestKey, resp.err
+ }
+ 
+ // Empty checks if the queue contains no items.
+ func (q *Queue) Empty() (bool, error) {
++	req := queryReq{respChan: make(chan queryResp, 1)}
+ 	select {
+ 	case <-q.done:
+ 		return false, ErrQueueClosed
+-	default:
++	case q.queryChan <- req:
++	}
++	select {
++	case <-q.done:
++		return false, ErrQueueClosed
++	case resp := <-req.respChan:
++		return resp.isEmpty, resp.err
+ 	}
+-
+-	req := queryReq{respChan: make(chan queryResp)}
+-	q.queryChan <- req
+-	resp := <-req.respChan
+-	return resp.isEmpty, resp.err
+ }
+ 
+ // HasNext checks if there is at least one item available to dequeue.
+ func (q *Queue) HasNext() bool {
+-	req := queryReq{respChan: make(chan queryResp)}
+-	q.queryChan <- req
+-	resp := <-req.respChan
+-	return resp.hasNext
++	req := queryReq{respChan: make(chan queryResp, 1)}
++	select {
++	case <-q.done:
++		return false
++	case q.queryChan <- req:
++	}
++	select {
++	case <-q.done:
++		return false
++	case resp := <-req.respChan:
++		return resp.hasNext
++	}
+ }
+ 
+ // Len returns the number of items currently in the queue.
+ func (q *Queue) Len() int {
++	req := queryReq{respChan: make(chan queryResp, 1)}
+ 	select {
+ 	case <-q.done:
+ 		return 0
+-	default:
++	case q.queryChan <- req:
++	}
++	select {
++	case <-q.done:
++		return 0
++	case resp := <-req.respChan:
++		return resp.len
+ 	}
+-
+-	req := queryReq{respChan: make(chan queryResp)}
+-	q.queryChan <- req
+-	resp := <-req.respChan
+-	return resp.len
+ }
+ 
+ func (q *Queue) run(highestKey uint64) {

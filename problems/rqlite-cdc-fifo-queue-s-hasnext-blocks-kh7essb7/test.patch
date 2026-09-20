@@ -1,0 +1,233 @@
+diff --git a/cdc/fifo_shutdown_contract_12ad85_test.go b/cdc/fifo_shutdown_contract_12ad85_test.go
+new file mode 100644
+index 00000000..98dbebc9
+--- /dev/null
++++ b/cdc/fifo_shutdown_contract_12ad85_test.go
+@@ -0,0 +1,155 @@
++//go:build newtest
++
++package cdc
++
++import (
++	"net/http"
++	"net/http/httptest"
++	"sync"
++	"testing"
++	"time"
++)
++
++// Test_Queue_ConcurrentCloseNeverHangs drives every public Queue method
++// (Enqueue, DeleteRange, FirstKey, HighestKey, Empty, Len, HasNext)
++// concurrently with Close, from many goroutines, across many iterations.
++//
++// The queue's managing goroutine exits as soon as Close is called. A method
++// that only checks "is the queue closed?" before sending its request on a
++// channel has a race: Close can complete, and the managing goroutine can
++// exit, in the window between that check and the send (or between the send
++// and receiving the response). When that happens the method blocks forever,
++// because nothing is left to read the request or answer it. This must never
++// happen for any method, no matter when Close is called relative to an
++// in-flight call.
++func Test_Queue_ConcurrentCloseNeverHangs(t *testing.T) {
++	const iterations = 200
++	const callersPerMethod = 4
++
++	for iter := 0; iter < iterations; iter++ {
++		q, _, _ := newTestQueue(t)
++
++		var wg sync.WaitGroup
++		start := func(fn func()) {
++			wg.Add(1)
++			go func() {
++				defer wg.Done()
++				fn()
++			}()
++		}
++
++		for i := 0; i < callersPerMethod; i++ {
++			start(func() { _ = q.Enqueue(&Event{Index: 1, Data: []byte("x")}) })
++			start(func() { _ = q.DeleteRange(1) })
++			start(func() { _, _ = q.FirstKey() })
++			start(func() { _, _ = q.HighestKey() })
++			start(func() { _, _ = q.Empty() })
++			start(func() { _ = q.Len() })
++			start(func() { _ = q.HasNext() })
++		}
++
++		// Close concurrently with the calls above, not after them, so the
++		// race window between each method's closed-check and its channel
++		// operation is actually exercised.
++		start(func() { q.Close() })
++
++		done := make(chan struct{})
++		go func() {
++			wg.Wait()
++			close(done)
++		}()
++
++		select {
++		case <-done:
++		case <-time.After(10 * time.Second):
++			t.Fatalf("iteration %d: at least one Queue method call is still blocked "+
++				"10s after Close was invoked concurrently with it", iter)
++		}
++	}
++}
++
++// Test_Service_StatsNeverHangsDuringStop confirms that Service.Stats, which
++// reads Queue.HasNext and Queue.Len, remains safe to call concurrently with
++// Service.Stop. Stop closes the underlying FIFO queue; a caller polling
++// Stats (as a status/diagnostics endpoint would) must never be left blocked
++// because the queue was closed out from under it mid-call.
++func Test_Service_StatsNeverHangsDuringStop(t *testing.T) {
++	ResetStats()
++
++	testSrv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
++		defer r.Body.Close()
++		w.WriteHeader(http.StatusOK)
++	}))
++	defer testSrv.Close()
++
++	cl := &mockCluster{}
++	cfg := DefaultConfig()
++	cfg.Endpoint = testSrv.URL
++
++	svc, err := NewService("node1", t.TempDir(), cl, cfg)
++	if err != nil {
++		t.Fatalf("failed to create service: %v", err)
++	}
++	if err := svc.Start(); err != nil {
++		t.Fatalf("failed to start service: %v", err)
++	}
++
++	var wg sync.WaitGroup
++	stop := make(chan struct{})
++
++	// Repeatedly poll Stats, as a status endpoint would, until told to stop.
++	wg.Add(1)
++	go func() {
++		defer wg.Done()
++		for {
++			select {
++			case <-stop:
++				return
++			default:
++			}
++			_, _ = svc.Stats()
++		}
++	}()
++
++	// Give the poller a moment to be actively calling Stats, then stop the
++	// service while it's in flight.
++	time.Sleep(10 * time.Millisecond)
++
++	stopped := make(chan struct{})
++	go func() {
++		svc.Stop()
++		close(stopped)
++	}()
++
++	select {
++	case <-stopped:
++	case <-time.After(10 * time.Second):
++		t.Fatal("Service.Stop did not return within 10s while Stats was being polled concurrently")
++	}
++
++	close(stop)
++
++	waitDone := make(chan struct{})
++	go func() {
++		wg.Wait()
++		close(waitDone)
++	}()
++
++	select {
++	case <-waitDone:
++	case <-time.After(10 * time.Second):
++		t.Fatal("a Stats poller goroutine is still blocked 10s after Stop returned")
++	}
++
++	// One final call after Stop must also return promptly rather than hang.
++	done := make(chan struct{})
++	go func() {
++		_, _ = svc.Stats()
++		close(done)
++	}()
++	select {
++	case <-done:
++	case <-time.After(10 * time.Second):
++		t.Fatal("Stats called after Stop is blocked")
++	}
++}
+diff --git a/test.sh b/test.sh
+new file mode 100755
+index 00000000..6f73fc1b
+--- /dev/null
++++ b/test.sh
+@@ -0,0 +1,66 @@
++#!/usr/bin/env bash
++# Test runner for the CDC FIFO queue shutdown-contract regression.
++#
++# Usage:
++#   ./test.sh [--output_path <junit.xml>] <base|new>
++#
++# base  runs the pre-existing cdc package regression suite (excluding the
++#       new tests below). Must pass both before and after the solution.
++# new   runs the new regression tests:
++#         - Test_Queue_ConcurrentCloseNeverHangs: drives every public Queue
++#           method concurrently with Close across many iterations and
++#           asserts none of them ever blocks forever.
++#         - Test_Service_StatsNeverHangsDuringStop: confirms Service.Stats
++#           (which reads Queue.HasNext/Len) stays safe to call concurrently
++#           with Service.Stop.
++#       Both fail (time out) before the solution and pass after it.
++set -uo pipefail
++
++cd /app
++
++OUTPUT_PATH=""
++if [ "${1:-}" = "--output_path" ]; then
++  OUTPUT_PATH="$2"
++  shift 2
++fi
++
++MODE="${1:-new}"
++
++TEST_LOG="$(mktemp)"
++STATUS=0
++
++run_tests() {
++  shift_args=("$@")
++  go test -count=1 -v "${shift_args[@]}" 2>&1 | tee -a "$TEST_LOG"
++  status=${PIPESTATUS[0]}
++  if [ "$status" -ne 0 ]; then
++    STATUS=$status
++  fi
++}
++
++case "$MODE" in
++  base)
++    # The new regression tests live in a file guarded by the "newtest" build
++    # tag, so a plain build (no tags) excludes them entirely and runs only
++    # the pre-existing cdc package suite.
++    run_tests -timeout 60s ./cdc/...
++    ;;
++  new)
++    run_tests -tags newtest -run '^(Test_Queue_ConcurrentCloseNeverHangs|Test_Service_StatsNeverHangsDuringStop)$' -timeout 120s ./cdc/...
++    ;;
++  *)
++    echo "unknown mode: $MODE (expected base or new)" >&2
++    exit 2
++    ;;
++esac
++
++if [ -n "$OUTPUT_PATH" ]; then
++  go-junit-report -set-exit-code < "$TEST_LOG" > "$OUTPUT_PATH"
++  junit_status=$?
++  if [ "$junit_status" -ne 0 ] && [ "$STATUS" -eq 0 ]; then
++    echo "go-junit-report failed to convert the test log (exit $junit_status)" >&2
++    STATUS=$junit_status
++  fi
++fi
++
++exit "$STATUS"

@@ -1,0 +1,5 @@
+The CDC service's FIFO queue is managed by a single background goroutine, and every public method (Enqueue, DeleteRange, FirstKey, HighestKey, Empty, Len, HasNext) talks to it over channels: send a request, wait for a reply. Closing the queue stops that goroutine.
+
+Most of these methods check up front whether the queue is closed, but that check happens before the request is sent. If the queue is closed while a method is between that check and actually sending or receiving on the channel, the goroutine that would have replied is already gone, and the call blocks forever instead of returning. HasNext doesn't even have the up-front check, so it can hang immediately after a close. This affects real callers: the CDC service's status/statistics reporting reads from the queue, and a status request racing with shutdown can hang.
+
+Fix the queue so that every one of its methods, and anything that depends on them, returns promptly no matter when Close happens relative to an in-flight call. Nothing should ever be left blocked waiting on a queue that has stopped answering.
