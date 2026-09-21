@@ -1,0 +1,17 @@
+{
+  "problemId": "kh70tx1v9kprfshtfptmvyz9618etngr",
+  "title": "Preview the next index run",
+  "status": "draft",
+  "version": 0,
+  "versionId": "kd77h2e68cfczvkk6m230n60s98evhfd",
+  "isLocked": false,
+  "language": "go",
+  "difficulty": null,
+  "category": "bugfix",
+  "repoUrl": "https://github.com/kenxpx/sift",
+  "commitHash": "b6d9b5ff6faa417950d9546c020169098329189d",
+  "githubIssueUrl": null,
+  "estimatedLOC": null,
+  "testOutputMode": null,
+  "downloadedAt": "2026-10-24T17:10:15.893Z"
+}

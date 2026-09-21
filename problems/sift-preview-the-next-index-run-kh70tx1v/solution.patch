@@ -1,0 +1,179 @@
+diff --git a/internal/app/app.go b/internal/app/app.go
+index f5776a1..72406d8 100644
+--- a/internal/app/app.go
++++ b/internal/app/app.go
+@@ -20,6 +20,7 @@ import (
+ 	"sift/internal/extract"
+ 	"sift/internal/index"
+ 	"sift/internal/manifest"
++	"sift/internal/plan"
+ 	"sift/internal/publish"
+ 	"sift/internal/scan"
+ 	"sift/internal/search"
+@@ -142,6 +143,20 @@ func (a App) Validate(root string) (validate.Findings, error) {
+ 	return f, nil
+ }
+ 
++// Plan previews what Index would do to the corpus at root without changing
++// anything on disk.
++func (a App) Plan(root string) ([]plan.Change, error) {
++	cfg, err := a.Config(root)
++	if err != nil {
++		return nil, err
++	}
++	changes, err := plan.Compute(cfg)
++	if err != nil {
++		return nil, fmt.Errorf("app: plan %s: %w", cfg.Root, err)
++	}
++	return changes, nil
++}
++
+ // Watch scans the corpus at root and reports both the files it holds now and
+ // the changes since the prev scan. The returned scan is what the caller passes
+ // as prev next time; a nil prev reports every file as added.
+diff --git a/internal/plan/plan.go b/internal/plan/plan.go
+new file mode 100644
+index 0000000..032b2f0
+--- /dev/null
++++ b/internal/plan/plan.go
+@@ -0,0 +1,140 @@
++// Package plan previews what the next index run would publish, without
++// changing anything on disk: no extraction cache entry is written and no
++// generation is published.
++//
++// A plan is computed by content, not by file metadata: a file whose size and
++// modification time are unchanged but whose bytes differ is still reported as
++// modified, and a file whose metadata changed but whose bytes hash the same
++// is not reported at all. This matches what an index run actually reuses
++// from the cache, which is keyed by content hash.
++//
++// A configuration change invalidates the cache for reuse — every document
++// that survives will be re-tokenized — but it does not make an existing
++// document new. A file the corpus already held before a configuration change
++// is reported as modified, the same as any other file whose cached extraction
++// can no longer be trusted; only a file the cache has never held under its
++// identity, under any configuration, is reported as added.
++package plan
++
++import (
++	"os"
++	"path/filepath"
++	"sort"
++
++	"sift/internal/cache"
++	"sift/internal/config"
++	"sift/internal/core"
++	"sift/internal/extract"
++	"sift/internal/manifest"
++	"sift/internal/publish"
++	"sift/internal/scan"
++	"sift/internal/store"
++)
++
++// Change kinds reported by Compute.
++const (
++	// KindAdded marks a file the cache has never held under this document ID,
++	// under any configuration.
++	KindAdded = "added"
++	// KindModified marks a file whose cached extraction can no longer be
++	// trusted for it: either its content hash no longer matches what the
++	// cache recorded, or the configuration that produced the cache has
++	// changed since, so every recorded extraction needs to be redone.
++	KindModified = "modified"
++	// KindRemoved marks a document the cache holds that the corpus no longer
++	// scans to.
++	KindRemoved = "removed"
++	// KindSkippedBinary marks a scanned file an index run would skip because
++	// its contents are not text.
++	KindSkippedBinary = "skipped: binary"
++)
++
++// Change is one difference between the corpus now and the extraction cache of
++// its last published generation.
++type Change struct {
++	// Rel is the slash-separated path relative to the corpus root, or, for
++	// KindRemoved, the cached document ID (a corpus-relative path from a
++	// previous scan).
++	Rel string
++	// Kind is one of the Kind constants above.
++	Kind string
++}
++
++// Compute scans the corpus described by cfg and reports, by content hash
++// rather than file metadata, what the next index run would add, modify,
++// remove or skip as binary. Compute never writes to the extraction cache or
++// the output directory; it only reads them.
++//
++// Changes are sorted by Rel then Kind, so the same corpus and cache always
++// produce the same plan in the same order.
++func Compute(cfg core.Config) ([]Change, error) {
++	files, err := scan.Walk(cfg)
++	if err != nil {
++		return nil, err
++	}
++	entries, stale := loadCache(cfg)
++	seen := make(map[core.DocID]bool, len(files))
++	var changes []Change
++	for _, f := range files {
++		data, err := os.ReadFile(f.Abs)
++		if err != nil {
++			// Matches app.App.Index: a file the scanner accepted but that
++			// vanished or became unreadable since is skipped, not reported.
++			continue
++		}
++		id := core.DocID(f.Rel)
++		seen[id] = true
++		if extract.IsBinary(data) {
++			changes = append(changes, Change{Rel: f.Rel, Kind: KindSkippedBinary})
++			continue
++		}
++		_, existed := entries.Entries[string(id)]
++		if !existed {
++			changes = append(changes, Change{Rel: f.Rel, Kind: KindAdded})
++			continue
++		}
++		if stale {
++			// The document existed before, but the configuration that
++			// produced the cache has changed: its extraction must be redone
++			// regardless of whether its content also changed.
++			changes = append(changes, Change{Rel: f.Rel, Kind: KindModified})
++			continue
++		}
++		hash := store.SHA256Bytes(data)
++		if _, ok := entries.Get(id, hash); !ok {
++			changes = append(changes, Change{Rel: f.Rel, Kind: KindModified})
++		}
++	}
++	for idStr := range entries.Entries {
++		if !seen[core.DocID(idStr)] {
++			changes = append(changes, Change{Rel: idStr, Kind: KindRemoved})
++		}
++	}
++	sort.Slice(changes, func(i, j int) bool {
++		if changes[i].Rel != changes[j].Rel {
++			return changes[i].Rel < changes[j].Rel
++		}
++		return changes[i].Kind < changes[j].Kind
++	})
++	return changes, nil
++}
++
++// loadCache returns the extraction cache published for cfg's current
++// generation, together with whether it is stale for the configuration now in
++// force. A stale cache is still returned (not discarded), because the
++// document identities it records are still meaningful even though its
++// content-hash entries can no longer be trusted for reuse: Compute needs to
++// know a document existed before to tell "modified" from "added" when the
++// configuration has changed.
++func loadCache(cfg core.Config) (*cache.Store, bool) {
++	out := publish.OutputPath(cfg)
++	m, err := manifest.Load(out)
++	if err != nil {
++		return cache.New(), false
++	}
++	entries, err := cache.Load(filepath.Join(out, core.CacheFile))
++	if err != nil {
++		return cache.New(), false
++	}
++	return entries, m.ConfigHash != config.Hash(cfg)
++}

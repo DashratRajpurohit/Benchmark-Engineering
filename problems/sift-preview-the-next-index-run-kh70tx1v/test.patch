@@ -1,0 +1,224 @@
+diff --git a/internal/plan/plan_af2d5d_test.go b/internal/plan/plan_af2d5d_test.go
+new file mode 100644
+index 0000000..8de5bdd
+--- /dev/null
++++ b/internal/plan/plan_af2d5d_test.go
+@@ -0,0 +1,159 @@
++package plan_test
++
++import (
++	"encoding/json"
++	"os"
++	"path/filepath"
++	"reflect"
++	"testing"
++	"time"
++
++	"sift/internal/app"
++	"sift/internal/plan"
++)
++
++// mustNoErr_af2d5d fails the test immediately if err is non-nil.
++func mustNoErr_af2d5d(t *testing.T, err error) {
++	t.Helper()
++	if err != nil {
++		t.Fatal(err)
++	}
++}
++
++func writeFile_af2d5d(t *testing.T, path string, body []byte) {
++	t.Helper()
++	mustNoErr_af2d5d(t, os.WriteFile(path, body, 0o644))
++}
++
++// kindsFor_af2d5d returns rel -> kind for the requested files only, so that
++// unrelated entries an implementation may legitimately report do not matter.
++func kindsFor_af2d5d(changes []plan.Change, rels ...string) map[string]string {
++	wanted := make(map[string]bool, len(rels))
++	for _, rel := range rels {
++		wanted[rel] = true
++	}
++	got := map[string]string{}
++	for _, c := range changes {
++		if wanted[c.Rel] {
++			got[c.Rel] = c.Kind
++		}
++	}
++	return got
++}
++
++// A file whose size and modification time are unchanged, but whose bytes
++// differ, must still be reported as modified.
++func TestComputeDetectsContentChangeWithUnchangedMetadata_af2d5d(t *testing.T) {
++	root := t.TempDir()
++	path := filepath.Join(root, "doc.md")
++	fixed := time.Date(2025, 1, 1, 0, 0, 0, 0, time.UTC)
++	write := func(body string) {
++		writeFile_af2d5d(t, path, []byte(body))
++		mustNoErr_af2d5d(t, os.Chtimes(path, fixed, fixed))
++	}
++	original := "# same length\n"
++	changed := "# same-length\n"
++	if len(original) != len(changed) {
++		t.Fatalf("test setup: bodies must be the same length")
++	}
++	write(original)
++
++	a := app.App{}
++	_, err := a.Index(root)
++	mustNoErr_af2d5d(t, err)
++	write(changed)
++
++	changes, err := a.Plan(root)
++	mustNoErr_af2d5d(t, err)
++	want := map[string]string{"doc.md": "modified"}
++	if got := kindsFor_af2d5d(changes, "doc.md"); !reflect.DeepEqual(got, want) {
++		t.Fatalf("Plan reported %v for a real content change with the same size and mtime, want %v (full: %+v)", got, want, changes)
++	}
++}
++
++// Added, removed and skipped-binary must each be reported distinctly, and an
++// unchanged file must not be reported at all.
++func TestComputeReportsAddedRemovedAndSkippedBinary_af2d5d(t *testing.T) {
++	root := t.TempDir()
++	writeFile_af2d5d(t, filepath.Join(root, "keep.md"), []byte("keep\n"))
++	writeFile_af2d5d(t, filepath.Join(root, "gone.md"), []byte("gone\n"))
++
++	a := app.App{}
++	_, err := a.Index(root)
++	mustNoErr_af2d5d(t, err)
++
++	mustNoErr_af2d5d(t, os.Remove(filepath.Join(root, "gone.md")))
++	writeFile_af2d5d(t, filepath.Join(root, "new.md"), []byte("new\n"))
++	writeFile_af2d5d(t, filepath.Join(root, "bin.dat"), []byte{0x00, 0x01, 0x02, 0x03})
++
++	changes, err := a.Plan(root)
++	mustNoErr_af2d5d(t, err)
++	want := map[string]string{
++		"new.md":  "added",
++		"gone.md": "removed",
++		"bin.dat": "skipped: binary",
++	}
++	if got := kindsFor_af2d5d(changes, "new.md", "gone.md", "bin.dat", "keep.md"); !reflect.DeepEqual(got, want) {
++		t.Fatalf("Plan reported %v, want %v (full: %+v)", got, want, changes)
++	}
++}
++
++// A file the corpus already held before a configuration change must be
++// reported as modified (its extraction needs to be redone), never as added
++// (it is not new to the corpus) and never as unchanged (its cached
++// extraction, made under the old configuration, can no longer be trusted).
++func TestComputeReportsExistingFileAsModifiedAfterConfigChange_af2d5d(t *testing.T) {
++	root := t.TempDir()
++	writeFile_af2d5d(t, filepath.Join(root, "doc.md"), []byte("hello world\n"))
++
++	a := app.App{}
++	_, err := a.Index(root)
++	mustNoErr_af2d5d(t, err)
++
++	data, err := json.Marshal(map[string]any{"stopwords": []string{"hello"}})
++	mustNoErr_af2d5d(t, err)
++	writeFile_af2d5d(t, filepath.Join(root, ".sift.json"), data)
++
++	changes, err := a.Plan(root)
++	mustNoErr_af2d5d(t, err)
++	want := map[string]string{"doc.md": "modified"}
++	if got := kindsFor_af2d5d(changes, "doc.md"); !reflect.DeepEqual(got, want) {
++		t.Fatalf("Plan reported %v for a file held before a configuration change, want %v (full: %+v)", got, want, changes)
++	}
++}
++
++// The same corpus and the same prior state must always produce the same list
++// in the same order, and previewing must not change what a second preview sees.
++func TestComputeIsDeterministicAndReadOnly_af2d5d(t *testing.T) {
++	root := t.TempDir()
++	for _, name := range []string{"a.md", "b.md", "c.md", "d.md"} {
++		writeFile_af2d5d(t, filepath.Join(root, name), []byte(name+"\n"))
++	}
++	a := app.App{}
++	_, err := a.Index(root)
++	mustNoErr_af2d5d(t, err)
++
++	writeFile_af2d5d(t, filepath.Join(root, "b.md"), []byte("changed b\n"))
++	writeFile_af2d5d(t, filepath.Join(root, "e.md"), []byte("brand new\n"))
++	writeFile_af2d5d(t, filepath.Join(root, "z.dat"), []byte{0x00, 0xff, 0x00})
++	mustNoErr_af2d5d(t, os.Remove(filepath.Join(root, "d.md")))
++
++	first, err := a.Plan(root)
++	mustNoErr_af2d5d(t, err)
++	want := map[string]string{
++		"b.md":  "modified",
++		"e.md":  "added",
++		"z.dat": "skipped: binary",
++		"d.md":  "removed",
++	}
++	if got := kindsFor_af2d5d(first, "a.md", "b.md", "c.md", "d.md", "e.md", "z.dat"); !reflect.DeepEqual(got, want) {
++		t.Fatalf("Plan reported %v, want %v (full: %+v)", got, want, first)
++	}
++	for i := 0; i < 3; i++ {
++		again, err := a.Plan(root)
++		mustNoErr_af2d5d(t, err)
++		if !reflect.DeepEqual(again, first) {
++			t.Fatalf("Plan run %d differs from the first run:\nfirst: %+v\nagain: %+v", i+2, first, again)
++		}
++	}
++}
+diff --git a/test.sh b/test.sh
+new file mode 100755
+index 0000000..fb87542
+--- /dev/null
++++ b/test.sh
+@@ -0,0 +1,53 @@
++#!/usr/bin/env bash
++# Test runner for the sift "preview the next index run" (internal/plan) task.
++#
++# Usage:
++#   ./test.sh [--output_path <junit.xml>] <base|new>
++#
++# base  runs every pre-existing package's tests (everything except the new
++#       internal/plan package); they must pass before and after the solution.
++# new   runs the new internal/plan tests; they fail before the solution and
++#       pass after.
++set -uo pipefail
++
++cd /app
++
++OUTPUT_PATH=""
++if [ "${1:-}" = "--output_path" ]; then
++  OUTPUT_PATH="$2"
++  shift 2
++fi
++
++MODE="${1:-new}"
++
++TEST_LOG="$(mktemp)"
++STATUS=0
++
++run_tests() {
++  regex="$1"
++  shift
++  go test -count=1 -v -run "$regex" "$@" 2>&1 | tee -a "$TEST_LOG"
++  status=${PIPESTATUS[0]}
++  if [ "$status" -ne 0 ]; then
++    STATUS=$status
++  fi
++}
++
++case "$MODE" in
++  base)
++    run_tests '.*' $(go list ./... | grep -v '/internal/plan$')
++    ;;
++  new)
++    run_tests '^TestCompute.*_af2d5d$' ./internal/plan/
++    ;;
++  *)
++    echo "unknown mode: $MODE (expected base or new)" >&2
++    exit 2
++    ;;
++esac
++
++if [ -n "$OUTPUT_PATH" ]; then
++  go-junit-report -set-exit-code < "$TEST_LOG" > "$OUTPUT_PATH" || true
++fi
++
++exit "$STATUS"
