@@ -1,0 +1,17 @@
+{
+  "problemId": "kh7b93byq93ev8m9y03k3nc2sd8etj4h",
+  "title": "Reduce allocations in gojq entries builtins",
+  "status": "draft",
+  "version": 0,
+  "versionId": "kd75dk4y8sw322ndgrtrryx3bd8etk2a",
+  "isLocked": false,
+  "language": "go",
+  "difficulty": null,
+  "category": "refactor",
+  "repoUrl": "https://github.com/itchyny/gojq",
+  "commitHash": "b7ebffbfc038677520df0bae4c8c2d877f88ffea",
+  "githubIssueUrl": null,
+  "estimatedLOC": null,
+  "testOutputMode": null,
+  "downloadedAt": "2026-10-24T17:10:17.567Z"
+}

@@ -1,0 +1,315 @@
+diff --git a/entries_dac09c_test.go b/entries_dac09c_test.go
+new file mode 100644
+index 0000000..c13f4d8
+--- /dev/null
++++ b/entries_dac09c_test.go
+@@ -0,0 +1,245 @@
++package gojq_test
++
++import (
++	"encoding/json"
++	"fmt"
++	"reflect"
++	"strings"
++	"testing"
++
++	"github.com/itchyny/gojq"
++)
++
++// entriesCase_dac09c records the exact observable behaviour (results, then the first
++// error) of one query on one input.
++type entriesCase_dac09c struct {
++	query, input, out, err string
++}
++
++var entriesCases_dac09c = []entriesCase_dac09c{
++	{"to_entries", "{}", "[]", ""},
++	{"to_entries", "{\"b\":2,\"a\":1,\"c\":null}", "[{\"key\":\"a\",\"value\":1},{\"key\":\"b\",\"value\":2},{\"key\":\"c\",\"value\":null}]", ""},
++	{"to_entries", "{\"z\":{\"x\":[1,2]},\"y\":false}", "[{\"key\":\"y\",\"value\":false},{\"key\":\"z\",\"value\":{\"x\":[1,2]}}]", ""},
++	{"to_entries", "[10,20,30]", "[{\"key\":0,\"value\":10},{\"key\":1,\"value\":20},{\"key\":2,\"value\":30}]", ""},
++	{"to_entries", "[]", "[]", ""},
++	{"to_entries", "null", "", "keys cannot be applied to: null"},
++	{"to_entries", "\"str\"", "", "keys cannot be applied to: string (\"str\")"},
++	{"to_entries", "5", "", "keys cannot be applied to: number (5)"},
++	{"to_entries", "true", "", "keys cannot be applied to: boolean (true)"},
++	{"from_entries", "[]", "{}", ""},
++	{"from_entries", "[{\"key\":\"a\",\"value\":1},{\"key\":\"b\",\"value\":2}]", "{\"a\":1,\"b\":2}", ""},
++	{"from_entries", "[{\"Key\":\"a\",\"Value\":1}]", "{\"a\":1}", ""},
++	{"from_entries", "[{\"name\":\"a\",\"value\":1}]", "{\"a\":1}", ""},
++	{"from_entries", "[{\"Name\":\"a\",\"Value\":1}]", "{\"a\":1}", ""},
++	{"from_entries", "[{\"k\":\"a\",\"v\":1}]", "", "expected a string for object key but got: null"},
++	{"from_entries", "[{\"key\":false,\"name\":\"n\",\"value\":1}]", "{\"n\":1}", ""},
++	{"from_entries", "[{\"key\":null,\"Key\":\"K\",\"value\":1}]", "{\"K\":1}", ""},
++	{"from_entries", "[{\"key\":null,\"value\":1}]", "", "expected a string for object key but got: null"},
++	{"from_entries", "[{\"key\":1,\"value\":1}]", "", "expected a string for object key but got: number (1)"},
++	{"from_entries", "[{\"key\":true,\"value\":1}]", "", "expected a string for object key but got: boolean (true)"},
++	{"from_entries", "[{\"key\":\"a\",\"value\":false}]", "{\"a\":false}", ""},
++	{"from_entries", "[{\"key\":\"a\",\"value\":null,\"Value\":7}]", "{\"a\":null}", ""},
++	{"from_entries", "[{\"key\":\"a\",\"Value\":7}]", "{\"a\":7}", ""},
++	{"from_entries", "[{\"key\":\"a\"}]", "{\"a\":null}", ""},
++	{"from_entries", "[{\"key\":\"\",\"value\":1}]", "{\"\":1}", ""},
++	{"from_entries", "[{\"key\":\"a\",\"value\":1},{\"key\":\"a\",\"value\":2}]", "{\"a\":2}", ""},
++	{"from_entries", "{\"x\":{\"key\":\"a\",\"value\":1},\"y\":{\"key\":\"b\",\"value\":2}}", "{\"a\":1,\"b\":2}", ""},
++	{"from_entries", "null", "", "cannot iterate over: null"},
++	{"from_entries", "\"str\"", "", "cannot iterate over: string (\"str\")"},
++	{"from_entries", "5", "", "cannot iterate over: number (5)"},
++	{"from_entries", "[1]", "", "expected an object but got: number (1)"},
++	{"from_entries", "[null]", "", "expected a string for object key but got: null"},
++	{"from_entries", "[[]]", "", "expected an object but got: array ([])"},
++	{"from_entries", "[{\"key\":\"a\",\"value\":1},null]", "", "expected a string for object key but got: null"},
++	{"from_entries", "[{\"key\":\"a\",\"value\":1},{\"value\":2}]", "", "expected a string for object key but got: null"},
++	{"from_entries", "[{\"key\":\"a\",\"value\":{\"n\":[1,{\"m\":2}]}}]", "{\"a\":{\"n\":[1,{\"m\":2}]}}", ""},
++	{"from_entries", "[{\"key\":\"a\",\"value\":1},{\"key\":1,\"value\":2}]", "", "expected a string for object key but got: number (1)"},
++	{"from_entries", "[{\"key\":1,\"value\":1},null]", "", "expected a string for object key but got: number (1)"},
++	{"from_entries", "[null,{\"key\":1,\"value\":1}]", "", "expected a string for object key but got: null"},
++	{"from_entries", "[{\"key\":\"k\",\"value\":1,\"Value\":2,\"name\":\"z\"}]", "{\"k\":1}", ""},
++	{"from_entries", "[{\"key\":[1],\"value\":1}]", "", "expected a string for object key but got: array ([1])"},
++	{"with_entries(.value += 1)", "{\"a\":1,\"b\":2}", "{\"a\":2,\"b\":3}", ""},
++	{"with_entries(select(.key != \"b\"))", "{\"a\":1,\"b\":2,\"c\":3}", "{\"a\":1,\"c\":3}", ""},
++	{"with_entries(.key |= ascii_upcase)", "{\"a\":1,\"b\":2}", "{\"A\":1,\"B\":2}", ""},
++	{"with_entries(empty)", "{\"a\":1}", "{}", ""},
++	{"with_entries(.)", "[5,6]", "", "expected a string for object key but got: number (0)"},
++	{"with_entries(.key = \"same\")", "{\"a\":1,\"b\":2}", "{\"same\":2}", ""},
++	{"with_entries(.value = null)", "{\"a\":1}", "{\"a\":null}", ""},
++	{"with_entries(.key |= tostring)", "[7,8]", "{\"0\":7,\"1\":8}", ""},
++	{"with_entries(.)", "null", "", "keys cannot be applied to: null"},
++	{"with_entries(.)", "{}", "{}", ""},
++	{"with_entries(.value |= tostring)", "{\"n\":1,\"s\":\"x\",\"o\":{\"a\":1}}", "{\"n\":\"1\",\"o\":\"{\\\"a\\\":1}\",\"s\":\"x\"}", ""},
++	{"with_entries(.,.)", "{\"a\":1}", "{\"a\":1}", ""},
++	{"with_entries(error(\"boom\"))", "{\"a\":1}", "", "error: boom"},
++	{"to_entries | from_entries", "{\"b\":1,\"a\":2}", "{\"a\":2,\"b\":1}", ""},
++	{"[to_entries[] | .key]", "{\"b\":1,\"a\":2}", "[\"a\",\"b\"]", ""},
++	{"to_entries | length", "{\"a\":1,\"b\":2,\"c\":3}", "3", ""},
++	{"path(to_entries)", "{\"a\":1}", "", "invalid path against: array ([{\"key\":\"a\",\"value\":1}])"},
++	{"[.[] | to_entries]", "[{\"a\":1},{\"b\":2}]", "[[{\"key\":\"a\",\"value\":1}],[{\"key\":\"b\",\"value\":2}]]", ""},
++	{"map_values(to_entries)", "{\"x\":{\"a\":1}}", "{\"x\":[{\"key\":\"a\",\"value\":1}]}", ""},
++	{"from_entries", "[{\"key\":false}]", "", "expected a string for object key but got: null"},
++	{"from_entries", "[{\"key\":false,\"Name\":false}]", "", "expected a string for object key but got: boolean (false)"},
++	{"from_entries", "[{\"Key\":0}]", "", "expected a string for object key but got: number (0)"},
++	{"from_entries", "[{\"key\":null,\"Key\":null,\"name\":null,\"Name\":\"N\",\"value\":3}]", "{\"N\":3}", ""},
++	{"from_entries", "[{\"name\":\"n\",\"Name\":\"N\",\"Value\":9}]", "{\"n\":9}", ""},
++	{"from_entries", "[{\"key\":\"a\",\"value\":1},{\"key\":\"b\"},{\"key\":\"c\",\"Value\":false}]", "{\"a\":1,\"b\":null,\"c\":false}", ""},
++	{"from_entries", "[{\"Key\":\"a\"},{\"name\":\"b\",\"value\":[]}]", "{\"a\":null,\"b\":[]}", ""},
++	{"from_entries", "[{\"key\":\"x\",\"value\":1},{\"key\":\"y\",\"value\":2},{\"key\":\"x\",\"value\":3},{\"key\":\"z\",\"value\":4},{\"key\":\"y\",\"value\":5}]", "{\"x\":3,\"y\":5,\"z\":4}", ""},
++	{"with_entries(.value |= .+1)", "{\"c\":1,\"a\":2,\"b\":3}", "{\"a\":3,\"b\":4,\"c\":2}", ""},
++	{"with_entries(.key |= \"k_\" + .)", "{\"a\":1,\"b\":2}", "{\"k_a\":1,\"k_b\":2}", ""},
++	{"with_entries(select(.value > 1))", "{\"a\":1,\"b\":2,\"c\":3}", "{\"b\":2,\"c\":3}", ""},
++	{"with_entries(if .key == \"a\" then empty else . end)", "{\"a\":1,\"b\":2}", "{\"b\":2}", ""},
++	{"from_entries", "[\"x\"]", "", "expected an object but got: string (\"x\")"},
++	{"from_entries", "[true]", "", "expected an object but got: boolean (true)"},
++	{"from_entries", "[[1]]", "", "expected an object but got: array ([1])"},
++	{"from_entries", "[false]", "", "expected an object but got: boolean (false)"},
++	{"from_entries", "[0]", "", "expected an object but got: number (0)"},
++	{"from_entries", "{\"b\":{\"key\":\"k\",\"value\":1},\"a\":{\"key\":\"k\",\"value\":2}}", "{\"k\":1}", ""},
++	{"from_entries", "{\"b\":{\"key\":\"k\",\"value\":1},\"a\":null}", "", "expected a string for object key but got: null"},
++	{"from_entries", "{}", "{}", ""},
++	{"from_entries", "[{\"key\":\"a\",\"value\":1},{\"key\":\"b\",\"value\":2}] ", "{\"a\":1,\"b\":2}", ""},
++	{"map(to_entries)", "[{\"a\":1},{}]", "[[{\"key\":\"a\",\"value\":1}],[]]", ""},
++	{"to_entries | map(.value)", "{\"b\":2,\"a\":1}", "[1,2]", ""},
++	{"[to_entries[] | select(.value > 1) | .key]", "{\"a\":1,\"b\":2,\"c\":3}", "[\"b\",\"c\"]", ""},
++	{"to_entries[0]", "{\"m\":1,\"n\":2}", "{\"key\":\"m\",\"value\":1}", ""},
++	{"from_entries | keys", "[{\"key\":\"z\",\"value\":1},{\"key\":\"a\",\"value\":2}]", "[\"a\",\"z\"]", ""},
++	{"with_entries(.value |= length)", "{\"a\":[1,2],\"b\":\"xyz\"}", "{\"a\":2,\"b\":3}", ""},
++	{"with_entries(.value |= keys)", "{\"a\":{\"q\":1}}", "{\"a\":[\"q\"]}", ""},
++}
++
++func mustNoErr_dac09c(t *testing.T, err error) {
++	t.Helper()
++	if err != nil {
++		t.Fatal(err)
++	}
++}
++
++func compileEntries_dac09c(t *testing.T, query string) *gojq.Code {
++	t.Helper()
++	q, err := gojq.Parse(query)
++	mustNoErr_dac09c(t, err)
++	code, err := gojq.Compile(q)
++	mustNoErr_dac09c(t, err)
++	return code
++}
++
++// runEntries_dac09c returns the newline-joined JSON results and the first error text.
++func runEntries_dac09c(t *testing.T, code *gojq.Code, in any) (string, string) {
++	t.Helper()
++	var outs []string
++	iter := code.Run(in)
++	for {
++		v, ok := iter.Next()
++		if !ok {
++			return strings.Join(outs, "\n"), ""
++		}
++		if e, ok := v.(error); ok {
++			return strings.Join(outs, "\n"), e.Error()
++		}
++		b, jerr := json.Marshal(v)
++		mustNoErr_dac09c(t, jerr)
++		outs = append(outs, string(b))
++	}
++}
++
++func decodeEntries_dac09c(t *testing.T, s string) any {
++	t.Helper()
++	var v any
++	mustNoErr_dac09c(t, json.Unmarshal([]byte(s), &v))
++	return v
++}
++
++func entriesAllocs_dac09c(t *testing.T, query string, in any) float64 {
++	code := compileEntries_dac09c(t, query)
++	return testing.AllocsPerRun(20, func() {
++		iter := code.Run(in)
++		for {
++			if _, ok := iter.Next(); !ok {
++				return
++			}
++		}
++	})
++}
++
++func bigEntriesObject_dac09c(n int) (map[string]any, []any) {
++	obj := make(map[string]any, n)
++	list := make([]any, 0, n)
++	for i := 0; i < n; i++ {
++		k := fmt.Sprintf("k%03d", i)
++		obj[k] = i
++		list = append(list, map[string]any{"key": k, "value": i})
++	}
++	return obj, list
++}
++
++// The entries builtins must keep returning exactly the same results and the
++// same errors as before, for every kind of input.
++func TestEntriesBuiltinsKeepResultsAndErrors_dac09c(t *testing.T) {
++	for _, c := range entriesCases_dac09c {
++		out, errText := runEntries_dac09c(t, compileEntries_dac09c(t, c.query), decodeEntries_dac09c(t, c.input))
++		got, want := [2]string{out, errText}, [2]string{c.out, c.err}
++		if !reflect.DeepEqual(got, want) {
++			t.Errorf("%s on %s:\n got  %q\n want %q", c.query, c.input, got, want)
++		}
++	}
++}
++
++// to_entries followed by from_entries is the identity on objects, and both
++// are repeatable.
++func TestEntriesRoundTripAndRepeatable_dac09c(t *testing.T) {
++	obj, list := bigEntriesObject_dac09c(50)
++	first, firstErr := runEntries_dac09c(t, compileEntries_dac09c(t, "to_entries | from_entries"), obj)
++	want, _ := json.Marshal(obj)
++	if !reflect.DeepEqual([2]string{first, firstErr}, [2]string{string(want), ""}) {
++		t.Fatalf("round trip of to_entries|from_entries changed the object: %q, %q", first, firstErr)
++	}
++	code := compileEntries_dac09c(t, "from_entries")
++	a, aErr := runEntries_dac09c(t, code, list)
++	b, bErr := runEntries_dac09c(t, code, list)
++	if !reflect.DeepEqual([2]string{a, aErr}, [2]string{b, bErr}) {
++		t.Fatalf("from_entries is not repeatable: %q vs %q", a, b)
++	}
++	if !reflect.DeepEqual([2]string{a, aErr}, [2]string{string(want), ""}) {
++		t.Fatalf("from_entries of the entries list = %q, %q, want %q", a, aErr, want)
++	}
++}
++
++// The results must not alias the input: changing a result afterwards must not
++// change what a later run sees.
++func TestEntriesDoNotAliasInput_dac09c(t *testing.T) {
++	obj := map[string]any{"a": 1, "b": 2}
++	res, ok := compileEntries_dac09c(t, "to_entries").Run(obj).Next()
++	if !ok {
++		t.Fatal("to_entries produced no result")
++	}
++	res.([]any)[0].(map[string]any)["value"] = 99
++	after, afterErr := runEntries_dac09c(t, compileEntries_dac09c(t, "to_entries"), obj)
++	want := `[{"key":"a","value":1},{"key":"b","value":2}]`
++	if !reflect.DeepEqual([2]string{after, afterErr}, [2]string{want, ""}) {
++		t.Fatalf("to_entries result aliased its input: %q, %q", after, afterErr)
++	}
++	if !reflect.DeepEqual(obj, map[string]any{"a": 1, "b": 2}) {
++		t.Fatalf("to_entries modified its input: %v", obj)
++	}
++}
++
++// from_entries and to_entries used to be written in jq, costing hundreds of
++// allocations per hundred entries. They must now be cheap.
++func TestEntriesAllocationBudget_dac09c(t *testing.T) {
++	obj, list := bigEntriesObject_dac09c(100)
++	budgets := []struct {
++		name  string
++		query string
++		in    any
++		max   float64
++	}{
++		{"from_entries", "from_entries", list, 120},
++		{"to_entries", "to_entries", obj, 470},
++		{"with_entries identity", "with_entries(.)", obj, 800},
++	}
++	for _, b := range budgets {
++		if got := entriesAllocs_dac09c(t, b.query, b.in); got > b.max {
++			t.Errorf("%s on 100 entries made %.0f allocations, want at most %.0f", b.name, got, b.max)
++		}
++	}
++}
+diff --git a/test.sh b/test.sh
+new file mode 100755
+index 0000000..f728be8
+--- /dev/null
++++ b/test.sh
+@@ -0,0 +1,58 @@
++#!/usr/bin/env bash
++# Test runner for the gojq to_entries / from_entries / with_entries
++# allocation-reduction task.
++#
++# Usage:
++#   ./test.sh [--output_path <junit.xml>] <base|new>
++#
++# base  runs the pre-existing suites (root package tests and the CLI
++#       suite, which exercises these builtins end to end); they must pass
++#       both before and after the solution is applied.
++# new   runs the allocation-budget test; it fails before the solution and
++#       passes after. The result/error parity and aliasing tests run in base
++#       mode: they pass on both sides and guard behaviour preservation.
++set -uo pipefail
++
++cd /app
++
++OUTPUT_PATH=""
++if [ "${1:-}" = "--output_path" ]; then
++  OUTPUT_PATH="$2"
++  shift 2
++fi
++
++MODE="${1:-new}"
++
++TEST_LOG="$(mktemp)"
++STATUS=0
++
++run_tests() {
++  regex="$1"
++  shift
++  go test -count=1 -v -run "$regex" "$@" 2>&1 | tee -a "$TEST_LOG"
++  status=${PIPESTATUS[0]}
++  if [ "$status" -ne 0 ]; then
++    STATUS=$status
++  fi
++}
++
++case "$MODE" in
++  base)
++    run_tests '^(TestCompare|TestCodeCompile_.*|TestParseErrorTokenOffset|TestCodeRun_.*|TestMarshal|TestWith.*|TestPreview|TestQueryRun_.*|TestQueryString|TestTypeOf)$' .
++    run_tests '^(TestEntriesBuiltinsKeepResultsAndErrors|TestEntriesRoundTripAndRepeatable|TestEntriesDoNotAliasInput)_dac09c$' .
++    run_tests '.*' ./cli/...
++    ;;
++  new)
++    run_tests '^TestEntriesAllocationBudget_dac09c$' .
++    ;;
++  *)
++    echo "unknown mode: $MODE (expected base or new)" >&2
++    exit 2
++    ;;
++esac
++
++if [ -n "$OUTPUT_PATH" ]; then
++  go-junit-report -set-exit-code < "$TEST_LOG" > "$OUTPUT_PATH" || true
++fi
++
++exit "$STATUS"
