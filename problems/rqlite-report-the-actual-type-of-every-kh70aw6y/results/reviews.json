@@ -1,0 +1,141 @@
+[
+ {
+  "feedback": "Tests: - T3/T4  Test_VTypes_FollowerForwarding: the test confirms the follower returns HTTP 200 with a values field and the expected vtypes labels, but never decodes and compares the actual value for row 2's TEXT-affinity column, which stores raw invalid-UTF-8 bytes (0xC0 0xFE). An implementation that computes the blob label correctly but sanitizes or replaces those bytes before forwarding to the follower (e.g. replacing invalid sequences so the payload can travel as a string) would still satisfy every current assertion. Add a decode of that value and assert it matches the base64 encoding of the original bytes, keeping the vtypes label check alongside it. This same gap exists in Test_VTypes_SingleNode: no subtest anywhere decodes actual row values for a byte-preservation check, so the same corrupting implementation would pass on a single node too and should be covered there as well, not just for the follower path.\n- T4  Test_VTypes_SingleNode/standard: the consistency-level loop covers none, weak, linearizable, and strong but omits auto, which is a distinct, separately supported level with its own resolution branch. Since the description requires the parameter to work at every read consistency level, add auto to the loop so an implementation that only wires the flag into the four explicit levels is caught.\n- T3  Test_VTypes_FollowerForwarding: the manual poll loop (time.Now().Add / time.Sleep(200ms)) reimplements a pattern the repo already provides via trueOrTimeout in system_test/helpers.go, which is used for the same kind of follower-catch-up wait elsewhere. Prefer the existing helper for consistency with the rest of the suite.\n\nSolution & Code: - S1  db/db.go, rowValueTypes (around the new function near line 2245): the DATE, DATETIME and TIMESTAMP exception is only satisfied incidentally, not enforced. rowValueTypes(dest) classifies purely from the Go value produced by the driver scan and is never given the declared column types, unlike normalizeRowParameters, which is called from the same loop and does receive xTypes. The comment on the default case even says \"Strings, and times from DATE, DATETIME and TIMESTAMP columns,\" which only holds when SQLite's dynamic typing happens to store a value the driver turns into a string or time.Time. A DATE/DATETIME/TIMESTAMP column can legally hold a REAL or BLOB value (e.g. CREATE TABLE t(v DATE); INSERT INTO t VALUES (X'00')), and such a value scans as []byte, so rowValueTypes reports blob instead of the required text. Fix by passing xTypes into rowValueTypes (it is already in scope at the call site) and forcing text for any column whose declared type is date, datetime, or timestamp before falling back to runtime-value classification for the rest.\n\nOther notes: The issue can be fixed with just around 120 line changes, effectively. Naturally, increase the scope of the problem to meet Olympus bar",
+  "fieldBands": {
+   "description": {
+    "band": 3
+   },
+   "solution": {
+    "band": 1,
+    "reasoning": " - S1  db/db.go, rowValueTypes (around the new function near line 2245): the DATE, DATETIME and TIMESTAMP exception is only satisfied incidentally, not enforced. rowValueTypes(dest) classifies purely from the Go value produced by the driver scan and is never given the declared column types, unlike normalizeRowParameters, which is called from the same loop and does receive xTypes. The comment on the default case even says \"Strings, and times from DATE, DATETIME and TIMESTAMP columns,\" which only holds when SQLite's dynamic typing happens to store a value the driver turns into a string or time.Time. A DATE/DATETIME/TIMESTAMP column can legally hold a REAL or BLOB value (e.g. CREATE TABLE t(v DATE); INSERT INTO t VALUES (X'00')), and such a value scans as []byte, so rowValueTypes reports blob instead of the required text. Fix by passing xTypes into rowValueTypes (it is already in scope at the call site) and forcing text for any column whose declared type is date, datetime, or timestamp before falling back to runtime-value classification for the rest.\n"
+   },
+   "tests": {
+    "band": 1,
+    "reasoning": "- T3/T4  Test_VTypes_FollowerForwarding: the test confirms the follower returns HTTP 200 with a values field and the expected vtypes labels, but never decodes and compares the actual value for row 2's TEXT-affinity column, which stores raw invalid-UTF-8 bytes (0xC0 0xFE). An implementation that computes the blob label correctly but sanitizes or replaces those bytes before forwarding to the follower (e.g. replacing invalid sequences so the payload can travel as a string) would still satisfy every current assertion. Add a decode of that value and assert it matches the base64 encoding of the original bytes, keeping the vtypes label check alongside it. This same gap exists in Test_VTypes_SingleNode: no subtest anywhere decodes actual row values for a byte-preservation check, so the same corrupting implementation would pass on a single node too and should be covered there as well, not just for the follower path.\n- T4  Test_VTypes_SingleNode/standard: the consistency-level loop covers none, weak, linearizable, and strong but omits auto, which is a distinct, separately supported level with its own resolution branch. Since the description requires the parameter to work at every read consistency level, add auto to the loop so an implementation that only wires the flag into the four explicit levels is caught.\n- T3  Test_VTypes_FollowerForwarding: the manual poll loop (time.Now().Add / time.Sleep(200ms)) reimplements a pattern the repo already provides via trueOrTimeout in system_test/helpers.go, which is used for the same kind of follower-catch-up wait elsewhere. Prefer the existing helper for consistency with the rest of the suite.\n"
+   }
+  },
+  "internalNotes": null,
+  "otherNotes": "The issue can be fixed with just around 120 line changes, effectively. Naturally, increase the scope of the problem to meet Olympus bar",
+  "otherNotesTags": null,
+  "outcome": "revision_requested",
+  "overallQuality": 1.6666666666666665,
+  "qualityScore": 4,
+  "reasoning": null,
+  "reviewFormatVersion": 2,
+  "reviewId": "m57f0x5ay5mg54edbrwt36nkw18etpfp",
+  "reviewerName": "Neeraj B",
+  "submittedAt": 1789970516749,
+  "versionNumber": 1,
+  "submittedAtIST": "2026-09-21T11:31:56.749000+05:30"
+ },
+ {
+  "feedback": "Other notes: The issue can still be solved with around 110 effective line changes, broaden the scope",
+  "fieldBands": {
+   "description": {
+    "band": 3
+   },
+   "solution": {
+    "band": 3
+   },
+   "tests": {
+    "band": 3
+   }
+  },
+  "internalNotes": null,
+  "otherNotes": "The issue can still be solved with around 110 effective line changes, broaden the scope",
+  "otherNotesTags": null,
+  "outcome": "revision_requested",
+  "overallQuality": 3,
+  "qualityScore": 7,
+  "reasoning": null,
+  "reviewFormatVersion": 2,
+  "reviewId": "m571q3j5njkaxfy6n6p2f51s1n8evx8m",
+  "reviewerName": "Neeraj B",
+  "submittedAt": 1790010071612,
+  "versionNumber": 3,
+  "submittedAtIST": "2026-09-21T22:31:11.612000+05:30"
+ },
+ {
+  "feedback": "Other notes: Effective LOC still sits at around 155. Naturally increase the scope of the issue to meet the Olympus bar while working on it. Address Auto-review suggestions as well. This will be the last iteration, as there is a cap on the number of iterations.",
+  "fieldBands": {
+   "description": {
+    "band": 3
+   },
+   "solution": {
+    "band": 3
+   },
+   "tests": {
+    "band": 3
+   }
+  },
+  "internalNotes": null,
+  "otherNotes": "Effective LOC still sits at around 155. Naturally increase the scope of the issue to meet the Olympus bar while working on it. Address Auto-review suggestions as well. This will be the last iteration, as there is a cap on the number of iterations.",
+  "otherNotesTags": null,
+  "outcome": "revision_requested",
+  "overallQuality": 3,
+  "qualityScore": 7,
+  "reasoning": null,
+  "reviewFormatVersion": 2,
+  "reviewId": "m573wtv9ap4t72b4gbamxy47458exwmv",
+  "reviewerName": "Neeraj B",
+  "submittedAt": 1790086323378,
+  "versionNumber": 4,
+  "submittedAtIST": "2026-09-22T19:42:03.378000+05:30"
+ },
+ {
+  "feedback": "Tests: -  test.sh base mode: cdc/json/marshal.go and db/cdc.go were changed to add before_types/after_types, but base mode runs only ./db/... ./command/... ./http/... ./cmd/rqlite/..., leaving out ./cdc/.... The cdc package's own tests (e.g. Test_ServiceSingleEvent and its variants in cdc/service_test.go), which exercise the full marshalling path including events with no row image, are consequently never run as a regression check. An implementation that satisfies the new row-bearing CDC test while breaking marshalling of row-ID-only or otherwise minimal events would not be caught. Add ./cdc/... to the base run.\n-  Test_VTypes_SingleNode/execute: the final loop computes the inserted id as 10+len(path) for both \"/db/execute\" and \"/db/request\". Both strings are 11 characters long, so both attempts insert id 21, which the setup fixture already uses (vtypesSetup inserts id 21). The INSERT ... RETURNING therefore fails with a constraint error on both iterations, and the test's absence-of-vtypes check trivially passes against an error result rather than a successful row-bearing one. Use distinct, unused ids per endpoint, confirm the result carries no error and returns the expected row, and only then assert vtypes is absent.\n-  Test_VTypes_SingleNode/shell: the shell subtest only ever checks blob and text labels (via the txt/b column swap on row id=2). No case exercises null, integer or real values, so a formatter that appends the type suffix only for string-like or blob cells and leaves numeric/NULL cells in their old, unlabeled form would still pass. Add a query such as SELECT NULL, 7, 1.5 and assert each of null, integer and real appears against its value in at least one mode.\n\nOther notes: Address all the issues this time, as there is a cap on the number of revisions.",
+  "fieldBands": {
+   "description": {
+    "band": 3
+   },
+   "solution": {
+    "band": 3
+   },
+   "tests": {
+    "band": 1,
+    "reasoning": "-  test.sh base mode: cdc/json/marshal.go and db/cdc.go were changed to add before_types/after_types, but base mode runs only ./db/... ./command/... ./http/... ./cmd/rqlite/..., leaving out ./cdc/.... The cdc package's own tests (e.g. Test_ServiceSingleEvent and its variants in cdc/service_test.go), which exercise the full marshalling path including events with no row image, are consequently never run as a regression check. An implementation that satisfies the new row-bearing CDC test while breaking marshalling of row-ID-only or otherwise minimal events would not be caught. Add ./cdc/... to the base run.\n-  Test_VTypes_SingleNode/execute: the final loop computes the inserted id as 10+len(path) for both \"/db/execute\" and \"/db/request\". Both strings are 11 characters long, so both attempts insert id 21, which the setup fixture already uses (vtypesSetup inserts id 21). The INSERT ... RETURNING therefore fails with a constraint error on both iterations, and the test's absence-of-vtypes check trivially passes against an error result rather than a successful row-bearing one. Use distinct, unused ids per endpoint, confirm the result carries no error and returns the expected row, and only then assert vtypes is absent.\n-  Test_VTypes_SingleNode/shell: the shell subtest only ever checks blob and text labels (via the txt/b column swap on row id=2). No case exercises null, integer or real values, so a formatter that appends the type suffix only for string-like or blob cells and leaves numeric/NULL cells in their old, unlabeled form would still pass. Add a query such as SELECT NULL, 7, 1.5 and assert each of null, integer and real appears against its value in at least one mode.\n"
+   }
+  },
+  "internalNotes": null,
+  "otherNotes": "Address all the issues this time, as there is a cap on the number of revisions.",
+  "otherNotesTags": null,
+  "outcome": "revision_requested",
+  "overallQuality": 2.333333333333333,
+  "qualityScore": 6,
+  "reasoning": null,
+  "reviewFormatVersion": 2,
+  "reviewId": "m576avwkf2jhy75x212xkznb358ez6hp",
+  "reviewerName": "Neeraj B",
+  "submittedAt": 1790170103182,
+  "versionNumber": 5,
+  "submittedAtIST": "2026-09-23T18:58:23.182000+05:30"
+ },
+ {
+  "feedback": "Tests: Auto-review suggestion is worth adding but not blocking.",
+  "fieldBands": {
+   "description": {
+    "band": 3
+   },
+   "solution": {
+    "band": 3
+   },
+   "tests": {
+    "band": 2,
+    "reasoning": "Auto-review suggestion is worth adding but not blocking. "
+   }
+  },
+  "internalNotes": null,
+  "otherNotes": null,
+  "otherNotesTags": null,
+  "outcome": "approved",
+  "overallQuality": 2.6666666666666665,
+  "qualityScore": 6,
+  "reasoning": null,
+  "reviewFormatVersion": 2,
+  "reviewId": "m572jdpwva6bfg58ye8wjf8tx18f0ytf",
+  "reviewerName": "Neeraj B",
+  "submittedAt": 1790228148854,
+  "versionNumber": 6,
+  "submittedAtIST": "2026-09-24T11:05:48.854000+05:30"
+ }
+]

@@ -1,0 +1,635 @@
+diff --git a/system_test/vtypes_6ab3eb_test.go b/system_test/vtypes_6ab3eb_test.go
+new file mode 100644
+index 00000000..de94fa76
+--- /dev/null
++++ b/system_test/vtypes_6ab3eb_test.go
+@@ -0,0 +1,566 @@
++package system
++
++import (
++	"bytes"
++
++	"encoding/base64"
++	"encoding/json"
++	"fmt"
++	"github.com/rqlite/rqlite/v10/cdc"
++	"github.com/rqlite/rqlite/v10/cdc/cdctest"
++	"io"
++	"net"
++	"net/http"
++	"net/url"
++	"os"
++	"os/exec"
++	"path/filepath"
++	"reflect"
++	"regexp"
++	"strings"
++	"testing"
++	"time"
++)
++
++var vtypesSetup = []string{
++	`CREATE TABLE t (id INTEGER PRIMARY KEY, txt TEXT, b BLOB, n REAL, x, flag BOOLEAN, ts DATETIME)`,
++	`INSERT INTO t VALUES (1, 'hello', X'c0fe', 1.5, NULL, 1, '2024-01-02 03:04:05')`,
++	`INSERT INTO t VALUES (2, X'c0fe', 'wP4=', 3, 7, 'yes', 1700000000)`,
++	`INSERT INTO t VALUES (20, 'a', X'00', 0.5, NULL, 0, 2.5)`,
++	`INSERT INTO t VALUES (21, 'b', X'00', 0.5, NULL, 0, X'00')`,
++}
++
++const vtypesQuery = `SELECT id, txt, b, n, x, flag, ts FROM t ORDER BY id`
++
++func mustSetupVTypesTable(t *testing.T, n *Node) {
++	t.Helper()
++	for _, s := range vtypesSetup {
++		if _, err := n.Execute(s); err != nil {
++			t.Fatalf("failed to execute %q: %v", s, err)
++		}
++	}
++}
++
++func vtypesGet(t *testing.T, n *Node, params url.Values) string {
++	t.Helper()
++	resp, err := http.Get("http://" + n.APIAddr + "/db/query?" + params.Encode())
++	if err != nil {
++		t.Fatalf("query failed: %v", err)
++	}
++	defer resp.Body.Close()
++	b, err := io.ReadAll(resp.Body)
++	if err != nil {
++		t.Fatalf("failed to read response: %v", err)
++	}
++	if resp.StatusCode != http.StatusOK {
++		t.Fatalf("unexpected status %d: %s", resp.StatusCode, b)
++	}
++	return string(b)
++}
++
++func vtypesPost(t *testing.T, n *Node, path string, params url.Values, body string) string {
++	t.Helper()
++	resp, err := http.Post("http://"+n.APIAddr+path+"?"+params.Encode(), "application/json", strings.NewReader(body))
++	if err != nil {
++		t.Fatalf("request failed: %v", err)
++	}
++	defer resp.Body.Close()
++	b, err := io.ReadAll(resp.Body)
++	if err != nil {
++		t.Fatalf("failed to read response: %v", err)
++	}
++	if resp.StatusCode != http.StatusOK {
++		t.Fatalf("unexpected status %d: %s", resp.StatusCode, b)
++	}
++	return string(b)
++}
++
++func decodeResults(t *testing.T, body string) []map[string]json.RawMessage {
++	t.Helper()
++	var r struct {
++		Results []map[string]json.RawMessage `json:"results"`
++	}
++	if err := json.Unmarshal([]byte(body), &r); err != nil {
++		t.Fatalf("failed to decode %q: %v", body, err)
++	}
++	return r.Results
++}
++
++var wantStandardVTypes = [][]string{
++	{"integer", "text", "blob", "real", "null", "integer", "text"},
++	{"integer", "blob", "text", "real", "integer", "text", "text"},
++	{"integer", "text", "blob", "real", "null", "integer", "text"},
++	{"integer", "text", "blob", "real", "null", "integer", "text"},
++}
++
++var wantAssociativeVTypes = []map[string]string{
++	{"id": "integer", "txt": "text", "b": "blob", "n": "real", "x": "null", "flag": "integer", "ts": "text"},
++	{"id": "integer", "txt": "blob", "b": "text", "n": "real", "x": "integer", "flag": "text", "ts": "text"},
++	{"id": "integer", "txt": "text", "b": "blob", "n": "real", "x": "null", "flag": "integer", "ts": "text"},
++	{"id": "integer", "txt": "text", "b": "blob", "n": "real", "x": "null", "flag": "integer", "ts": "text"},
++}
++
++func mustVTypes(t *testing.T, body string, idx int) json.RawMessage {
++	t.Helper()
++	res := decodeResults(t, body)
++	if idx >= len(res) {
++		t.Fatalf("expected at least %d results, got %d: %s", idx+1, len(res), body)
++	}
++	raw, ok := res[idx]["vtypes"]
++	if !ok {
++		t.Fatalf("no vtypes in result %d: %s", idx, body)
++	}
++	return raw
++}
++
++func mustStandard(t *testing.T, raw json.RawMessage, want [][]string) {
++	t.Helper()
++	var got [][]string
++	if err := json.Unmarshal(raw, &got); err != nil {
++		t.Fatalf("failed to decode vtypes %s: %v", raw, err)
++	}
++	if !reflect.DeepEqual(got, want) {
++		t.Fatalf("unexpected vtypes: got %v, want %v", got, want)
++	}
++}
++
++func mustAssociative(t *testing.T, raw json.RawMessage, want []map[string]string) {
++	t.Helper()
++	var got []map[string]string
++	if err := json.Unmarshal(raw, &got); err != nil {
++		t.Fatalf("failed to decode vtypes %s: %v", raw, err)
++	}
++	if !reflect.DeepEqual(got, want) {
++		t.Fatalf("unexpected vtypes: got %v, want %v", got, want)
++	}
++}
++
++// mustBeC0FE checks that a single JSON value carries the raw bytes C0 FE, which are
++// not valid UTF-8 and so cannot survive a trip through a Go string.
++func mustBeC0FE(t *testing.T, raw json.RawMessage, body string) {
++	t.Helper()
++	var enc string
++	if err := json.Unmarshal(raw, &enc); err != nil {
++		t.Fatalf("failed to decode value %s: %v", raw, err)
++	}
++	got, err := base64.StdEncoding.DecodeString(enc)
++	if err != nil || !bytes.Equal(got, []byte{0xc0, 0xfe}) {
++		t.Fatalf("bytes of the blob in the TEXT column were not preserved, got %q in %s", enc, body)
++	}
++}
++
++// mustKeepBytes checks that the TEXT-column blob in the second row of a full table
++// query reached the client intact.
++func mustKeepBytes(t *testing.T, body string) {
++	t.Helper()
++	var values [][]json.RawMessage
++	if err := json.Unmarshal(decodeResults(t, body)[0]["values"], &values); err != nil {
++		t.Fatalf("failed to decode values: %v", err)
++	}
++	if len(values) < 2 || len(values[1]) < 2 {
++		t.Fatalf("unexpected values in %s", body)
++	}
++	mustBeC0FE(t, values[1][1], body)
++}
++
++func Test_VTypes_SingleNode(t *testing.T) {
++	node := mustNewLeaderNode("node1")
++	defer node.Deprovision()
++	mustSetupVTypesTable(t, node)
++
++	t.Run("standard", func(t *testing.T) {
++		for _, level := range []string{"none", "weak", "linearizable", "strong", "auto"} {
++			body := vtypesGet(t, node, url.Values{"q": {vtypesQuery}, "vtypes": {""}, "level": {level}})
++			mustStandard(t, mustVTypes(t, body, 0), wantStandardVTypes)
++
++			mustKeepBytes(t, body)
++			var values [][]json.RawMessage
++			if err := json.Unmarshal(decodeResults(t, body)[0]["values"], &values); err != nil {
++				t.Fatalf("failed to decode values: %v", err)
++			}
++			if len(values) != len(wantStandardVTypes) {
++				t.Fatalf("level %s: vtypes has %d rows but values has %d", level, len(wantStandardVTypes), len(values))
++			}
++		}
++
++		// Without the parameter the response must not change: no vtypes key, and every
++		// value still encoded exactly as it was before the types could be requested.
++		body := vtypesGet(t, node, url.Values{"q": {vtypesQuery}})
++		if strings.Contains(body, "vtypes") {
++			t.Fatalf("vtypes present though not requested: %s", body)
++		}
++		var legacy [][]json.RawMessage
++		if err := json.Unmarshal(decodeResults(t, body)[0]["values"], &legacy); err != nil {
++			t.Fatalf("failed to decode values: %v", err)
++		}
++		for _, c := range []struct {
++			row, col int
++			want     string
++		}{
++			// A blob in a TEXT column has always been lossy here, and must stay that way.
++			{1, 1, `"\ufffd\ufffd"`},
++			{0, 2, `"wP4="`},                 // a blob is base64
++			{0, 5, `true`},                   // a BOOLEAN column
++			{0, 6, `"2024-01-02T03:04:05Z"`}, // a DATETIME column
++		} {
++			var got, want any
++			if err := json.Unmarshal(legacy[c.row][c.col], &got); err != nil {
++				t.Fatalf("failed to decode value: %v", err)
++			}
++			if err := json.Unmarshal([]byte(c.want), &want); err != nil {
++				t.Fatalf("bad expectation %s: %v", c.want, err)
++			}
++			if !reflect.DeepEqual(got, want) {
++				t.Fatalf("value at row %d column %d changed without the parameter: got %s, want %s\n%s",
++					c.row, c.col, legacy[c.row][c.col], c.want, body)
++			}
++		}
++
++		// A result with no rows carries no vtypes.
++		body = vtypesGet(t, node, url.Values{"q": {`SELECT id, txt FROM t WHERE id < 0`}, "vtypes": {""}})
++		if _, ok := decodeResults(t, body)[0]["vtypes"]; ok {
++			t.Fatalf("vtypes present for a result with no rows: %s", body)
++		}
++	})
++
++	t.Run("associative", func(t *testing.T) {
++		body := vtypesGet(t, node, url.Values{"q": {vtypesQuery}, "vtypes": {""}, "associative": {""}})
++		mustAssociative(t, mustVTypes(t, body, 0), wantAssociativeVTypes)
++
++		if body := vtypesGet(t, node, url.Values{"q": {vtypesQuery}, "associative": {""}}); strings.Contains(body, "vtypes") {
++			t.Fatalf("vtypes present though not requested: %s", body)
++		}
++	})
++
++	t.Run("unified", func(t *testing.T) {
++		stmts := `["INSERT INTO t (id, txt, b, n, x) VALUES (3, 'z', X'00', 3.5, 'q')", "SELECT id, txt, b, n, x FROM t WHERE id = 3"]`
++		body := vtypesPost(t, node, "/db/request", url.Values{"vtypes": {""}}, stmts)
++		if _, ok := decodeResults(t, body)[0]["vtypes"]; ok {
++			t.Fatalf("vtypes present in an execute result: %s", body)
++		}
++		mustStandard(t, mustVTypes(t, body, 1), [][]string{{"integer", "text", "blob", "real", "text"}})
++
++		stmts = `["INSERT INTO t (id, txt, b, n, x) VALUES (6, 'z', X'00', 3.5, 'q')", "SELECT id, txt, b, n, x FROM t WHERE id = 6"]`
++		body = vtypesPost(t, node, "/db/request", url.Values{"vtypes": {""}, "associative": {""}}, stmts)
++		mustAssociative(t, mustVTypes(t, body, 1), []map[string]string{
++			{"id": "integer", "txt": "text", "b": "blob", "n": "real", "x": "text"},
++		})
++	})
++
++	t.Run("temporal", func(t *testing.T) {
++		for _, stmt := range []string{
++			`CREATE TABLE tt (d DATE, dt DATETIME, ts TIMESTAMP)`,
++			`INSERT INTO tt VALUES (X'00', 1700000000, 2.5)`,
++			`INSERT INTO tt VALUES (1700000000, 2.5, X'00')`,
++			// A NULL is a null whatever the column declares.
++			`INSERT INTO tt VALUES (NULL, NULL, NULL)`,
++		} {
++			if _, err := node.Execute(stmt); err != nil {
++				t.Fatalf("failed to execute %q: %v", stmt, err)
++			}
++		}
++
++		body := vtypesGet(t, node, url.Values{"q": {`SELECT d, dt, ts FROM tt`}, "vtypes": {""}})
++		mustStandard(t, mustVTypes(t, body, 0), [][]string{
++			{"text", "text", "text"},
++			{"text", "text", "text"},
++			{"null", "null", "null"},
++		})
++
++		body = vtypesGet(t, node, url.Values{"q": {`SELECT d, dt, ts FROM tt LIMIT 1`}, "vtypes": {""}, "associative": {""}})
++		mustAssociative(t, mustVTypes(t, body, 0), []map[string]string{
++			{"d": "text", "dt": "text", "ts": "text"},
++		})
++	})
++
++	t.Run("shell", func(t *testing.T) {
++		bin := filepath.Join(t.TempDir(), "rqlite")
++		build := exec.Command("go", "build", "-o", bin, "./cmd/rqlite")
++		build.Dir = ".."
++		if out, err := build.CombinedOutput(); err != nil {
++			t.Fatalf("failed to build the shell: %v\n%s", err, out)
++		}
++
++		host, port, err := net.SplitHostPort(node.APIAddr)
++		if err != nil {
++			t.Fatalf("failed to split %q: %v", node.APIAddr, err)
++		}
++		run := func(script string) string {
++			cmd := exec.Command(bin, "-H", host, "-p", port)
++			cmd.Stdin = strings.NewReader(script + ".quit\n")
++			out, err := cmd.CombinedOutput()
++			if err != nil {
++				t.Fatalf("the shell failed for %q: %v\n%s", script, err, out)
++			}
++			return string(out)
++		}
++		// Any spacing between a value and its type is accepted.
++		typed := func(value, vtype string) *regexp.Regexp {
++			return regexp.MustCompile(regexp.QuoteMeta(value) + `\s*\(` + vtype + `\)`)
++		}
++
++		// Row 2 holds a blob in the TEXT column and text in the BLOB column, so a shell
++		// that fell back to the declared column types would report both the wrong way
++		// round. Both values print as the same base64 text, so each is queried alone.
++		blobInText := "SELECT txt FROM t WHERE id = 2\n"
++		textInBlob := "SELECT b FROM t WHERE id = 2\n"
++		wantBlob, wantText := typed("wP4=", "blob"), typed("wP4=", "text")
++
++		// The setting is off until it is turned on.
++		if out := run(blobInText); wantBlob.MatchString(out) || wantText.MatchString(out) {
++			t.Fatalf("the shell showed a type though the setting is off:\n%s", out)
++		}
++
++		for _, mode := range []string{"column", "line", "csv", "json"} {
++			out := run(".vtypes on\n.mode " + mode + "\n" + blobInText)
++			if !wantBlob.MatchString(out) || wantText.MatchString(out) {
++				t.Fatalf("%s output does not report the blob in the TEXT column:\n%s", mode, out)
++			}
++			out = run(".vtypes on\n.mode " + mode + "\n" + textInBlob)
++			if !wantText.MatchString(out) || wantBlob.MatchString(out) {
++				t.Fatalf("%s output does not report the text in the BLOB column:\n%s", mode, out)
++			}
++		}
++
++		// Values of every type are labelled, not only the text and blob ones.
++		scalars := "SELECT NULL AS n, 7 AS i, 1.5 AS r\n"
++		for _, mode := range []string{"column", "line", "csv", "json"} {
++			out := run(".vtypes on\n.mode " + mode + "\n" + scalars)
++			// However the shell spells a null value, its type must be shown against it.
++			anyNull := regexp.MustCompile(`\S+\s*\(null\)`)
++			for _, want := range []*regexp.Regexp{anyNull, typed("7", "integer"), typed("1.5", "real")} {
++				if !want.MatchString(out) {
++					t.Fatalf("%s output does not label every value:\n%s", mode, out)
++				}
++			}
++		}
++
++		// Statements the shell issues itself carry the setting too.
++		if out := run(".vtypes on\n.tables\n"); !typed("t", "text").MatchString(out) {
++			t.Fatalf(".tables output does not show the types:\n%s", out)
++		}
++
++		// So do statements read from a file.
++		sqlFile := filepath.Join(t.TempDir(), "q.sql")
++		if err := os.WriteFile(sqlFile, []byte(blobInText), 0644); err != nil {
++			t.Fatalf("failed to write %s: %v", sqlFile, err)
++		}
++		if out := run(".vtypes on\n.read " + sqlFile + "\n"); !wantBlob.MatchString(out) {
++			t.Fatalf(".read output does not show the types:\n%s", out)
++		}
++
++		// And turning it back off restores the plain display.
++		if out := run(".vtypes on\n.vtypes off\n" + blobInText); wantBlob.MatchString(out) || wantText.MatchString(out) {
++			t.Fatalf("the shell showed a type after the setting was turned off:\n%s", out)
++		}
++	})
++
++	t.Run("computed", func(t *testing.T) {
++		// A value a query builds is reported by its storage class too.
++		body := vtypesGet(t, node, url.Values{"q": {`SELECT CAST(7 AS TEXT), CAST('3.5' AS REAL), length(X'c0fe')`}, "vtypes": {""}})
++		mustStandard(t, mustVTypes(t, body, 0), [][]string{{"text", "real", "integer"}})
++
++		// Text a query computes from a blob keeps those bytes as well.
++		body = vtypesGet(t, node, url.Values{"q": {`SELECT CAST(X'c0fe' AS TEXT)`}, "vtypes": {""}})
++		mustStandard(t, mustVTypes(t, body, 0), [][]string{{"text"}})
++		var values [][]json.RawMessage
++		if err := json.Unmarshal(decodeResults(t, body)[0]["values"], &values); err != nil {
++			t.Fatalf("failed to decode values: %v", err)
++		}
++		if len(values) != 1 || len(values[0]) != 1 {
++			t.Fatalf("expected a single computed value in %s", body)
++		}
++		mustBeC0FE(t, values[0][0], body)
++	})
++
++	t.Run("execute", func(t *testing.T) {
++		stmts := `["INSERT INTO t (id, txt, b, n, x) VALUES (7, 'z', X'00', 3.5, 'q') RETURNING id, txt, b, n, x"]`
++		body := vtypesPost(t, node, "/db/execute", url.Values{"vtypes": {""}}, stmts)
++		mustStandard(t, mustVTypes(t, body, 0), [][]string{{"integer", "text", "blob", "real", "text"}})
++
++		stmts = `["INSERT INTO t (id, txt, b, n, x) VALUES (8, 'z', X'00', 3.5, 'q') RETURNING id, txt, b, n, x"]`
++		body = vtypesPost(t, node, "/db/execute", url.Values{"vtypes": {""}, "associative": {""}}, stmts)
++		mustAssociative(t, mustVTypes(t, body, 0), []map[string]string{
++			{"id": "integer", "txt": "text", "b": "blob", "n": "real", "x": "text"},
++		})
++
++		// A statement that returns no rows carries no vtypes.
++		stmts = `["INSERT INTO t (id, txt) VALUES (9, 'z')"]`
++		body = vtypesPost(t, node, "/db/execute", url.Values{"vtypes": {""}}, stmts)
++		if _, ok := decodeResults(t, body)[0]["vtypes"]; ok {
++			t.Fatalf("vtypes present in an execute result: %s", body)
++		}
++
++		// Rows returned without the parameter carry no vtypes on either endpoint.
++		for i, path := range []string{"/db/execute", "/db/request"} {
++			stmts = `["INSERT INTO t (id, txt) VALUES (` + fmt.Sprint(40+i) + `, 'z') RETURNING id, txt"]`
++			body = vtypesPost(t, node, path, url.Values{}, stmts)
++			res := decodeResults(t, body)[0]
++			if msg, ok := res["error"]; ok {
++				t.Fatalf("%s returned an error: %s", path, msg)
++			}
++			var returned [][]json.RawMessage
++			if err := json.Unmarshal(res["values"], &returned); err != nil || len(returned) != 1 {
++				t.Fatalf("%s returned no row: %s", path, body)
++			}
++			if _, ok := res["vtypes"]; ok {
++				t.Fatalf("vtypes present in a %s result though not requested: %s", path, body)
++			}
++		}
++	})
++
++	t.Run("returning", func(t *testing.T) {
++		stmts := `["INSERT INTO t (id, txt, b, n, x) VALUES (4, 'r', X'00', 4.5, NULL) RETURNING id, txt, b, n, x"]`
++		body := vtypesPost(t, node, "/db/request", url.Values{"vtypes": {""}}, stmts)
++		mustStandard(t, mustVTypes(t, body, 0), [][]string{{"integer", "text", "blob", "real", "null"}})
++
++		stmts = `["INSERT INTO t (id, txt, b, n, x) VALUES (5, 'r', X'00', 4.5, NULL) RETURNING id, txt, b, n, x"]`
++		body = vtypesPost(t, node, "/db/request", url.Values{"vtypes": {""}, "associative": {""}}, stmts)
++		mustAssociative(t, mustVTypes(t, body, 0), []map[string]string{
++			{"id": "integer", "txt": "text", "b": "blob", "n": "real", "x": "null"},
++		})
++	})
++}
++
++func Test_VTypes_FollowerForwarding(t *testing.T) {
++	leader := mustNewLeaderNode("leader")
++	defer leader.Deprovision()
++	mustSetupVTypesTable(t, leader)
++
++	follower := mustNewNode("follower", false)
++	defer follower.Deprovision()
++	if err := follower.Join(leader); err != nil {
++		t.Fatalf("follower failed to join leader: %v", err)
++	}
++	if _, err := follower.WaitForLeader(); err != nil {
++		t.Fatalf("follower never saw a leader: %v", err)
++	}
++	for range 3 {
++		leader.Noop("vtypes")
++	}
++
++	// Allow the follower a bounded amount of time to start serving the request.
++	var body string
++	if !trueOrTimeout(func() bool {
++		resp, err := http.Get("http://" + follower.APIAddr + "/db/query?" +
++			url.Values{"q": {vtypesQuery}, "vtypes": {""}, "level": {"weak"}}.Encode())
++		if err != nil {
++			return false
++		}
++		defer resp.Body.Close()
++		b, _ := io.ReadAll(resp.Body)
++		body = string(b)
++		return resp.StatusCode == http.StatusOK && strings.Contains(body, `"values"`)
++	}, 20*time.Second) {
++		t.Fatalf("follower never served the query, last response: %s", body)
++	}
++	mustStandard(t, mustVTypes(t, body, 0), wantStandardVTypes)
++	mustKeepBytes(t, body)
++
++	// Reads that go through the leader for a different reason must behave the same.
++	for _, level := range []string{"none", "strong", "linearizable", "auto"} {
++		body = vtypesGet(t, follower, url.Values{"q": {vtypesQuery}, "vtypes": {""}, "level": {level}})
++		mustStandard(t, mustVTypes(t, body, 0), wantStandardVTypes)
++		mustKeepBytes(t, body)
++	}
++
++	// A write forwarded to the leader returns its rows the same way.
++	body = vtypesPost(t, follower, "/db/execute", url.Values{"vtypes": {""}},
++		`["INSERT INTO t (id, txt) VALUES (30, X'c0fe') RETURNING id, txt"]`)
++	mustStandard(t, mustVTypes(t, body, 0), [][]string{{"integer", "blob"}})
++	var returned [][]json.RawMessage
++	if err := json.Unmarshal(decodeResults(t, body)[0]["values"], &returned); err != nil {
++		t.Fatalf("failed to decode values: %v", err)
++	}
++	if len(returned) != 1 || len(returned[0]) != 2 {
++		t.Fatalf("the forwarded write returned no row: %s", body)
++	}
++	mustBeC0FE(t, returned[0][1], body)
++}
++
++// Test_VTypes_CDC checks that change data capture events report the type of every
++// value they carry, keyed by column name.
++func Test_VTypes_CDC(t *testing.T) {
++	node := mustNewLeaderNode("cdcnode")
++	defer node.Deprovision()
++
++	endpoint := cdctest.NewHTTPTestServer()
++	endpoint.Start()
++	defer endpoint.Close()
++
++	cdcCluster := cdc.NewCDCCluster(node.Store, node.Cluster, node.Client)
++	svc, err := cdc.NewService(node.ID, node.Dir, cdcCluster, mustCDCConfig(endpoint.URL()))
++	if err != nil {
++		t.Fatalf("failed to create CDC service: %v", err)
++	}
++	node.CDC = svc
++	node.CDC.Start()
++	node.CDC.SetLeader(true)
++	node.Store.EnableCDC(node.CDC.C(), nil, false)
++
++	for _, stmt := range []string{
++		`CREATE TABLE c (id INTEGER, txt TEXT, b BLOB, ts DATETIME)`,
++		// The TEXT column holds a blob and the BLOB column holds text, so the declared
++		// column types cannot stand in for the types of these values.
++		// ts holds an integer, but a date-like column always reports text.
++		`INSERT INTO c VALUES (1, X'c0fe', 'hi', 1700000000)`,
++		// A NULL is a null whatever the column declares.
++		`INSERT INTO c VALUES (2, NULL, NULL, NULL)`,
++		// A BLOB column has no affinity, so this stores an integer where text was.
++		`UPDATE c SET b = 5 WHERE id = 1`,
++	} {
++		if _, err := node.Execute(stmt); err != nil {
++			t.Fatalf("failed to execute %q: %v", stmt, err)
++		}
++	}
++
++	// Collect the types of every event delivered to the endpoint.
++	var got []map[string]any
++	testPoll(t, func() (bool, error) {
++		got = got[:0]
++		for _, req := range endpoint.GetRequests() {
++			var env struct {
++				Payload []struct {
++					Events []map[string]any `json:"events"`
++				} `json:"payload"`
++			}
++			if err := json.Unmarshal(req, &env); err != nil {
++				return false, err
++			}
++			for _, m := range env.Payload {
++				got = append(got, m.Events...)
++			}
++		}
++		return len(got) >= 3, nil
++	}, 100*time.Millisecond, 20*time.Second)
++
++	mustTypes := func(ev map[string]any, key string, want map[string]string) {
++		t.Helper()
++		raw, ok := ev[key]
++		if !ok {
++			t.Fatalf("event carries no %s: %v", key, ev)
++		}
++		m, _ := raw.(map[string]any)
++
++		// The types must describe every column of the row image they belong to.
++		image, _ := ev[strings.TrimSuffix(key, "_types")].(map[string]any)
++		if len(image) != len(m) {
++			t.Fatalf("%s has %d columns but its row image has %d: %v", key, len(m), len(image), ev)
++		}
++		for col := range image {
++			if _, ok := m[col]; !ok {
++				t.Fatalf("%s has no entry for column %q: %v", key, col, ev)
++			}
++		}
++		for col, wantType := range want {
++			if m[col] != wantType {
++				t.Fatalf("%s[%s] is %v, want %s: %v", key, col, m[col], wantType, ev)
++			}
++		}
++	}
++
++	mustTypes(got[0], "after_types", map[string]string{"id": "integer", "txt": "blob", "b": "text", "ts": "text"})
++	mustTypes(got[1], "after_types", map[string]string{"id": "integer", "txt": "null", "b": "null", "ts": "null"})
++	mustTypes(got[2], "before_types", map[string]string{"txt": "blob", "b": "text"})
++	mustTypes(got[2], "after_types", map[string]string{"txt": "blob", "b": "integer"})
++}
+diff --git a/test.sh b/test.sh
+new file mode 100755
+index 00000000..81e216a5
+--- /dev/null
++++ b/test.sh
+@@ -0,0 +1,57 @@
++#!/usr/bin/env bash
++# Test runner for the per-value "vtypes" query option.
++#
++# Usage:
++#   ./test.sh [--output_path <junit.xml>] <base|new>
++#
++# base  runs the pre-existing db, command, http, rqlite shell and CDC suites. Must pass
++#       both before and after the solution.
++# new   runs the new end-to-end tests for the vtypes option against real nodes,
++#       including a follower forwarding the request to the leader and the rqlite
++#       shell driven as a subprocess.
++set -uo pipefail
++
++cd /app
++
++OUTPUT_PATH=""
++if [ "${1:-}" = "--output_path" ]; then
++  OUTPUT_PATH="$2"
++  shift 2
++fi
++
++MODE="${1:-new}"
++
++TEST_LOG="$(mktemp)"
++STATUS=0
++
++run_tests() {
++  go test -count=1 -v "$@" 2>&1 | tee -a "$TEST_LOG"
++  status=${PIPESTATUS[0]}
++  if [ "$status" -ne 0 ]; then
++    STATUS=$status
++  fi
++}
++
++case "$MODE" in
++  base)
++    run_tests -timeout 600s ./db/... ./command/... ./http/... ./cmd/rqlite/... ./cdc/...
++    ;;
++  new)
++    run_tests -timeout 600s -run '^Test_VTypes_' ./system_test/
++    ;;
++  *)
++    echo "unknown mode: $MODE (expected base or new)" >&2
++    exit 2
++    ;;
++esac
++
++if [ -n "$OUTPUT_PATH" ]; then
++  go-junit-report -set-exit-code < "$TEST_LOG" > "$OUTPUT_PATH"
++  junit_status=$?
++  if [ "$junit_status" -ne 0 ] && [ "$STATUS" -eq 0 ]; then
++    echo "go-junit-report failed to convert the test log (exit $junit_status)" >&2
++    STATUS=$junit_status
++  fi
++fi
++
++exit "$STATUS"

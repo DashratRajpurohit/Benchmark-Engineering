@@ -1,0 +1,201 @@
+{
+ "allPassing": false,
+ "computedDifficulty": "hard",
+ "criteria": [
+  {
+   "description": "No agent run flagged the task as unfair or broken",
+   "detail": "No fairness issues",
+   "id": "fair",
+   "label": "Fair task",
+   "preview": true,
+   "status": "pass"
+  },
+  {
+   "description": "At least 1 agent run must solve the problem",
+   "detail": "2/10 solved",
+   "id": "solvable",
+   "label": "Solvable",
+   "preview": true,
+   "status": "pass"
+  },
+  {
+   "description": "At least 4 runs must complete on each of Nova, Orion and Vega",
+   "id": "codenameCoverage",
+   "label": "Rollouts on every model",
+   "preview": true,
+   "status": "pending"
+  },
+  {
+   "description": "Exactly one of Nova, Orion or Vega solves it, more than 0% and at most 25% of the time; the other two stay at 0%",
+   "id": "passStructure",
+   "label": "Solved by one model only",
+   "preview": true,
+   "status": "pending"
+  },
+  {
+   "description": "Nova runs must average more than 400K tokens of sequence length",
+   "id": "novaSequenceLength",
+   "label": "Long horizon",
+   "preview": true,
+   "status": "pending"
+  },
+  {
+   "description": "Cheat rate must be below 20% (across all agents)",
+   "detail": "No cheating detected",
+   "id": "noCheating",
+   "label": "No cheating",
+   "preview": true,
+   "status": "pass"
+  },
+  {
+   "description": "No run should be blocked by environment or verifier issues",
+   "detail": "No environment blockers detected",
+   "id": "noEnvBlocker",
+   "label": "No environment blockers",
+   "preview": true,
+   "status": "pass"
+  },
+  {
+   "description": "Passing runs must hold up under the false-positive review panel",
+   "detail": "Passed with caveats",
+   "guidance": "The panel upheld the pass but flagged caveats \u2014 a dissenting judge, a run it couldn't review, or an inconclusive verdict. Not blocking; a reviewer may want to read the panel notes.",
+   "id": "noFalsePositives",
+   "label": "No false positives",
+   "preview": true,
+   "status": "warn"
+  }
+ ],
+ "currentSubmissionType": "olympus",
+ "marsAllPassing": null,
+ "marsCriteria": null,
+ "observedPassRate": 0.2,
+ "olympusV2": true,
+ "olympusV2Pools": {
+  "nova": {
+   "avgPassSequenceLength": null,
+   "avgSequenceLength": null,
+   "codename": "Nova",
+   "measured": 0,
+   "passRate": null,
+   "passes": 0,
+   "passesMeasured": 0,
+   "running": 0,
+   "working": 0
+  },
+  "strong": [
+   {
+    "avgPassSequenceLength": null,
+    "avgSequenceLength": null,
+    "codename": "Orion",
+    "measured": 0,
+    "passRate": null,
+    "passes": 0,
+    "passesMeasured": 0,
+    "running": 0,
+    "working": 0
+   },
+   {
+    "avgPassSequenceLength": null,
+    "avgSequenceLength": null,
+    "codename": "Vega",
+    "measured": 0,
+    "passRate": null,
+    "passes": 0,
+    "passesMeasured": 0,
+    "running": 0,
+    "working": 0
+   }
+  ]
+ },
+ "viewer": {
+  "isBeginner": false,
+  "marsLocked": true,
+  "olympusLocked": false,
+  "unlockTierName": null
+ },
+ "readiness": [
+  {
+   "detail": "5/5 passing, repository verification expired \u2014 re-run checks",
+   "id": "prechecks",
+   "label": "Prechecks",
+   "stale": true,
+   "status": "fail"
+  },
+  {
+   "id": "scopeGate",
+   "label": "Scope Gate",
+   "status": "pass",
+   "verdict": "pass"
+  },
+  {
+   "detail": "7/7 passing",
+   "id": "dynamicChecks",
+   "label": "Quality Checks",
+   "stale": false,
+   "status": "pass"
+  },
+  {
+   "detail": "No fairness issues",
+   "id": "agentFair",
+   "label": "Fair task",
+   "status": "pass"
+  },
+  {
+   "detail": "2/10 solved",
+   "id": "agentSolvable",
+   "label": "Solvable",
+   "status": "pass"
+  },
+  {
+   "id": "agentCodenameCoverage",
+   "label": "Rollouts on every model",
+   "status": "pending"
+  },
+  {
+   "id": "agentPassStructure",
+   "label": "Solved by one model only",
+   "status": "pending"
+  },
+  {
+   "id": "agentNovaSequenceLength",
+   "label": "Long horizon",
+   "status": "pending"
+  },
+  {
+   "detail": "No cheating detected",
+   "id": "agentNoCheating",
+   "label": "No cheating",
+   "status": "pass"
+  },
+  {
+   "detail": "No environment blockers detected",
+   "id": "agentNoEnvBlocker",
+   "label": "No environment blockers",
+   "status": "pass"
+  },
+  {
+   "detail": "Passed with caveats",
+   "id": "agentNoFalsePositives",
+   "label": "No false positives",
+   "status": "warn"
+  },
+  {
+   "detail": "approved",
+   "id": "autoReview",
+   "label": "Auto Review",
+   "status": "pass"
+  },
+  {
+   "detail": "image rebuilds hermetically",
+   "id": "rebuildSafe",
+   "label": "Rebuild-safe",
+   "status": "pass"
+  },
+  {
+   "detail": "image deep-rebuilds from clean source + vendored deps",
+   "id": "harborSafe",
+   "label": "Harbor rebuild-safe",
+   "status": "pass"
+  }
+ ]
+}

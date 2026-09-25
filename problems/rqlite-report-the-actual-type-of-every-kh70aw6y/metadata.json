@@ -1,0 +1,17 @@
+{
+  "problemId": "kh70aw6yf64c74btwsdxeecy0h8erez8",
+  "title": "Report the actual type of every returned value with a vtypes query option",
+  "status": "accepted",
+  "version": 6,
+  "versionId": "kd7ahjhf53dygs40zgyqwf8scx8ey340",
+  "isLocked": true,
+  "language": "go",
+  "difficulty": null,
+  "category": "feature_request",
+  "repoUrl": "https://github.com/rqlite/rqlite",
+  "commitHash": "f7dcf0f0c1e7da3378248f0a0a1593b079a1c2e4",
+  "githubIssueUrl": null,
+  "estimatedLOC": null,
+  "testOutputMode": null,
+  "downloadedAt": "2026-10-24T17:10:22.257Z"
+}
