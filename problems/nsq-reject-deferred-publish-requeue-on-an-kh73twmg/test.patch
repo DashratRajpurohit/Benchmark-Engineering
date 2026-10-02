@@ -1,0 +1,1335 @@
+diff --git a/nsqd/deferred_exit_race_9c3f21_test.go b/nsqd/deferred_exit_race_9c3f21_test.go
+new file mode 100644
+index 0000000..a566175
+--- /dev/null
++++ b/nsqd/deferred_exit_race_9c3f21_test.go
+@@ -0,0 +1,1257 @@
++package nsqd
++
++import (
++	"fmt"
++	"io"
++	"net"
++	"net/http"
++	"net/url"
++	"os"
++	"path/filepath"
++	"reflect"
++	"strconv"
++	"strings"
++	"sync"
++	"sync/atomic"
++	"testing"
++	"time"
++
++	"github.com/nsqio/go-nsq"
++	"github.com/nsqio/nsq/internal/lg"
++	"github.com/nsqio/nsq/internal/test"
++)
++
++const runDeferredExitTestsEnv = "NSQ_RUN_DEFERRED_EXIT_TESTS"
++
++// holdDeletion is how long the SUB tests keep a deletion in progress: longer
++// than any short fixed retry.
++const holdDeletion = 520 * time.Millisecond
++
++func skipUnlessEnabled(t *testing.T) {
++	t.Helper()
++	if os.Getenv(runDeferredExitTestsEnv) == "" {
++		t.Skipf("set %s=1 to run", runDeferredExitTestsEnv)
++	}
++}
++
++func mustSetupDeferredExitChannel(t *testing.T) (*NSQD, *Topic, *Channel) {
++	t.Helper()
++	opts := NewOptions()
++	opts.Logger = test.NewTestLogger(t)
++	_, _, n := mustStartNSQD(opts)
++	t.Cleanup(func() { _ = os.RemoveAll(opts.DataPath) })
++	t.Cleanup(n.Exit)
++
++	topicName := "test_deferred_exit_race_" + strconv.Itoa(int(time.Now().UnixNano()))
++	topic := n.GetTopic(topicName)
++	channel := callGetChannel(topic, "ch")
++	return n, topic, channel
++}
++
++func startDeferredExitNSQD(t *testing.T) (net.Addr, net.Addr, *NSQD) {
++	t.Helper()
++	opts := NewOptions()
++	// Client goroutines can log after the test returns; t.Log would panic.
++	opts.Logger = lg.NilLogger{}
++	tcpAddr, httpAddr, n := mustStartNSQD(opts)
++	t.Cleanup(func() { _ = os.RemoveAll(opts.DataPath) })
++	t.Cleanup(n.Exit)
++	return tcpAddr, httpAddr, n
++}
++
++// Topic.GetChannel may return the channel alone or with an error; a nil
++// channel means it could not be created.
++func callGetChannel(t *Topic, name string) *Channel {
++	results := reflect.ValueOf(t.GetChannel).Call([]reflect.Value{reflect.ValueOf(name)})
++	return results[0].Interface().(*Channel)
++}
++
++var deferDelays = []time.Duration{30 * time.Millisecond, 250 * time.Millisecond, 5 * time.Second}
++
++// Channel.PutMessageDeferred may or may not return an error; returning none
++// counts as accepting the message.
++func callPutMessageDeferred(c *Channel, msg *Message, timeout time.Duration) error {
++	results := reflect.ValueOf(c.PutMessageDeferred).Call([]reflect.Value{
++		reflect.ValueOf(msg), reflect.ValueOf(timeout),
++	})
++	if len(results) == 0 || results[0].IsNil() {
++		return nil
++	}
++	return results[0].Interface().(error)
++}
++
++func deferredCount(c *Channel) int {
++	return NewChannelStats(c, nil, 0).DeferredCount
++}
++
++func requireNothingDeferred(t *testing.T, c *Channel, call string) {
++	t.Helper()
++	if got := deferredCount(c); got != 0 {
++		t.Fatalf("%s was rejected but left %d message(s) deferred on the exiting "+
++			"channel, which are never flushed or delivered", call, got)
++	}
++}
++
++// Close writes every message a channel still holds to its backend, so an nsqd
++// restarted on the same data path delivers them.
++func requireDeliveredAfterRestart(t *testing.T, n *NSQD, topicName, channelName string, ids ...MessageID) map[MessageID]*Message {
++	t.Helper()
++	n.Exit()
++	opts := NewOptions()
++	opts.Logger = test.NewTestLogger(t)
++	opts.DataPath = n.getOpts().DataPath
++	tcpAddr, _, restarted := mustStartNSQD(opts)
++	t.Cleanup(restarted.Exit)
++
++	conn, err := mustConnectNSQD(tcpAddr)
++	test.Nil(t, err)
++	t.Cleanup(func() { _ = conn.Close() })
++	_ = conn.SetDeadline(time.Now().Add(5 * time.Second))
++	identify(t, conn, nil, frameTypeResponse)
++	_, err = nsq.Subscribe(topicName, channelName).WriteTo(conn)
++	test.Nil(t, err)
++	readValidate(t, conn, frameTypeResponse, "OK")
++	// finish each message as it arrives, so more can follow than one RDY
++	// count allows in flight
++	ready := len(ids)
++	if limit := int(opts.MaxRdyCount); ready > limit {
++		ready = limit
++	}
++	_, err = nsq.Ready(ready).WriteTo(conn)
++	test.Nil(t, err)
++
++	want := make(map[MessageID]bool, len(ids))
++	for _, id := range ids {
++		want[id] = true
++	}
++	got := make(map[MessageID]*Message, len(ids))
++	for range ids {
++		resp, err := nsq.ReadResponse(conn)
++		if err != nil {
++			t.Fatalf("after a restart, %s/%s delivered %d of the %d messages it held "+
++				"when it was closed; the rest were lost (%s)",
++				topicName, channelName, len(ids)-len(want), len(ids), err)
++		}
++		frameType, data, _ := nsq.UnpackResponse(resp)
++		test.Equal(t, frameTypeMessage, frameType)
++		msg, err := decodeMessage(data)
++		test.Nil(t, err)
++		if !want[msg.ID] {
++			t.Fatalf("after a restart, %s/%s delivered unexpected message %s", topicName, channelName, msg.ID)
++		}
++		delete(want, msg.ID)
++		got[msg.ID] = msg
++		_, err = nsq.Finish(nsq.MessageID(msg.ID)).WriteTo(conn)
++		test.Nil(t, err)
++	}
++	return got
++}
++
++// holdExit is how long the "while" cases below keep a channel's Close or
++// Delete in progress. It only bounds how long a correct call waits: a call
++// that is rejected, whether at once or once the exit finishes, passes either
++// way.
++const holdExit = 100 * time.Millisecond
++
++// channelExit is a way a channel stops taking messages, Close (as at
++// shutdown) or Delete, checked once it has returned or while it is still in
++// progress: the channel is already exiting but not yet flushed or emptied.
++type channelExit struct {
++	name   string
++	delete bool
++	during bool
++}
++
++var (
++	closeExits  = []channelExit{{"after close", false, false}, {"while closing", false, true}}
++	deleteExits = []channelExit{{"after delete", true, false}, {"while deleting", true, true}}
++	// inFlightExits leaves out "after delete": Delete has emptied the
++	// in-flight messages by then, so none is left to re-register.
++	inFlightExits = []channelExit{closeExits[0], closeExits[1], deleteExits[1]}
++)
++
++// start closes or deletes c. In an "after" case it returns once that has
++// finished. In a "while" case it returns as soon as c is exiting, with the
++// exit held by a consumer whose Close blocks for holdExit; finish then waits
++// for the exit to complete.
++func (e channelExit) start(t *testing.T, c *Channel) (finish func()) {
++	t.Helper()
++	exit := c.Close
++	if e.delete {
++		exit = c.Delete
++	}
++	if !e.during {
++		test.Nil(t, exit())
++		return func() {}
++	}
++	holder := newDeletionHolder()
++	test.Nil(t, c.AddClient(1000, holder))
++	exited := make(chan error, 1)
++	inBackground(t, holder, func() { exited <- exit() })
++	holder.awaitClosing(t, "channel exit")
++	time.AfterFunc(holdExit, holder.Release)
++	return func() {
++		t.Helper()
++		select {
++		case err := <-exited:
++			test.Nil(t, err)
++		case <-time.After(5 * time.Second):
++			t.Fatalf("channel exit never finished")
++		}
++	}
++}
++
++func TestPutMessageDeferredAfterCloseRejected(t *testing.T) {
++	skipUnlessEnabled(t)
++	testPutMessageDeferredRejected(t, closeExits)
++}
++
++func TestPutMessageDeferredAfterDeleteRejected(t *testing.T) {
++	skipUnlessEnabled(t)
++	testPutMessageDeferredRejected(t, deleteExits)
++}
++
++func testPutMessageDeferredRejected(t *testing.T, exits []channelExit) {
++	for _, e := range exits {
++		t.Run(e.name, func(t *testing.T) {
++			for _, d := range deferDelays {
++				_, topic, channel := mustSetupDeferredExitChannel(t)
++
++				finish := e.start(t, channel)
++				err := callPutMessageDeferred(channel, NewMessage(topic.GenerateID(), []byte("deferred")), d)
++				finish()
++
++				if err := channel.PutMessage(NewMessage(topic.GenerateID(), []byte("fresh"))); err == nil {
++					t.Fatalf("expected PutMessage to reject %s", e.name)
++				}
++				if err == nil {
++					t.Fatalf("expected PutMessageDeferred(%v) to reject %s, just like "+
++						"PutMessage does -- a message accepted here is never written to "+
++						"backend or delivered", d, e.name)
++				}
++				requireNothingDeferred(t, channel, "PutMessageDeferred")
++			}
++			if e.during && !e.delete {
++				raceDeferredPublishesWithClose(t)
++			}
++		})
++	}
++}
++
++// raceDeferredPublishesWithClose closes a channel while publishers keep
++// making deferred publishes to it, until one is rejected: each accepted
++// publish must be among the messages Close writes out.
++func raceDeferredPublishesWithClose(t *testing.T) {
++	t.Helper()
++	const (
++		publishers   = 32
++		perPublisher = 100
++	)
++	for round := 0; round < 20; round++ {
++		n, topic, channel := mustSetupDeferredExitChannel(t)
++
++		start := make(chan struct{})
++		accepted := make(chan MessageID, publishers*perPublisher)
++		publishing := make(chan struct{}, publishers*perPublisher)
++		var wg sync.WaitGroup
++		for i := 0; i < publishers; i++ {
++			wg.Add(1)
++			go func() {
++				defer wg.Done()
++				<-start
++				for j := 0; j < perPublisher; j++ {
++					msg := NewMessage(topic.GenerateID(), []byte("racing"))
++					if callPutMessageDeferred(channel, msg, time.Minute) != nil {
++						return
++					}
++					accepted <- msg.ID
++					publishing <- struct{}{}
++				}
++			}()
++		}
++		closed := make(chan error, 1)
++		go func() {
++			// close once every publisher is under way
++			for i := 0; i < publishers; i++ {
++				<-publishing
++			}
++			closed <- channel.Close()
++		}()
++		close(start)
++		wg.Wait()
++		select {
++		case err := <-closed:
++			test.Nil(t, err)
++		case <-time.After(5 * time.Second):
++			t.Fatalf("channel close never finished")
++		}
++		close(accepted)
++
++		var ids []MessageID
++		for id := range accepted {
++			ids = append(ids, id)
++		}
++		requireDeliveredAfterRestart(t, n, topic.name, "ch", ids...)
++	}
++}
++
++func TestRequeueMessageDeferredAfterCloseRejected(t *testing.T) {
++	skipUnlessEnabled(t)
++	for _, e := range inFlightExits {
++		t.Run(e.name, func(t *testing.T) {
++			for _, d := range deferDelays {
++				n, topic, channel := mustSetupDeferredExitChannel(t)
++
++				const clientID = int64(7)
++				deferred := NewMessage(topic.GenerateID(), []byte("deferred"))
++				test.Nil(t, channel.StartInFlightTimeout(deferred, clientID, time.Minute))
++				immediate := NewMessage(topic.GenerateID(), []byte("immediate"))
++				test.Nil(t, channel.StartInFlightTimeout(immediate, clientID, time.Minute))
++
++				finish := e.start(t, channel)
++				errDeferred := channel.RequeueMessage(clientID, deferred.ID, d)
++				errImmediate := channel.RequeueMessage(clientID, immediate.ID, 0)
++				finish()
++
++				if errImmediate == nil {
++					t.Fatalf("expected an immediate requeue to reject %s", e.name)
++				}
++				if errDeferred == nil {
++					t.Fatalf("expected a deferred requeue (%v) to reject %s, just like an "+
++						"immediate requeue does", d, e.name)
++				}
++				requireNothingDeferred(t, channel, "a deferred requeue")
++				if !e.delete {
++					// both messages were still in flight, so Close persisted them
++					requireDeliveredAfterRestart(t, n, topic.name, "ch", deferred.ID, immediate.ID)
++				}
++			}
++		})
++	}
++}
++
++func TestTouchMessageAfterCloseRejected(t *testing.T) {
++	skipUnlessEnabled(t)
++	for _, e := range inFlightExits {
++		t.Run(e.name, func(t *testing.T) {
++			n, topic, channel := mustSetupDeferredExitChannel(t)
++
++			const clientID = int64(3)
++			msg := NewMessage(topic.GenerateID(), []byte("touched"))
++			test.Nil(t, channel.StartInFlightTimeout(msg, clientID, time.Minute))
++
++			finish := e.start(t, channel)
++			err := channel.TouchMessage(clientID, msg.ID, time.Minute)
++			finish()
++
++			if err == nil {
++				t.Fatalf("expected TouchMessage to reject %s", e.name)
++			}
++			if !e.delete {
++				// the message was still in flight, so Close persisted it
++				requireDeliveredAfterRestart(t, n, topic.name, "ch", msg.ID)
++			}
++		})
++	}
++}
++
++func requireNoChannel(t *testing.T, topic *Topic, name string) {
++	t.Helper()
++	if _, err := topic.GetExistingChannel(name); err == nil {
++		t.Fatalf("channel %q was created on topic %s after it started exiting; "+
++			"nothing will ever close, flush or feed it", name, topic.name)
++	}
++}
++
++func TestChannelCreateOnExitingTopicRejected(t *testing.T) {
++	skipUnlessEnabled(t)
++	for _, shutdown := range []bool{false, true} {
++		name := "topic being deleted"
++		if shutdown {
++			name = "nsqd shutting down"
++		}
++		t.Run(name, func(t *testing.T) {
++			_, httpAddr, n := startDeferredExitNSQD(t)
++
++			topicName := "test_deferred_exit_topic_" + strconv.Itoa(int(time.Now().UnixNano()))
++			topic := n.GetTopic(topicName)
++			finish := stallTopicExit(t, n, httpAddr, topicName, shutdown)
++
++			// The topic's lock is free while it exits, so creating the channel
++			// is answered before the exit finishes.
++			if shutdown {
++				// nsqd's HTTP server has already stopped; create the channel
++				// the way a SUB still being handled would.
++				created := make(chan *Channel, 1)
++				go func() { created <- callGetChannel(topic, "never-existed") }()
++				select {
++				case c := <-created:
++					if c != nil {
++						t.Fatalf("expected creating a channel on a topic of a shutting down " +
++							"nsqd to fail, got a channel")
++					}
++				case <-time.After(5 * time.Second):
++					t.Fatalf("creating a channel on a topic of a shutting down nsqd never returned")
++				}
++			} else {
++				code := postStatus(api(httpAddr, "/channel/create", "topic", topicName, "channel", "never-existed"), nil)
++				if code < 400 || code > 599 {
++					t.Fatalf("expected channel/create on a topic being deleted to fail with an "+
++						"HTTP error status while it is deleted, got %d (-1: no answer)", code)
++				}
++			}
++			requireNoChannel(t, topic, "never-existed")
++
++			finish()
++			requireNoChannel(t, topic, "never-existed")
++		})
++	}
++}
++
++// deletionHolder is a consumer whose Close blocks until released. Deleting
++// or closing a channel closes each of its consumers first, so attaching one
++// holds that in progress for as long as the test needs.
++type deletionHolder struct {
++	closing     chan struct{}
++	release     chan struct{}
++	closingOnce sync.Once
++	releaseOnce sync.Once
++}
++
++func newDeletionHolder() *deletionHolder {
++	return &deletionHolder{closing: make(chan struct{}), release: make(chan struct{})}
++}
++
++func (h *deletionHolder) UnPause()                 {}
++func (h *deletionHolder) Pause()                   {}
++func (h *deletionHolder) TimedOutMessage()         {}
++func (h *deletionHolder) Empty()                   {}
++func (h *deletionHolder) Stats(string) ClientStats { return nil }
++func (h *deletionHolder) Close() error {
++	h.closingOnce.Do(func() { close(h.closing) })
++	<-h.release
++	return nil
++}
++func (h *deletionHolder) Release() { h.releaseOnce.Do(func() { close(h.release) }) }
++
++func (h *deletionHolder) awaitClosing(t *testing.T, what string) {
++	t.Helper()
++	select {
++	case <-h.closing:
++	case <-time.After(5 * time.Second):
++		t.Fatalf("%s never started", what)
++	}
++}
++
++// inBackground runs fn, which h may hold up, on its own goroutine. When the
++// test ends, before nsqd shuts down, h is released and fn is given up to two
++// seconds to return.
++func inBackground(t *testing.T, h *deletionHolder, fn func()) {
++	done := make(chan struct{})
++	go func() {
++		defer close(done)
++		fn()
++	}()
++	t.Cleanup(func() {
++		h.Release()
++		select {
++		case <-done:
++		case <-time.After(2 * time.Second):
++		}
++	})
++}
++
++func api(httpAddr net.Addr, path string, query ...string) string {
++	v := url.Values{}
++	for i := 0; i+1 < len(query); i += 2 {
++		v.Set(query[i], query[i+1])
++	}
++	return fmt.Sprintf("http://%s%s?%s", httpAddr, path, v.Encode())
++}
++
++var httpClient = &http.Client{Timeout: 10 * time.Second}
++
++func postStatus(url string, body io.Reader) int {
++	resp, err := httpClient.Post(url, "application/octet-stream", body)
++	if err != nil {
++		return -1
++	}
++	_ = resp.Body.Close()
++	return resp.StatusCode
++}
++
++func subscribeReady(t *testing.T, tcpAddr net.Addr, topicName, channelName string) net.Conn {
++	t.Helper()
++	conn, err := mustConnectNSQD(tcpAddr)
++	test.Nil(t, err)
++	t.Cleanup(func() { _ = conn.Close() })
++	_ = conn.SetDeadline(time.Now().Add(5 * time.Second))
++	identify(t, conn, nil, frameTypeResponse)
++	_, err = nsq.Subscribe(topicName, channelName).WriteTo(conn)
++	test.Nil(t, err)
++	resp, err := nsq.ReadResponse(conn)
++	if err != nil {
++		t.Fatalf("SUB to %s/%s did not complete (%s)", topicName, channelName, err)
++	}
++	frameType, data, _ := nsq.UnpackResponse(resp)
++	if frameType != frameTypeResponse || string(data) != "OK" {
++		t.Fatalf("SUB to %s/%s got frame type %d data %q", topicName, channelName, frameType, data)
++	}
++	_, err = nsq.Ready(1).WriteTo(conn)
++	test.Nil(t, err)
++	return conn
++}
++
++func startSubscribe(t *testing.T, tcpAddr net.Addr, topicName, channelName string, ready bool) net.Conn {
++	t.Helper()
++	conn, err := mustConnectNSQD(tcpAddr)
++	test.Nil(t, err)
++	t.Cleanup(func() { _ = conn.Close() })
++	identify(t, conn, nil, frameTypeResponse)
++	_, err = nsq.Subscribe(topicName, channelName).WriteTo(conn)
++	test.Nil(t, err)
++	if ready {
++		_, err = nsq.Ready(1).WriteTo(conn)
++		test.Nil(t, err)
++	}
++	return conn
++}
++
++func requireSubscribed(t *testing.T, conn net.Conn, what string) {
++	t.Helper()
++	_ = conn.SetReadDeadline(time.Now().Add(5 * time.Second))
++	resp, err := nsq.ReadResponse(conn)
++	if err != nil {
++		t.Fatalf("expected a SUB racing %s to end up subscribed to the replacement (%s)", what, err)
++	}
++	frameType, data, _ := nsq.UnpackResponse(resp)
++	if frameType != frameTypeResponse || string(data) != "OK" {
++		t.Fatalf("expected a SUB racing %s to end up subscribed to the replacement, "+
++			"got frame type %d data %q", what, frameType, data)
++	}
++}
++
++func receiveBody(t *testing.T, conn net.Conn, body string) {
++	t.Helper()
++	_ = conn.SetReadDeadline(time.Now().Add(5 * time.Second))
++	resp, err := nsq.ReadResponse(conn)
++	if err != nil {
++		t.Fatalf("message %q never arrived (%s)", body, err)
++	}
++	frameType, data, _ := nsq.UnpackResponse(resp)
++	test.Equal(t, frameTypeMessage, frameType)
++	msg, err := decodeMessage(data)
++	test.Nil(t, err)
++	test.Equal(t, []byte(body), msg.Body)
++}
++
++func TestSubRacingTopicDeletionLandsOnReplacement(t *testing.T) {
++	skipUnlessEnabled(t)
++	tcpAddr, httpAddr, n := startDeferredExitNSQD(t)
++
++	topicName := "test_deferred_exit_resub_" + strconv.Itoa(int(time.Now().UnixNano()))
++	holder := newDeletionHolder()
++	test.Nil(t, callGetChannel(n.GetTopic(topicName), "holder").AddClient(1000, holder))
++
++	deleted := make(chan int, 1)
++	inBackground(t, holder, func() {
++		deleted <- postStatus(api(httpAddr, "/topic/delete", "topic", topicName), nil)
++	})
++	holder.awaitClosing(t, "topic deletion")
++
++	conn := startSubscribe(t, tcpAddr, topicName, "late", false)
++
++	time.Sleep(holdDeletion)
++	holder.Release()
++	select {
++	case code := <-deleted:
++		test.Equal(t, 200, code)
++	case <-time.After(5 * time.Second):
++		t.Fatalf("topic deletion never finished")
++	}
++
++	requireSubscribed(t, conn, "a topic deletion")
++	_, err := nsq.Ready(1).WriteTo(conn)
++	test.Nil(t, err)
++
++	test.Equal(t, 200, postStatus(api(httpAddr, "/pub", "topic", topicName), strings.NewReader("after-delete")))
++	receiveBody(t, conn, "after-delete")
++}
++
++// stallTopicExit starts deleting topicName, or with shutdown shuts n down,
++// and holds that in progress, with the topic already exiting but its lock
++// free, until finish is called: the topic's message pump is stuck delivering
++// to a channel whose own deletion is blocked.
++func stallTopicExit(t *testing.T, n *NSQD, httpAddr net.Addr, topicName string, shutdown bool) (finish func()) {
++	t.Helper()
++	topic := n.GetTopic(topicName)
++	holder := newDeletionHolder()
++	test.Nil(t, callGetChannel(topic, "held").AddClient(1000, holder))
++
++	channelDeleted := make(chan int, 1)
++	inBackground(t, holder, func() {
++		channelDeleted <- postStatus(api(httpAddr, "/channel/delete", "topic", topicName, "channel", "held"), nil)
++	})
++	holder.awaitClosing(t, "channel deletion")
++
++	// Once the topic's pump has taken this message it cannot return to
++	// noticing the topic's exit until "held" accepts or rejects it.
++	test.Equal(t, 200, postStatus(api(httpAddr, "/pub", "topic", topicName), strings.NewReader("stuck")))
++	deadline := time.Now().Add(5 * time.Second)
++	for topic.Depth() != 0 {
++		if time.Now().After(deadline) {
++			t.Fatalf("topic pump never picked up the message")
++		}
++		time.Sleep(time.Millisecond)
++	}
++
++	topicExited := make(chan error, 1)
++	inBackground(t, holder, func() {
++		if shutdown {
++			n.Exit()
++			topicExited <- nil
++			return
++		}
++		if code := postStatus(api(httpAddr, "/topic/delete", "topic", topicName), nil); code != 200 {
++			topicExited <- fmt.Errorf("topic/delete returned %d", code)
++			return
++		}
++		topicExited <- nil
++	})
++	for !topic.Exiting() {
++		if time.Now().After(deadline) {
++			t.Fatalf("topic exit never started")
++		}
++		time.Sleep(time.Millisecond)
++	}
++
++	return func() {
++		holder.Release()
++		select {
++		case code := <-channelDeleted:
++			test.Equal(t, 200, code)
++		case <-time.After(5 * time.Second):
++			t.Fatalf("channel deletion never finished")
++		}
++		select {
++		case err := <-topicExited:
++			test.Nil(t, err)
++		case <-time.After(5 * time.Second):
++			t.Fatalf("topic deletion or nsqd shutdown never finished")
++		}
++	}
++}
++
++func TestSubRacingSlowTopicDeletionLandsOnReplacement(t *testing.T) {
++	skipUnlessEnabled(t)
++	for _, tc := range []struct {
++		name     string
++		suffix   string
++		channel  string
++		existing bool
++	}{
++		{"new channel", "", "late", false},
++		{"existing channel", "", "late", true},
++		{"ephemeral channel", "", "late#ephemeral", false},
++		{"ephemeral topic", "#ephemeral", "late", false},
++	} {
++		t.Run(tc.name, func(t *testing.T) {
++			tcpAddr, httpAddr, n := startDeferredExitNSQD(t)
++
++			baseName := "test_deferred_exit_slowdel_" + strconv.Itoa(int(time.Now().UnixNano()))
++			topicName := baseName + tc.suffix
++			if tc.existing {
++				test.Equal(t, 200, postStatus(api(httpAddr, "/topic/create", "topic", topicName), nil))
++				test.Equal(t, 200, postStatus(api(httpAddr, "/channel/create", "topic", topicName, "channel", tc.channel), nil))
++			}
++			finish := stallTopicExit(t, n, httpAddr, topicName, false)
++
++			conn := startSubscribe(t, tcpAddr, topicName, tc.channel, true)
++
++			other := subscribeReady(t, tcpAddr, baseName+"_other", "c")
++			test.Equal(t, 200, postStatus(api(httpAddr, "/pub", "topic", baseName+"_other"), strings.NewReader("other-topic")))
++			receiveBody(t, other, "other-topic")
++
++			time.Sleep(holdDeletion)
++			finish()
++
++			requireSubscribed(t, conn, "a slow topic deletion")
++			test.Equal(t, 200, postStatus(api(httpAddr, "/pub", "topic", topicName), strings.NewReader("after-slow-delete")))
++			receiveBody(t, conn, "after-slow-delete")
++		})
++	}
++}
++
++func TestSubRacingChannelDeletionLandsOnReplacement(t *testing.T) {
++	skipUnlessEnabled(t)
++	for _, tc := range []struct {
++		name, channel string
++		second        bool
++	}{
++		{"doomed", "doomed", false},
++		{"doomed#ephemeral", "doomed#ephemeral", false},
++		// A second request to delete the channel arrives while it is being
++		// deleted; it must not change the outcome of the first.
++		{"second delete request", "doomed", true},
++	} {
++		channelName := tc.channel
++		t.Run(tc.name, func(t *testing.T) {
++			tcpAddr, httpAddr, n := startDeferredExitNSQD(t)
++
++			topicName := "test_deferred_exit_chdel_" + strconv.Itoa(int(time.Now().UnixNano()))
++			holder := newDeletionHolder()
++			test.Nil(t, callGetChannel(n.GetTopic(topicName), channelName).AddClient(1000, holder))
++
++			deleted := make(chan int, 1)
++			inBackground(t, holder, func() {
++				deleted <- postStatus(api(httpAddr, "/channel/delete", "topic", topicName, "channel", channelName), nil)
++			})
++			holder.awaitClosing(t, "channel deletion")
++			if tc.second {
++				again := make(chan struct{})
++				inBackground(t, holder, func() {
++					defer close(again)
++					postStatus(api(httpAddr, "/channel/delete", "topic", topicName, "channel", channelName), nil)
++				})
++				select {
++				case <-again:
++				case <-time.After(holdDeletion):
++				}
++			}
++
++			conn := startSubscribe(t, tcpAddr, topicName, channelName, true)
++
++			sibling := subscribeReady(t, tcpAddr, topicName, "sibling")
++
++			time.Sleep(holdDeletion)
++			holder.Release()
++			select {
++			case code := <-deleted:
++				test.Equal(t, 200, code)
++			case <-time.After(5 * time.Second):
++				t.Fatalf("channel deletion never finished")
++			}
++
++			requireSubscribed(t, conn, "a channel deletion")
++			test.Equal(t, 200, postStatus(api(httpAddr, "/pub", "topic", topicName), strings.NewReader("after-channel-delete")))
++			receiveBody(t, conn, "after-channel-delete")
++			receiveBody(t, sibling, "after-channel-delete")
++		})
++	}
++}
++
++// Deleting a channel removes it: a message published to its topic while the
++// deletion is in progress does not bring the deleted channel back, and the
++// deleted channel rejects a deferred publish.
++func TestChannelDeletedWhilePublishingStaysDeleted(t *testing.T) {
++	skipUnlessEnabled(t)
++	_, httpAddr, n := startDeferredExitNSQD(t)
++	topicName := "test_deferred_exit_stays_deleted_" + strconv.Itoa(int(time.Now().UnixNano()))
++	topic := n.GetTopic(topicName)
++	channel := callGetChannel(topic, "doomed")
++	holder := newDeletionHolder()
++	test.Nil(t, channel.AddClient(1000, holder))
++	test.NotNil(t, callGetChannel(topic, "sibling"))
++
++	deleted := make(chan int, 1)
++	inBackground(t, holder, func() {
++		deleted <- postStatus(api(httpAddr, "/channel/delete", "topic", topicName, "channel", "doomed"), nil)
++	})
++	holder.awaitClosing(t, "channel deletion")
++	test.Equal(t, 200, postStatus(api(httpAddr, "/pub", "topic", topicName), strings.NewReader("during-delete")))
++	time.Sleep(holdExit)
++	holder.Release()
++	select {
++	case code := <-deleted:
++		test.Equal(t, 200, code)
++	case <-time.After(5 * time.Second):
++		t.Fatalf("channel deletion never finished")
++	}
++
++	// the sibling still gets the message, once the topic has handed it on
++	deadline := time.Now().Add(5 * time.Second)
++	sibling, err := topic.GetExistingChannel("sibling")
++	test.Nil(t, err)
++	for sibling.Depth() == 0 && time.Now().Before(deadline) {
++		time.Sleep(time.Millisecond)
++	}
++	test.Equal(t, int64(1), sibling.Depth())
++	if _, err := topic.GetExistingChannel("doomed"); err == nil {
++		t.Fatalf("the deleted channel exists again: a message published while it " +
++			"was being deleted brought it back")
++	}
++	if callPutMessageDeferred(channel, NewMessage(topic.GenerateID(), []byte("late")), time.Minute) == nil {
++		t.Fatalf("expected a deferred publish to the deleted channel to be rejected, " +
++			"just like PutMessage is")
++	}
++}
++
++// closeHold is a logger that holds the goroutine logging line until release
++// is closed, and passes every line on to next.
++type closeHold struct {
++	next    Logger
++	line    string
++	reached chan struct{}
++	release chan struct{}
++	once    sync.Once
++}
++
++func (h *closeHold) Output(maxdepth int, s string) error {
++	if strings.Contains(s, h.line) {
++		h.once.Do(func() { close(h.reached) })
++		<-h.release
++	}
++	return h.next.Output(maxdepth+1, s)
++}
++
++// pumpHold is a logger that holds a consumer's pump as it starts writing its
++// first message, which it has already taken and put in flight, until release
++// is closed. moved is closed once the pump then writes another message or
++// stops.
++type pumpHold struct {
++	next    Logger
++	started chan struct{}
++	release chan struct{}
++	moved   chan struct{}
++	writes  int32
++	once    sync.Once
++}
++
++func (h *pumpHold) Output(maxdepth int, s string) error {
++	switch {
++	case strings.Contains(s, "PROTOCOL(V2): writing msg("):
++		if atomic.AddInt32(&h.writes, 1) == 1 {
++			close(h.started)
++			<-h.release
++		} else {
++			h.once.Do(func() { close(h.moved) })
++		}
++	case strings.Contains(s, "exiting messagePump"):
++		h.once.Do(func() { close(h.moved) })
++	}
++	return h.next.Output(maxdepth+1, s)
++}
++
++// A message that a consumer's pump takes from a channel after the channel has
++// started closing, and so before the pump has put it in flight, is written out
++// by the close, never dropped. A deferred publish arriving meanwhile is
++// rejected.
++//
++// Each round holds the pump while it writes one message, holds Close once the
++// channel is exiting but before it disconnects the consumer, and then lets the
++// pump go on with a second message queued. The pump may take that message or
++// stop for the close; the rounds go on until it has taken it.
++func TestChannelCloseKeepsDequeuedMessage(t *testing.T) {
++	skipUnlessEnabled(t)
++	const rounds = 40
++	for i := 0; i < rounds; i++ {
++		if takenWhileClosing(t) {
++			return
++		}
++	}
++	t.Fatalf("in %d rounds the consumer never took a message from its channel after "+
++		"the channel started closing, so the overlap this test checks was not reached", rounds)
++}
++
++// takenWhileClosing reports whether the pump took the queued message while
++// the channel was closing.
++func takenWhileClosing(t *testing.T) bool {
++	t.Helper()
++	const channelName = "taken-while-closing"
++	pump := &pumpHold{
++		next:    lg.NilLogger{},
++		started: make(chan struct{}),
++		release: make(chan struct{}),
++		moved:   make(chan struct{}),
++	}
++	exit := &closeHold{
++		next:    pump,
++		line:    "CHANNEL(" + channelName + "): closing",
++		reached: make(chan struct{}),
++		release: make(chan struct{}),
++	}
++	opts := NewOptions()
++	opts.Logger = exit
++	opts.LogLevel = lg.DEBUG
++	tcpAddr, _, n := mustStartNSQD(opts)
++	t.Cleanup(func() { _ = os.RemoveAll(opts.DataPath) })
++	t.Cleanup(n.Exit)
++	var releasePump, releaseExit sync.Once
++	t.Cleanup(func() {
++		releasePump.Do(func() { close(pump.release) })
++		releaseExit.Do(func() { close(exit.release) })
++	})
++
++	topicName := "test_close_dequeued_" + strconv.Itoa(int(time.Now().UnixNano()))
++	topic := n.GetTopic(topicName)
++	channel := callGetChannel(topic, channelName)
++	msgs := []*Message{
++		NewMessage(topic.GenerateID(), []byte("delivering when the close starts")),
++		NewMessage(topic.GenerateID(), []byte("taken while closing")),
++	}
++	for _, msg := range msgs {
++		test.Nil(t, channel.PutMessage(msg))
++	}
++
++	conn, err := mustConnectNSQD(tcpAddr)
++	test.Nil(t, err)
++	t.Cleanup(func() { _ = conn.Close() })
++	_ = conn.SetDeadline(time.Now().Add(5 * time.Second))
++	identify(t, conn, nil, frameTypeResponse)
++	_, err = nsq.Subscribe(topicName, channelName).WriteTo(conn)
++	test.Nil(t, err)
++	readValidate(t, conn, frameTypeResponse, "OK")
++	// enough RDY that the pump goes on to the second message after the first
++	_, err = nsq.Ready(len(msgs) + 1).WriteTo(conn)
++	test.Nil(t, err)
++	select {
++	case <-pump.started:
++	case <-time.After(5 * time.Second):
++		t.Fatalf("the consumer's pump never started writing a message")
++	}
++
++	closed := make(chan error, 1)
++	go func() { closed <- channel.Close() }()
++	select {
++	case <-exit.reached:
++	case <-time.After(200 * time.Millisecond):
++		// this Close waits for the pump before logging that line
++		for deadline := time.Now().Add(5 * time.Second); !channel.Exiting(); time.Sleep(time.Millisecond) {
++			if time.Now().After(deadline) {
++				t.Fatalf("the channel never started closing")
++			}
++		}
++	}
++	deferredErr := make(chan error, 1)
++	go func() {
++		deferred := NewMessage(topic.GenerateID(), []byte("deferred while closing"))
++		deferredErr <- callPutMessageDeferred(channel, deferred, time.Minute)
++	}()
++	releasePump.Do(func() { close(pump.release) })
++	select {
++	case <-pump.moved:
++	case <-time.After(500 * time.Millisecond):
++	}
++	releaseExit.Do(func() { close(exit.release) })
++	select {
++	case err = <-closed:
++		test.Nil(t, err)
++	case <-time.After(5 * time.Second):
++		t.Fatalf("channel close never finished")
++	}
++	select {
++	case err = <-deferredErr:
++	case <-time.After(5 * time.Second):
++		t.Fatalf("a deferred publish to the closing channel never returned")
++	}
++	if err == nil {
++		t.Fatalf("expected a deferred publish to a closing channel to be rejected, " +
++			"just like PutMessage is")
++	}
++
++	got := requireDeliveredAfterRestart(t, n, topicName, channelName, msgs[0].ID, msgs[1].ID)
++	taken := 0
++	for _, msg := range msgs {
++		test.Equal(t, msg.Body, got[msg.ID].Body)
++		// a pump counts an attempt as it takes a message, so one taken before
++		// the close is on its second attempt after the restart
++		if got[msg.ID].Attempts > 1 {
++			taken++
++		}
++	}
++	return taken == len(msgs)
++}
++
++// Deleting a channel disconnects its consumers and finishes even while one
++// of them has stopped reading and nsqd is blocked writing to it: the
++// deletion closes that client's connection. The deleted channel then rejects
++// a deferred publish.
++func TestChannelDeleteDisconnectsStalledConsumer(t *testing.T) {
++	skipUnlessEnabled(t)
++	const (
++		channelName = "stalled"
++		messages    = 32
++		bodySize    = 1000 * 1000
++	)
++	opts := NewOptions()
++	opts.Logger = lg.NilLogger{}
++	// room to buffer every message, so nsqd only writes them to the
++	// connection when it flushes that buffer
++	opts.MaxOutputBufferSize = 40 << 20
++	tcpAddr, httpAddr, n := mustStartNSQD(opts)
++	t.Cleanup(func() { _ = os.RemoveAll(opts.DataPath) })
++	t.Cleanup(n.Exit)
++
++	topicName := "test_delete_stalled_" + strconv.Itoa(int(time.Now().UnixNano()))
++	topic := n.GetTopic(topicName)
++	channel := callGetChannel(topic, channelName)
++	body := []byte(strings.Repeat("x", bodySize))
++	for i := 0; i < messages; i++ {
++		test.Nil(t, channel.PutMessage(NewMessage(topic.GenerateID(), body)))
++	}
++
++	conn, err := mustConnectNSQD(tcpAddr)
++	test.Nil(t, err)
++	// closing the connection unblocks nsqd if the deletion is stuck
++	t.Cleanup(func() { _ = conn.Close() })
++	if tc, ok := conn.(*net.TCPConn); ok {
++		_ = tc.SetReadBuffer(16 << 10)
++	}
++	_ = conn.SetDeadline(time.Now().Add(5 * time.Second))
++	// the longest heartbeat interval, which is also how long nsqd keeps
++	// trying to write to this client before giving up by itself
++	identify(t, conn, map[string]interface{}{
++		"heartbeat_interval": int(opts.MaxHeartbeatInterval / time.Millisecond),
++		"output_buffer_size": 40 << 20,
++	}, frameTypeResponse)
++	_, err = nsq.Subscribe(topicName, channelName).WriteTo(conn)
++	test.Nil(t, err)
++	readValidate(t, conn, frameTypeResponse, "OK")
++	_, err = nsq.Ready(messages + 1).WriteTo(conn)
++	test.Nil(t, err)
++
++	// The consumer's pump takes every message, then flushes them: far more
++	// than the connection holds while the consumer does not read, so that
++	// write blocks. The first byte to arrive shows it has started.
++	deadline := time.Now().Add(5 * time.Second)
++	for NewChannelStats(channel, nil, 0).InFlightCount != messages && time.Now().Before(deadline) {
++		time.Sleep(time.Millisecond)
++	}
++	test.Equal(t, messages, NewChannelStats(channel, nil, 0).InFlightCount)
++	_, err = io.ReadFull(conn, make([]byte, 1))
++	test.Nil(t, err)
++
++	deleted := make(chan int, 1)
++	go func() {
++		deleted <- postStatus(api(httpAddr, "/channel/delete", "topic", topicName, "channel", channelName), nil)
++	}()
++	select {
++	case code := <-deleted:
++		test.Equal(t, 200, code)
++	case <-time.After(5 * time.Second):
++		t.Fatalf("channel deletion never finished while a consumer had stopped reading")
++	}
++	_, err = topic.GetExistingChannel(channelName)
++	test.NotNil(t, err)
++	if callPutMessageDeferred(channel, NewMessage(topic.GenerateID(), []byte("late")), time.Minute) == nil {
++		t.Fatalf("expected a deferred publish to the deleted channel to be rejected, " +
++			"just like PutMessage is")
++	}
++}
++
++// A client that subscribes to a channel whose deletion failed, leaving it in
++// place with nothing to replace it, gets an error instead of waiting, whether
++// the SUB arrives while that deletion is in progress or after it has failed.
++// The channel left in place is exiting, so it also rejects a deferred
++// publish.
++func TestSubToChannelWhoseDeletionFailedIsAnswered(t *testing.T) {
++	skipUnlessEnabled(t)
++	for _, during := range []bool{false, true} {
++		name := "after the deletion failed"
++		if during {
++			name = "while the deletion is failing"
++		}
++		t.Run(name, func(t *testing.T) {
++			opts := NewOptions()
++			opts.Logger = lg.NilLogger{}
++			tcpAddr, httpAddr, n := mustStartNSQD(opts)
++			// A SUB left waiting inside nsqd would also hold up its shutdown;
++			// give up on that after five seconds so only this test fails.
++			t.Cleanup(func() {
++				exited := make(chan struct{})
++				go func() {
++					n.Exit()
++					close(exited)
++				}()
++				select {
++				case <-exited:
++					_ = os.RemoveAll(opts.DataPath)
++				case <-time.After(5 * time.Second):
++				}
++			})
++			topicName := "test_deferred_exit_undeletable_" + strconv.Itoa(int(time.Now().UnixNano()))
++			const channelName = "undeletable"
++			channel := callGetChannel(n.GetTopic(topicName), channelName)
++			test.NotNil(t, channel)
++
++			// A non-empty directory stands where the channel's queue keeps its
++			// metadata file, so emptying the queue, and with it the deletion,
++			// fails.
++			meta := filepath.Join(n.getOpts().DataPath, getBackendName(topicName, channelName)+".diskqueue.meta.dat")
++			_ = os.Remove(meta)
++			test.Nil(t, os.MkdirAll(filepath.Join(meta, "keep"), 0o755))
++			t.Cleanup(func() { _ = os.RemoveAll(meta) })
++
++			holder := newDeletionHolder()
++			if during {
++				test.Nil(t, channel.AddClient(1000, holder))
++			}
++			deleted := make(chan int, 1)
++			inBackground(t, holder, func() {
++				deleted <- postStatus(api(httpAddr, "/channel/delete", "topic", topicName, "channel", channelName), nil)
++			})
++			var conn net.Conn
++			if during {
++				holder.awaitClosing(t, "channel deletion")
++				conn = startSubscribe(t, tcpAddr, topicName, channelName, false)
++				time.Sleep(holdDeletion)
++				holder.Release()
++			}
++			var code int
++			select {
++			case code = <-deleted:
++			case <-time.After(5 * time.Second):
++				t.Fatalf("channel deletion never finished")
++			}
++			if callPutMessageDeferred(channel, NewMessage(n.GetTopic(topicName).GenerateID(), []byte("late")), time.Minute) == nil {
++				t.Fatalf("expected a deferred publish to a channel whose deletion was "+
++					"attempted (status %d) to be rejected, just like PutMessage is", code)
++			}
++			if !during {
++				conn = startSubscribe(t, tcpAddr, topicName, channelName, false)
++			}
++
++			_ = conn.SetReadDeadline(time.Now().Add(5 * time.Second))
++			resp, err := nsq.ReadResponse(conn)
++			if err != nil {
++				t.Fatalf("a SUB to a channel whose deletion failed (status %d) got no answer: "+
++					"the client was left waiting for a replacement that never comes (%s)", code, err)
++			}
++			frameType, data, _ := nsq.UnpackResponse(resp)
++			if frameType == frameTypeError {
++				return
++			}
++			if code != 200 {
++				t.Fatalf("a SUB to a channel whose deletion failed (status %d) got frame type %d "+
++					"data %q instead of an error: nothing replaces that channel", code, frameType, data)
++			}
++			// the deletion did go through, so the SUB may be on a replacement,
++			// which must deliver
++			if frameType != frameTypeResponse || string(data) != "OK" {
++				t.Fatalf("a SUB to a channel whose deletion failed got frame type %d data %q", frameType, data)
++			}
++			_, err = nsq.Ready(1).WriteTo(conn)
++			test.Nil(t, err)
++			test.Equal(t, 200, postStatus(api(httpAddr, "/pub", "topic", topicName), strings.NewReader("after-failed-delete")))
++			receiveBody(t, conn, "after-failed-delete")
++		})
++	}
++}
++
++// receiveAndFinish reads the next message on conn, which must have body, and
++// finishes it.
++func receiveAndFinish(t *testing.T, conn net.Conn, body, failure string) {
++	t.Helper()
++	_ = conn.SetReadDeadline(time.Now().Add(5 * time.Second))
++	resp, err := nsq.ReadResponse(conn)
++	if err != nil {
++		t.Fatalf("%s: message %q never arrived (%s)", failure, body, err)
++	}
++	frameType, data, _ := nsq.UnpackResponse(resp)
++	test.Equal(t, frameTypeMessage, frameType)
++	msg, err := decodeMessage(data)
++	test.Nil(t, err)
++	test.Equal(t, []byte(body), msg.Body)
++	_, err = nsq.Finish(nsq.MessageID(msg.ID)).WriteTo(conn)
++	test.Nil(t, err)
++}
++
++// An ephemeral channel is deleted once its last consumer leaves, but only if
++// it is still unused when that deletion starts. Here the deletion is held, if
++// it logs the line below, while another consumer subscribes: that consumer
++// either joins the channel, which then stays, or waits and ends up on the
++// channel that replaces it. Either way it stays subscribed and is delivered to.
++func TestSubDuringEphemeralChannelCleanupStaysSubscribed(t *testing.T) {
++	skipUnlessEnabled(t)
++	topicName := "test_ephemeral_cleanup_" + strconv.Itoa(int(time.Now().UnixNano()))
++	const channelName = "consumers#ephemeral"
++	cleanup := &closeHold{
++		next:    lg.NilLogger{},
++		line:    "TOPIC(" + topicName + "): deleting channel " + channelName,
++		reached: make(chan struct{}),
++		release: make(chan struct{}),
++	}
++	opts := NewOptions()
++	opts.Logger = cleanup
++	tcpAddr, httpAddr, n := mustStartNSQD(opts)
++	t.Cleanup(func() { _ = os.RemoveAll(opts.DataPath) })
++	t.Cleanup(n.Exit)
++	var release sync.Once
++	releaseCleanup := func() { release.Do(func() { close(cleanup.release) }) }
++	t.Cleanup(releaseCleanup)
++
++	first := subscribeReady(t, tcpAddr, topicName, channelName)
++	test.Nil(t, first.Close())
++	select {
++	case <-cleanup.reached:
++	case <-time.After(5 * time.Second):
++		// a deletion that does not log this line is not held
++	}
++
++	second := startSubscribe(t, tcpAddr, topicName, channelName, true)
++	answered := make(chan error, 1)
++	go func() {
++		_ = second.SetReadDeadline(time.Now().Add(holdDeletion + 5*time.Second))
++		resp, err := nsq.ReadResponse(second)
++		if err == nil {
++			frameType, data, _ := nsq.UnpackResponse(resp)
++			if frameType != frameTypeResponse || string(data) != "OK" {
++				err = fmt.Errorf("got frame type %d data %q", frameType, data)
++			}
++		}
++		answered <- err
++	}()
++	var err error
++	select {
++	case err = <-answered:
++		releaseCleanup()
++	case <-time.After(holdDeletion):
++		// the SUB is waiting for the deletion to finish
++		releaseCleanup()
++		err = <-answered
++	}
++	if err != nil {
++		t.Fatalf("expected a SUB to an ephemeral channel whose last consumer just left "+
++			"to complete (%s)", err)
++	}
++
++	const failure = "a consumer that subscribed to an ephemeral channel as its last " +
++		"consumer left was disconnected by the channel's automatic deletion"
++	for _, body := range []string{"after-cleanup", "after-cleanup-again"} {
++		test.Equal(t, 200, postStatus(api(httpAddr, "/pub", "topic", topicName), strings.NewReader(body)))
++		receiveAndFinish(t, second, body, failure)
++	}
++}
++
++// An ephemeral topic is deleted once its last channel goes, but only if it
++// is still unused when that deletion starts. Each round deletes a topic's
++// only channel and at once creates another one: either the topic's deletion
++// has already started, and the new channel is refused, or the topic stays,
++// with the new channel and the message queued on it. A topic whose deletion
++// always starts first never has a channel to lose.
++func TestChannelCreatedDuringEphemeralTopicCleanupIsKept(t *testing.T) {
++	skipUnlessEnabled(t)
++	tcpAddr, _, n := startDeferredExitNSQD(t)
++	const rounds = 20
++	for i := 0; i < rounds; i++ {
++		topicName := "test_eph_cleanup_" + strconv.Itoa(int(time.Now().UnixNano())) + "#ephemeral"
++		topic := n.GetTopic(topicName)
++		test.NotNil(t, callGetChannel(topic, "first"))
++		test.Nil(t, topic.DeleteExistingChannel("first"))
++		channel := callGetChannel(topic, "second")
++		if channel == nil {
++			continue
++		}
++
++		const failure = "a channel created on an ephemeral topic as the topic lost its " +
++			"last channel was deleted by the topic's automatic deletion"
++		if err := channel.PutMessage(NewMessage(topic.GenerateID(), []byte("queued"))); err != nil {
++			t.Fatalf("%s: a message put on it was rejected (%s)", failure, err)
++		}
++		conn := subscribeReady(t, tcpAddr, topicName, "second")
++		receiveAndFinish(t, conn, "queued", failure)
++		return
++	}
++	t.Logf("in %d rounds the topic's deletion always started before the new channel "+
++		"was created, so no channel was created on a topic being deleted", rounds)
++}
+diff --git a/test.sh b/test.sh
+index 5874b6a..5015bf1 100755
+--- a/test.sh
++++ b/test.sh
+@@ -1,4 +1,66 @@
+-#!/bin/sh
++#!/usr/bin/env bash
++# Usage: ./test.sh [--output_path <junit.xml>] [base|new]
++# With no mode it runs the repository's CI checks below.
++set -uo pipefail
++
++OUTPUT_PATH=""
++if [ "${1:-}" = "--output_path" ]; then
++  OUTPUT_PATH="$2"
++  shift 2
++  case "$OUTPUT_PATH" in
++    /*) ;;
++    *) OUTPUT_PATH="$PWD/$OUTPUT_PATH" ;;
++  esac
++fi
++
++cd /app
++
++MODE="${1:-}"
++
++if [ -n "$OUTPUT_PATH" ] && [ -z "$MODE" ]; then
++  echo "--output_path needs a mode: base or new" >&2
++  exit 2
++fi
++
++if [ -n "$MODE" ]; then
++  TEST_LOG="$(mktemp)"
++  STATUS=0
++
++  run_tests() {
++    go test -count=1 -v "$@" 2>&1 | tee -a "$TEST_LOG"
++    status=${PIPESTATUS[0]}
++    if [ "$status" -ne 0 ]; then
++      STATUS=$status
++    fi
++  }
++
++  case "$MODE" in
++    base)
++      run_tests -timeout 300s ./...
++      ;;
++    new)
++      NSQ_RUN_DEFERRED_EXIT_TESTS=1 run_tests -timeout 120s -run '^(TestPutMessageDeferredAfterCloseRejected|TestPutMessageDeferredAfterDeleteRejected|TestRequeueMessageDeferredAfterCloseRejected|TestTouchMessageAfterCloseRejected|TestChannelCreateOnExitingTopicRejected|TestSubRacingTopicDeletionLandsOnReplacement|TestSubRacingSlowTopicDeletionLandsOnReplacement|TestSubRacingChannelDeletionLandsOnReplacement|TestChannelCloseKeepsDequeuedMessage|TestChannelDeleteDisconnectsStalledConsumer|TestSubToChannelWhoseDeletionFailedIsAnswered|TestChannelDeletedWhilePublishingStaysDeleted|TestSubDuringEphemeralChannelCleanupStaysSubscribed|TestChannelCreatedDuringEphemeralTopicCleanupIsKept)$' ./nsqd/...
++      ;;
++    *)
++      echo "unknown mode: $MODE (expected base or new)" >&2
++      exit 2
++      ;;
++  esac
++
++  if [ -n "$OUTPUT_PATH" ]; then
++    go-junit-report -set-exit-code < "$TEST_LOG" > "$OUTPUT_PATH"
++    junit_status=$?
++    if [ "$junit_status" -ne 0 ] && [ "$STATUS" -eq 0 ]; then
++      echo "go-junit-report failed to convert the test log (exit $junit_status)" >&2
++      STATUS=$junit_status
++    fi
++  fi
++
++  exit "$STATUS"
++fi
++
++# written for sh, where unset variables such as GOARCH are not an error
++set +u +o pipefail
+ set -e
+ 
+ GOMAXPROCS=1 go test -vet=all -timeout 90s ./...

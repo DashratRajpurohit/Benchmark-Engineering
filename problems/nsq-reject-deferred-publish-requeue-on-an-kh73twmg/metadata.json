@@ -1,0 +1,17 @@
+{
+  "problemId": "kh73twmgpgvp3z5a0yxrrtea998f09ks",
+  "title": "Reject deferred publish/requeue on an exiting nsqd channel",
+  "status": "accepted",
+  "version": 7,
+  "versionId": "kd79pb835npg8mheantg4xg2rn8fe8gq",
+  "isLocked": true,
+  "language": "go",
+  "difficulty": null,
+  "category": "bugfix",
+  "repoUrl": "https://github.com/nsqio/nsq",
+  "commitHash": "85cf10c09c6c3c86160d6f0eb156f62d0efc1648",
+  "githubIssueUrl": null,
+  "estimatedLOC": null,
+  "testOutputMode": null,
+  "downloadedAt": "2026-10-24T17:10:12.190Z"
+}

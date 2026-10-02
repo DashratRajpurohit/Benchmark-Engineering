@@ -1,0 +1,143 @@
+[
+ {
+  "feedback": "Tests: The verifier permits an orphan channel to be created before an HTTP error is returned, and its deletion-race assertions depend on fixed sleeps rather than confirmed subscription attachment. It also misses rejection side effects, ephemeral deletion paths, and admission overlapping shutdown.\n\n- T3: The deferred-publish and requeue rejection tests assert an error but not that deferred state remains unchanged. A register-then-return-error implementation can pass.\n- T4: All subscription deletion races use ordinary names. The pinned SUB code has an ephemeral-specific retry branch, yet no slow deletion case uses an ephemeral topic or channel.\n- T2/T5: The slow-deletion tests publish after a 20 ms sleep before reading the racing SUB acknowledgment. A correct subscription that has not yet been scheduled can miss that publish. The channel-creation test likewise relies on a 200 ms sleep to assume its request ran before deletion finished.\n- T1/T6, minor: test.sh --output_path results.xml without a mode falls through to the old CI path and produces no requested XML. The documented base/new invocations do work.\n\nSolution & Code: The new in-flight registration guard can lose an already-dequeued message during Channel.Close. Coordinate dequeue and registration with close, or preserve the message when registration is rejected.\nThe decisive code sequence is:\n1. nsqd/protocol_v2.go removes a message from the channel queue before calling StartInFlightTimeout.\n2. Channel.Close can then acquire exitMutex, mark the channel exiting, and flush its queues and registered in-flight messages. The dequeued message is in neither collection.\n3. StartInFlightTimeout subsequently sees Exiting() and returns an error; the client message pump exits without restoring the message.\nThe sole passing agent adds the same guard without a recovery path. A controlled delivery-versus-close test is needed before its false-positive clearance can be relied on.\n\nOther notes: The passing patch has 89 effective production LOC, not the displayed 330, which includes an agent-added test file. That misses the active 200-LOC median floor; the reference is about 180. Its four production files and 67 messages meet the other scope bars.",
+  "fieldBands": {
+   "description": {
+    "band": 3
+   },
+   "solution": {
+    "band": 1,
+    "reasoning": "The new in-flight registration guard can lose an already-dequeued message during Channel.Close. Coordinate dequeue and registration with close, or preserve the message when registration is rejected.\nThe decisive code sequence is:\n1. nsqd/protocol_v2.go removes a message from the channel queue before calling StartInFlightTimeout.\n2. Channel.Close can then acquire exitMutex, mark the channel exiting, and flush its queues and registered in-flight messages. The dequeued message is in neither collection.\n3. StartInFlightTimeout subsequently sees Exiting() and returns an error; the client message pump exits without restoring the message.\nThe sole passing agent adds the same guard without a recovery path. A controlled delivery-versus-close test is needed before its false-positive clearance can be relied on.\n\n"
+   },
+   "tests": {
+    "band": 1,
+    "reasoning": "The verifier permits an orphan channel to be created before an HTTP error is returned, and its deletion-race assertions depend on fixed sleeps rather than confirmed subscription attachment. It also misses rejection side effects, ephemeral deletion paths, and admission overlapping shutdown.\n\n- T3: The deferred-publish and requeue rejection tests assert an error but not that deferred state remains unchanged. A register-then-return-error implementation can pass.\n- T4: All subscription deletion races use ordinary names. The pinned SUB code has an ephemeral-specific retry branch, yet no slow deletion case uses an ephemeral topic or channel.\n- T2/T5: The slow-deletion tests publish after a 20 ms sleep before reading the racing SUB acknowledgment. A correct subscription that has not yet been scheduled can miss that publish. The channel-creation test likewise relies on a 200 ms sleep to assume its request ran before deletion finished.\n- T1/T6, minor: test.sh --output_path results.xml without a mode falls through to the old CI path and produces no requested XML. The documented base/new invocations do work."
+   }
+  },
+  "internalNotes": null,
+  "otherNotes": "The passing patch has 89 effective production LOC, not the displayed 330, which includes an agent-added test file. That misses the active 200-LOC median floor; the reference is about 180. Its four production files and 67 messages meet the other scope bars.",
+  "otherNotesTags": null,
+  "outcome": "revision_requested",
+  "overallQuality": 1.6666666666666665,
+  "qualityScore": 4,
+  "reasoning": null,
+  "reviewFormatVersion": 2,
+  "reviewId": "m575y5280gs5w88dda8a6wrxh18f4ryg",
+  "reviewerName": "tg 1239",
+  "submittedAt": 1790454256025,
+  "versionNumber": 1,
+  "submittedAtIST": "2026-09-27T01:54:16.025000+05:30"
+ },
+ {
+  "feedback": "Tests: T3/T4 \u2014 The suite still permits silent message loss:\n- Dequeued-message preservation: the sole passing agent adds an exit guard to StartInFlightTimeout without coordinating the message pump. My controlled probe lost the message in 3/3 runs on that agent; the current reference preserved it in 3/3. Add this regression before relying on false-positive clearance.\n- Admission overlapping Close: deferred-publish tests begin only after exit is established. They do not distinguish an atomic admission check from check-then-register code that inserts after Close flushes.\n- Rejected requeue/touch preservation: an error and an empty deferred registry do not prove the original in-flight message survived. During held Close, verify its ID/body is persisted or subsequently delivered.\nT2/T5 \u2014 publishJustAfterDeletion still publishes after at most 40 ms, even when the racing subscriber has not attached. Wait for confirmed attachment before publishing; ordinary scheduling delay can otherwise fail a correct implementation.\nT4 \u2014 Ephemeral-channel coverage was added, but slow deletion of an ephemeral topic remains untested.\nT6 \u2014 Remove harness-narrating and redundant helper/Docker comments; retain concise explanations of genuinely non-obvious synchronization.\n\nOther notes: The scope requirement remains unmet. The sole reported passing agent contains 89 effective production LOC across four files, with 67 messages. Files and messages pass; LOC misses the active 200-line floor. The displayed 330 includes its test file. A larger reference does not repair this metric.",
+  "fieldBands": {
+   "description": {
+    "band": 3
+   },
+   "solution": {
+    "band": 3
+   },
+   "tests": {
+    "band": 1,
+    "reasoning": "T3/T4 \u2014 The suite still permits silent message loss:\n- Dequeued-message preservation: the sole passing agent adds an exit guard to StartInFlightTimeout without coordinating the message pump. My controlled probe lost the message in 3/3 runs on that agent; the current reference preserved it in 3/3. Add this regression before relying on false-positive clearance.\n- Admission overlapping Close: deferred-publish tests begin only after exit is established. They do not distinguish an atomic admission check from check-then-register code that inserts after Close flushes.\n- Rejected requeue/touch preservation: an error and an empty deferred registry do not prove the original in-flight message survived. During held Close, verify its ID/body is persisted or subsequently delivered.\nT2/T5 \u2014 publishJustAfterDeletion still publishes after at most 40 ms, even when the racing subscriber has not attached. Wait for confirmed attachment before publishing; ordinary scheduling delay can otherwise fail a correct implementation.\nT4 \u2014 Ephemeral-channel coverage was added, but slow deletion of an ephemeral topic remains untested.\nT6 \u2014 Remove harness-narrating and redundant helper/Docker comments; retain concise explanations of genuinely non-obvious synchronization."
+   }
+  },
+  "internalNotes": null,
+  "otherNotes": "The scope requirement remains unmet. The sole reported passing agent contains 89 effective production LOC across four files, with 67 messages. Files and messages pass; LOC misses the active 200-line floor. The displayed 330 includes its test file. A larger reference does not repair this metric.",
+  "otherNotesTags": null,
+  "outcome": "revision_requested",
+  "overallQuality": 2.333333333333333,
+  "qualityScore": 6,
+  "reasoning": null,
+  "reviewFormatVersion": 2,
+  "reviewId": "m578yka8sd4qtarzh647efvz1x8f71m3",
+  "reviewerName": "tg 1239",
+  "submittedAt": 1790533181833,
+  "versionNumber": 2,
+  "submittedAtIST": "2026-09-27T23:49:41.833000+05:30"
+ },
+ {
+  "feedback": "Tests: T3/T4 \u2014 TestChannelCloseKeepsDequeuedMessage still does not prove the required dequeue/close overlap. It sends RDY after exit begins, polls Depth() for 500 ms without asserting success, then releases Close. The message can remain queued, be flushed normally, and pass the restart assertion.\n\nI removed the reference\u2019s delivery wait and added an exit guard that discards the already-selected message\u2019s registration. This faulty variant passed the targeted regression 5/5 times and the entire new-test suite.\n\nMake the regression establish an actual receive-before-registration overlap, fail if that setup is not reached, and verify preservation of the same message. Simply asserting eventual zero depth would not establish the critical overlap.\n\nT6 \u2014 Redundant test narration remains, including comments describing skipUnlessEnabled and restating helper names such as deferredCount. Remove those while retaining concise explanations of non-obvious synchronization.\n\nOther notes: 198 LOC in reference, acceptable but just flagging",
+  "fieldBands": {
+   "description": {
+    "band": 3
+   },
+   "solution": {
+    "band": 3
+   },
+   "tests": {
+    "band": 1,
+    "reasoning": "T3/T4 \u2014 TestChannelCloseKeepsDequeuedMessage still does not prove the required dequeue/close overlap. It sends RDY after exit begins, polls Depth() for 500 ms without asserting success, then releases Close. The message can remain queued, be flushed normally, and pass the restart assertion.\n\nI removed the reference\u2019s delivery wait and added an exit guard that discards the already-selected message\u2019s registration. This faulty variant passed the targeted regression 5/5 times and the entire new-test suite.\n\nMake the regression establish an actual receive-before-registration overlap, fail if that setup is not reached, and verify preservation of the same message. Simply asserting eventual zero depth would not establish the critical overlap.\n\nT6 \u2014 Redundant test narration remains, including comments describing skipUnlessEnabled and restating helper names such as deferredCount. Remove those while retaining concise explanations of non-obvious synchronization."
+   }
+  },
+  "internalNotes": null,
+  "otherNotes": "198 LOC in reference, acceptable but just flagging",
+  "otherNotesTags": null,
+  "outcome": "revision_requested",
+  "overallQuality": 2.333333333333333,
+  "qualityScore": 6,
+  "reasoning": null,
+  "reviewFormatVersion": 2,
+  "reviewId": "m573j2jt7tttcmmsganp0jc1wd8fb3wq",
+  "reviewerName": "tg 1239",
+  "submittedAt": 1790705807149,
+  "versionNumber": 5,
+  "submittedAtIST": "2026-09-29T23:46:47.149000+05:30"
+ },
+ {
+  "feedback": "Tests: This is non-blocking for the current implementation: the single-remover guard rejects the second delete before it can alter the first deletion\u2019s outcome. A failed first deletion retains the original channel, so waiting subscribers receive an error.\n\nThe tests cover duplicate deletion and failed-deletion behavior separately. Combining them would strengthen coverage, but the finding does not demonstrate a current correctness defect.",
+  "fieldBands": {
+   "description": {
+    "band": 3
+   },
+   "solution": {
+    "band": 3
+   },
+   "tests": {
+    "band": 2,
+    "reasoning": "This is non-blocking for the current implementation: the single-remover guard rejects the second delete before it can alter the first deletion\u2019s outcome. A failed first deletion retains the original channel, so waiting subscribers receive an error.\n\nThe tests cover duplicate deletion and failed-deletion behavior separately. Combining them would strengthen coverage, but the finding does not demonstrate a current correctness defect."
+   }
+  },
+  "internalNotes": null,
+  "otherNotes": null,
+  "otherNotesTags": null,
+  "outcome": "approved",
+  "overallQuality": 2.6666666666666665,
+  "qualityScore": 6,
+  "reasoning": null,
+  "reviewFormatVersion": 2,
+  "reviewId": "m57chhyrq89c4s1cv1jbkmpv7x8fd6sr",
+  "reviewerName": "tg 1239",
+  "submittedAt": 1790739456739,
+  "versionNumber": 6,
+  "submittedAtIST": "2026-09-30T09:07:36.739000+05:30"
+ },
+ {
+  "feedback": "Tests: This is non-blocking for the current implementation: the single-remover guard rejects the second delete before it can alter the first deletion\u2019s outcome. A failed first deletion retains the original channel, so waiting subscribers receive an error.\n\nThe tests cover duplicate deletion and failed-deletion behavior separately. Combining them would strengthen coverage, but the finding does not demonstrate a current correctness defect.",
+  "fieldBands": {
+   "description": {
+    "band": 3
+   },
+   "solution": {
+    "band": 3
+   },
+   "tests": {
+    "band": 2,
+    "reasoning": "This is non-blocking for the current implementation: the single-remover guard rejects the second delete before it can alter the first deletion\u2019s outcome. A failed first deletion retains the original channel, so waiting subscribers receive an error.\n\nThe tests cover duplicate deletion and failed-deletion behavior separately. Combining them would strengthen coverage, but the finding does not demonstrate a current correctness defect."
+   }
+  },
+  "internalNotes": null,
+  "otherNotes": null,
+  "otherNotesTags": null,
+  "outcome": "approved",
+  "overallQuality": 2.6666666666666665,
+  "qualityScore": 6,
+  "reasoning": null,
+  "reviewFormatVersion": 2,
+  "reviewId": "m5769m8nshx1aq9sbka50ndtm18ff82q",
+  "reviewerName": "tg 1239",
+  "submittedAt": 1790895176301,
+  "versionNumber": 7,
+  "submittedAtIST": "2026-10-02T04:22:56.301000+05:30"
+ }
+]

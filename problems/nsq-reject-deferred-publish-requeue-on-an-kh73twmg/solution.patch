@@ -1,0 +1,642 @@
+diff --git a/nsqd/channel.go b/nsqd/channel.go
+index 4225aff..49cbc3a 100644
+--- a/nsqd/channel.go
++++ b/nsqd/channel.go
+@@ -63,7 +63,18 @@ type Channel struct {
+ 	paused         int32
+ 	ephemeral      bool
+ 	deleteCallback func(*Channel)
+-	deleter        sync.Once
++	// removing is set (under the topic lock) by Topic.removeChannel before it
++	// deletes the channel, and removedChan is closed once that deletion has
++	// finished, successfully or not.
++	removing    int32
++	removedChan chan struct{}
++
++	// closingChan is closed when the channel starts exiting. deliveries
++	// counts the client message pumps taking messages from the channel;
++	// exit() waits for them to stop before it flushes or empties it, so a
++	// message a pump has already taken is in flight by then, not lost.
++	closingChan chan struct{}
++	deliveries  sync.WaitGroup
+ 
+ 	// Stats tracking
+ 	e2eProcessingLatencyStream *quantile.Quantile
+@@ -87,6 +98,8 @@ func NewChannel(topicName string, channelName string, nsqd *NSQD,
+ 		memoryMsgChan:            nil,
+ 		clients:                  make(map[int64]Consumer),
+ 		deleteCallback:           deleteCallback,
++		removedChan:              make(chan struct{}),
++		closingChan:              make(chan struct{}),
+ 		nsqd:                     nsqd,
+ 		ephemeral:                strings.HasSuffix(channelName, "#ephemeral"),
+ 		topologyAwareConsumption: nsqd.getOpts().HasExperiment(TopologyAwareConsumption),
+@@ -174,6 +187,7 @@ func (c *Channel) exit(deleted bool) error {
+ 	if !atomic.CompareAndSwapInt32(&c.exitFlag, 0, 1) {
+ 		return errors.New("exiting")
+ 	}
++	close(c.closingChan)
+ 
+ 	if deleted {
+ 		c.nsqd.logf(LOG_INFO, "CHANNEL(%s): deleting", c.name)
+@@ -194,6 +208,11 @@ func (c *Channel) exit(deleted bool) error {
+ 	}
+ 	c.RUnlock()
+ 
++	// wait for the message pumps to register any message they have taken;
++	// they stop on closingChan or on their connection closing, and never
++	// need exitMutex to do so
++	c.deliveries.Wait()
++
+ 	if deleted {
+ 		// empty the queue (deletes the backend files, too)
+ 		err := c.Empty()
+@@ -387,15 +406,26 @@ func (c *Channel) put(m *Message) error {
+ 	return nil
+ }
+ 
+-func (c *Channel) PutMessageDeferred(msg *Message, timeout time.Duration) {
+-	atomic.AddUint64(&c.messageCount, 1)
++// PutMessageDeferred registers msg for delayed delivery after timeout. It
++// returns an error once the channel has started exiting.
++func (c *Channel) PutMessageDeferred(msg *Message, timeout time.Duration) error {
+ 	if err := c.StartDeferredTimeout(msg, timeout); err != nil {
+-		c.nsqd.logf(LOG_ERROR, "CHANNEL(%s): failed to defer message - %s", c.name, err)
++		return err
+ 	}
++	atomic.AddUint64(&c.messageCount, 1)
++	return nil
+ }
+ 
+ // TouchMessage resets the timeout for an in-flight message
+ func (c *Channel) TouchMessage(clientID int64, id MessageID, clientMsgTimeout time.Duration) error {
++	// held across the pop and the reinsert, so a Close() in between cannot
++	// flush without the message
++	c.exitMutex.RLock()
++	defer c.exitMutex.RUnlock()
++	if c.Exiting() {
++		return errors.New("exiting")
++	}
++
+ 	msg, err := c.popInFlightMessage(clientID, id)
+ 	if err != nil {
+ 		return err
+@@ -438,6 +468,13 @@ func (c *Channel) FinishMessage(clientID int64, id MessageID) error {
+ //
+ //	and requeue a message (aka "deferred requeue")
+ func (c *Channel) RequeueMessage(clientID int64, id MessageID, timeout time.Duration) error {
++	// held across the pop and the re-registration, as in TouchMessage
++	c.exitMutex.RLock()
++	defer c.exitMutex.RUnlock()
++	if c.Exiting() {
++		return errors.New("exiting")
++	}
++
+ 	// remove from inflight first
+ 	msg, err := c.popInFlightMessage(clientID, id)
+ 	if err != nil {
+@@ -447,18 +484,11 @@ func (c *Channel) RequeueMessage(clientID int64, id MessageID, timeout time.Dura
+ 	atomic.AddUint64(&c.requeueCount, 1)
+ 
+ 	if timeout == 0 {
+-		c.exitMutex.RLock()
+-		if c.Exiting() {
+-			c.exitMutex.RUnlock()
+-			return errors.New("exiting")
+-		}
+-		err := c.put(msg)
+-		c.exitMutex.RUnlock()
+-		return err
++		return c.put(msg)
+ 	}
+ 
+ 	// deferred requeue
+-	return c.StartDeferredTimeout(msg, timeout)
++	return c.startDeferredTimeout(msg, timeout)
+ }
+ 
+ // AddClient adds a client to the Channel's client list
+@@ -466,7 +496,7 @@ func (c *Channel) AddClient(clientID int64, client Consumer) error {
+ 	c.exitMutex.RLock()
+ 	defer c.exitMutex.RUnlock()
+ 
+-	if c.Exiting() {
++	if c.Exiting() || atomic.LoadInt32(&c.removing) == 1 {
+ 		return errors.New("exiting")
+ 	}
+ 
+@@ -512,8 +542,25 @@ func (c *Channel) RemoveClient(clientID int64) {
+ 	c.Unlock()
+ 
+ 	if numClients == 0 && c.ephemeral {
+-		go c.deleter.Do(func() { c.deleteCallback(c) })
++		go c.deleteCallback(c)
++	}
++}
++
++// startDelivering registers a client message pump that is about to take
++// messages from c. It fails once c is exiting; otherwise the pump must call
++// stopDelivering once it stops taking messages, and exit() waits for that.
++func (c *Channel) startDelivering() bool {
++	c.exitMutex.RLock()
++	defer c.exitMutex.RUnlock()
++	if c.Exiting() {
++		return false
+ 	}
++	c.deliveries.Add(1)
++	return true
++}
++
++func (c *Channel) stopDelivering() {
++	c.deliveries.Done()
+ }
+ 
+ func (c *Channel) StartInFlightTimeout(msg *Message, clientID int64, timeout time.Duration) error {
+@@ -529,7 +576,19 @@ func (c *Channel) StartInFlightTimeout(msg *Message, clientID int64, timeout tim
+ 	return nil
+ }
+ 
++// StartDeferredTimeout registers msg for delayed delivery. Like PutMessage
++// it fails once the channel is exiting.
+ func (c *Channel) StartDeferredTimeout(msg *Message, timeout time.Duration) error {
++	c.exitMutex.RLock()
++	defer c.exitMutex.RUnlock()
++	if c.Exiting() {
++		return errors.New("exiting")
++	}
++	return c.startDeferredTimeout(msg, timeout)
++}
++
++// startDeferredTimeout expects the caller to hold exitMutex for reading.
++func (c *Channel) startDeferredTimeout(msg *Message, timeout time.Duration) error {
+ 	absTs := time.Now().Add(timeout).UnixNano()
+ 	item := &pqueue.Item{Value: msg, Priority: absTs}
+ 	err := c.pushDeferredMessage(item)
+diff --git a/nsqd/http.go b/nsqd/http.go
+index 9c463f1..c2dd6ad 100644
+--- a/nsqd/http.go
++++ b/nsqd/http.go
+@@ -436,7 +436,9 @@ func (s *httpServer) doCreateChannel(w http.ResponseWriter, req *http.Request, p
+ 	if err != nil {
+ 		return nil, err
+ 	}
+-	topic.GetChannel(channelName)
++	if _, err := topic.GetOrCreateChannel(channelName); err != nil {
++		return nil, http_api.Err{Code: 503, Text: "EXITING"}
++	}
+ 	return nil, nil
+ }
+ 
+diff --git a/nsqd/nsqd.go b/nsqd/nsqd.go
+index 7f2e0b1..de4701a 100644
+--- a/nsqd/nsqd.go
++++ b/nsqd/nsqd.go
+@@ -378,7 +378,11 @@ func (n *NSQD) LoadMetadata() error {
+ 				n.logf(LOG_WARN, "skipping creation of invalid channel %s", c.Name)
+ 				continue
+ 			}
+-			channel := topic.GetChannel(c.Name)
++			channel, err := topic.GetOrCreateChannel(c.Name)
++			if err != nil {
++				n.logf(LOG_ERROR, "TOPIC(%s): failed to create channel %s while loading metadata - %s", t.Name, c.Name, err)
++				continue
++			}
+ 			if c.Paused {
+ 				if err := channel.Pause(); err != nil {
+ 					n.logf(LOG_ERROR, "CHANNEL(%s): failed to pause while loading metadata - %s", c.Name, err)
+@@ -509,7 +513,9 @@ func (n *NSQD) GetTopic(topicName string) *Topic {
+ 		return t
+ 	}
+ 	deleteCallback := func(t *Topic) {
+-		_ = n.DeleteExistingTopic(t.name)
++		// an ephemeral topic that lost its last channel is only deleted if
++		// no channel has been created on it since
++		_ = n.removeTopic(t, true)
+ 	}
+ 	t = NewTopic(topicName, n, deleteCallback)
+ 	n.topicMap[topicName] = t
+@@ -537,7 +543,9 @@ func (n *NSQD) GetTopic(topicName string) *Topic {
+ 			if strings.HasSuffix(channelName, "#ephemeral") {
+ 				continue // do not create ephemeral channel with no consumer client
+ 			}
+-			t.GetChannel(channelName)
++			if _, err := t.GetOrCreateChannel(channelName); err != nil {
++				n.logf(LOG_ERROR, "TOPIC(%s): failed to pre-create channel %s - %s", t.name, channelName, err)
++			}
+ 		}
+ 	} else if len(n.getOpts().NSQLookupdTCPAddresses) > 0 {
+ 		n.logf(LOG_ERROR, "no available nsqlookupd to query for channels to pre-create for topic %s", t.name)
+@@ -559,6 +567,25 @@ func (n *NSQD) GetExistingTopic(topicName string) (*Topic, error) {
+ 	return topic, nil
+ }
+ 
++// awaitTopicReplacement blocks while t is being deleted and reports whether
++// its name now resolves to a replacement topic. A topic that is exiting
++// without being deleted (shutdown), or whose deletion failed, is never
++// replaced.
++func (n *NSQD) awaitTopicReplacement(t *Topic) bool {
++	if atomic.LoadInt32(&t.removing) == 0 {
++		return false
++	}
++	select {
++	case <-t.removedChan:
++	case <-n.exitChan:
++		return false
++	}
++	n.RLock()
++	current, ok := n.topicMap[t.name]
++	n.RUnlock()
++	return !ok || current != t
++}
++
+ // DeleteExistingTopic removes a topic only if it exists
+ func (n *NSQD) DeleteExistingTopic(topicName string) error {
+ 	n.RLock()
+@@ -568,19 +595,38 @@ func (n *NSQD) DeleteExistingTopic(topicName string) error {
+ 		return errors.New("topic does not exist")
+ 	}
+ 	n.RUnlock()
++	return n.removeTopic(topic, false)
++}
++
++// removeTopic deletes topic. With unusedOnly it leaves a topic that has
++// channels in place.
++func (n *NSQD) removeTopic(topic *Topic, unusedOnly bool) error {
++	// set the removal mark under the topic lock, which publishes, channel
++	// creation and subscribes hold while checking it
++	topic.Lock()
++	if unusedOnly && len(topic.channelMap) > 0 {
++		topic.Unlock()
++		return errors.New("topic in use")
++	}
++	if topic.Exiting() || !atomic.CompareAndSwapInt32(&topic.removing, 0, 1) {
++		topic.Unlock()
++		return errors.New("exiting")
++	}
++	topic.Unlock()
++	defer close(topic.removedChan)
+ 
+ 	// delete empties all channels and the topic itself before closing
+ 	// (so that we dont leave any messages around)
+ 	//
+ 	// we do this before removing the topic from map below (with no lock)
+-	// so that any incoming writes will error and not create a new topic
+-	// to enforce ordering
++	// so that any incoming writes error and subscribes wait for it rather
++	// than create a new topic
+ 	if err := topic.Delete(); err != nil {
+ 		return err
+ 	}
+ 
+ 	n.Lock()
+-	delete(n.topicMap, topicName)
++	delete(n.topicMap, topic.name)
+ 	n.Unlock()
+ 
+ 	return nil
+diff --git a/nsqd/protocol_v2.go b/nsqd/protocol_v2.go
+index 58fc820..b77c4c9 100644
+--- a/nsqd/protocol_v2.go
++++ b/nsqd/protocol_v2.go
+@@ -215,6 +215,10 @@ func (p *protocolV2) messagePump(client *clientV2, startedChan chan bool) {
+ 	var zoneMsgChan, regionMsgChan, memoryMsgChan chan *Message
+ 	var backendMsgChan <-chan []byte
+ 	var subChannel *Channel
++	// closingChan is closed once subChannel starts exiting; delivering is
++	// true while this pump is registered with subChannel
++	var closingChan <-chan struct{}
++	var delivering bool
+ 	// NOTE: `flusherChan` is used to bound message latency for
+ 	// the pathological case of a channel on a low volume topic
+ 	// with >1 clients having >1 RDY counts
+@@ -301,6 +305,16 @@ func (p *protocolV2) messagePump(client *clientV2, startedChan chan bool) {
+ 		case subChannel = <-subEventChan:
+ 			// you can't SUB anymore
+ 			subEventChan = nil
++			// register before taking any message, so that the channel's
++			// exit waits for us to put what we took in flight
++			if !subChannel.startDelivering() {
++				goto exit
++			}
++			delivering = true
++			closingChan = subChannel.closingChan
++		case <-closingChan:
++			// the channel is closing or being deleted, and closes our client
++			goto exit
+ 		case identifyData := <-identifyEventChan:
+ 			// you can't IDENTIFY anymore
+ 			identifyEventChan = nil
+@@ -385,6 +399,9 @@ exit:
+ 	p.nsqd.logf(LOG_INFO, "PROTOCOL(V2): [%s] exiting messagePump", client)
+ 	heartbeatTicker.Stop()
+ 	outputBufferTicker.Stop()
++	if delivering {
++		subChannel.stopDelivering()
++	}
+ 	if err != nil {
+ 		p.nsqd.logf(LOG_ERROR, "PROTOCOL(V2): [%s] messagePump error - %s", client, err)
+ 	}
+@@ -657,26 +674,9 @@ func (p *protocolV2) SUB(client *clientV2, params [][]byte) ([]byte, error) {
+ 		return nil, err
+ 	}
+ 
+-	// This retry-loop is a work-around for a race condition, where the
+-	// last client can leave the channel between GetChannel() and AddClient().
+-	// Avoid adding a client to an ephemeral channel / topic which has started exiting.
+-	var channel *Channel
+-	for i := 1; ; i++ {
+-		topic := p.nsqd.GetTopic(topicName)
+-		channel = topic.GetChannel(channelName)
+-		if err := channel.AddClient(client.ID, client); err != nil {
+-			return nil, protocol.NewFatalClientErr(err, "E_SUB_FAILED", "SUB failed "+err.Error())
+-		}
+-
+-		if (channel.ephemeral && channel.Exiting()) || (topic.ephemeral && topic.Exiting()) {
+-			channel.RemoveClient(client.ID)
+-			if i < 2 {
+-				time.Sleep(100 * time.Millisecond)
+-				continue
+-			}
+-			return nil, protocol.NewFatalClientErr(nil, "E_SUB_FAILED", "SUB failed to deleted topic/channel")
+-		}
+-		break
++	channel, err := p.subscribe(client, topicName, channelName)
++	if err != nil {
++		return nil, protocol.NewFatalClientErr(err, "E_SUB_FAILED", "SUB failed "+err.Error())
+ 	}
+ 	atomic.StoreInt32(&client.State, stateSubscribed)
+ 	client.Channel = channel
+@@ -686,6 +686,31 @@ func (p *protocolV2) SUB(client *clientV2, params [][]byte) ([]byte, error) {
+ 	return okBytes, nil
+ }
+ 
++// subscribe adds client to channelName on topicName. If the topic or the
++// channel is being deleted it waits for the deletion to finish and
++// subscribes to the one that replaces it, whether or not the channel already
++// existed; one that is exiting without being replaced (e.g. at shutdown) is
++// an error.
++func (p *protocolV2) subscribe(client *clientV2, topicName, channelName string) (*Channel, error) {
++	for {
++		topic := p.nsqd.GetTopic(topicName)
++		channel, err := topic.GetOrCreateChannel(channelName)
++		if err == nil {
++			err = topic.addClient(channel, client.ID, client)
++			if err == nil {
++				return channel, nil
++			}
++		}
++		if p.nsqd.awaitTopicReplacement(topic) {
++			continue
++		}
++		if channel != nil && topic.awaitChannelReplacement(channel) {
++			continue
++		}
++		return nil, err
++	}
++}
++
+ func (p *protocolV2) RDY(client *clientV2, params [][]byte) ([]byte, error) {
+ 	state := atomic.LoadInt32(&client.State)
+ 
+diff --git a/nsqd/topic.go b/nsqd/topic.go
+index db61c3b..fb79b85 100644
+--- a/nsqd/topic.go
++++ b/nsqd/topic.go
+@@ -20,12 +20,17 @@ type Topic struct {
+ 
+ 	sync.RWMutex
+ 
+-	name              string
+-	channelMap        map[string]*Channel
+-	backend           BackendQueue
+-	memoryMsgChan     chan *Message
+-	startChan         chan int
+-	exitChan          chan int
++	name          string
++	channelMap    map[string]*Channel
++	backend       BackendQueue
++	memoryMsgChan chan *Message
++	startChan     chan int
++	exitChan      chan int
++	// removing is set (under the topic lock) by NSQD.removeTopic before it
++	// deletes the topic, and removedChan is closed once that
++	// deletion has finished, successfully or not.
++	removing          int32
++	removedChan       chan struct{}
+ 	channelUpdateChan chan int
+ 	waitGroup         util.WaitGroupWrapper
+ 	exitFlag          int32
+@@ -33,7 +38,6 @@ type Topic struct {
+ 
+ 	ephemeral      bool
+ 	deleteCallback func(*Topic)
+-	deleter        sync.Once
+ 
+ 	paused    int32
+ 	pauseChan chan int
+@@ -49,6 +53,7 @@ func NewTopic(topicName string, nsqd *NSQD, deleteCallback func(*Topic)) *Topic
+ 		memoryMsgChan:     make(chan *Message, nsqd.getOpts().MemQueueSize),
+ 		startChan:         make(chan int, 1),
+ 		exitChan:          make(chan int),
++		removedChan:       make(chan struct{}),
+ 		channelUpdateChan: make(chan int),
+ 		nsqd:              nsqd,
+ 		paused:            0,
+@@ -95,13 +100,30 @@ func (t *Topic) Exiting() bool {
+ 	return atomic.LoadInt32(&t.exitFlag) == 1
+ }
+ 
++// closing reports whether t is exiting or marked for removal.
++func (t *Topic) closing() bool {
++	return atomic.LoadInt32(&t.exitFlag) == 1 || atomic.LoadInt32(&t.removing) == 1
++}
++
+ // GetChannel performs a thread safe operation
+ // to return a pointer to a Channel object (potentially new)
+-// for the given Topic
++// for the given Topic, or nil where GetOrCreateChannel returns an error.
+ func (t *Topic) GetChannel(channelName string) *Channel {
++	channel, _ := t.GetOrCreateChannel(channelName)
++	return channel
++}
++
++// GetOrCreateChannel returns the named channel, creating it if needed. It
++// fails if the channel does not exist and the topic is exiting or being
++// deleted: Topic.exit() closes only the channels that exist when it runs, so
++// a channel created later would never be closed, flushed or fed.
++func (t *Topic) GetOrCreateChannel(channelName string) (*Channel, error) {
+ 	t.Lock()
+-	channel, isNew := t.getOrCreateChannel(channelName)
++	channel, isNew, err := t.getOrCreateChannel(channelName)
+ 	t.Unlock()
++	if err != nil {
++		return nil, err
++	}
+ 
+ 	if isNew {
+ 		// update messagePump state
+@@ -111,22 +133,42 @@ func (t *Topic) GetChannel(channelName string) *Channel {
+ 		}
+ 	}
+ 
+-	return channel
++	return channel, nil
+ }
+ 
+ // this expects the caller to handle locking
+-func (t *Topic) getOrCreateChannel(channelName string) (*Channel, bool) {
++func (t *Topic) getOrCreateChannel(channelName string) (*Channel, bool, error) {
+ 	channel, ok := t.channelMap[channelName]
+-	if !ok {
+-		deleteCallback := func(c *Channel) {
+-			_ = t.DeleteExistingChannel(c.name)
+-		}
+-		channel = NewChannel(t.name, channelName, t.nsqd, deleteCallback)
+-		t.channelMap[channelName] = channel
+-		t.nsqd.logf(LOG_INFO, "TOPIC(%s): new channel(%s)", t.name, channel.name)
+-		return channel, true
++	if ok {
++		return channel, false, nil
++	}
++	if t.closing() {
++		return nil, false, errors.New("exiting")
+ 	}
+-	return channel, false
++	deleteCallback := func(c *Channel) {
++		// an ephemeral channel that lost its last client is only deleted if
++		// no client has subscribed to it since
++		_ = t.removeChannel(c, true)
++	}
++	channel = NewChannel(t.name, channelName, t.nsqd, deleteCallback)
++	t.channelMap[channelName] = channel
++	t.nsqd.logf(LOG_INFO, "TOPIC(%s): new channel(%s)", t.name, channel.name)
++	return channel, true, nil
++}
++
++// addClient adds client to channel, one of t's channels, unless t or channel
++// is exiting or marked for removal. Both removal marks are set under t's
++// write lock, so holding the read lock here makes the check and the add one
++// step: the client either joins before a deletion starts, and is closed by
++// it, or not at all. A channel being deleted is rejected before AddClient,
++// which would otherwise wait on it with t's lock held.
++func (t *Topic) addClient(channel *Channel, clientID int64, client Consumer) error {
++	t.RLock()
++	defer t.RUnlock()
++	if t.closing() || channel.Exiting() || atomic.LoadInt32(&channel.removing) == 1 {
++		return errors.New("exiting")
++	}
++	return channel.AddClient(clientID, client)
+ }
+ 
+ func (t *Topic) GetExistingChannel(channelName string) (*Channel, error) {
+@@ -147,6 +189,27 @@ func (t *Topic) DeleteExistingChannel(channelName string) error {
+ 	if !ok {
+ 		return errors.New("channel does not exist")
+ 	}
++	return t.removeChannel(channel, false)
++}
++
++// removeChannel deletes channel, one of t's channels. With unusedOnly it
++// leaves a channel that has clients in place.
++func (t *Topic) removeChannel(channel *Channel, unusedOnly bool) error {
++	// set the removal mark under the topic lock, which subscribes hold while
++	// checking it and adding their client
++	t.Lock()
++	channel.RLock()
++	inUse := len(channel.clients) > 0
++	channel.RUnlock()
++	if unusedOnly && inUse {
++		t.Unlock()
++		return errors.New("channel in use")
++	}
++	if channel.Exiting() || !atomic.CompareAndSwapInt32(&channel.removing, 0, 1) {
++		t.Unlock()
++		return errors.New("exiting")
++	}
++	t.Unlock()
+ 
+ 	t.nsqd.logf(LOG_INFO, "TOPIC(%s): deleting channel %s", t.name, channel.name)
+ 
+@@ -154,17 +217,18 @@ func (t *Topic) DeleteExistingChannel(channelName string) error {
+ 	// (so that we dont leave any messages around)
+ 	//
+ 	// we do this before removing the channel from map below (with no lock)
+-	// so that any incoming subs will error and not create a new channel
+-	// to enforce ordering
++	// so that any incoming subs wait for it rather than join this channel
+ 	err := channel.Delete()
+ 	if err != nil {
++		close(channel.removedChan)
+ 		return err
+ 	}
+ 
+ 	t.Lock()
+-	delete(t.channelMap, channelName)
++	delete(t.channelMap, channel.name)
+ 	numChannels := len(t.channelMap)
+ 	t.Unlock()
++	close(channel.removedChan)
+ 
+ 	// update messagePump state
+ 	select {
+@@ -173,17 +237,36 @@ func (t *Topic) DeleteExistingChannel(channelName string) error {
+ 	}
+ 
+ 	if numChannels == 0 && t.ephemeral {
+-		go t.deleter.Do(func() { t.deleteCallback(t) })
++		go t.deleteCallback(t)
+ 	}
+ 
+ 	return nil
+ }
+ 
++// awaitChannelReplacement blocks while c, one of t's channels, is being
++// deleted and reports whether its name no longer resolves to c. A channel
++// that is exiting without being deleted, or whose deletion failed, is never
++// replaced.
++func (t *Topic) awaitChannelReplacement(c *Channel) bool {
++	if atomic.LoadInt32(&c.removing) == 0 {
++		return false
++	}
++	select {
++	case <-c.removedChan:
++	case <-t.nsqd.exitChan:
++		return false
++	}
++	t.RLock()
++	current, ok := t.channelMap[c.name]
++	t.RUnlock()
++	return !ok || current != c
++}
++
+ // PutMessage writes a Message to the queue
+ func (t *Topic) PutMessage(m *Message) error {
+ 	t.RLock()
+ 	defer t.RUnlock()
+-	if atomic.LoadInt32(&t.exitFlag) == 1 {
++	if t.closing() {
+ 		return errors.New("exiting")
+ 	}
+ 	err := t.put(m)
+@@ -199,7 +282,7 @@ func (t *Topic) PutMessage(m *Message) error {
+ func (t *Topic) PutMessages(msgs []*Message) error {
+ 	t.RLock()
+ 	defer t.RUnlock()
+-	if atomic.LoadInt32(&t.exitFlag) == 1 {
++	if t.closing() {
+ 		return errors.New("exiting")
+ 	}
+ 
+@@ -330,7 +413,11 @@ func (t *Topic) messagePump() {
+ 				chanMsg.deferred = msg.deferred
+ 			}
+ 			if chanMsg.deferred != 0 {
+-				channel.PutMessageDeferred(chanMsg, chanMsg.deferred)
++				if err := channel.PutMessageDeferred(chanMsg, chanMsg.deferred); err != nil {
++					t.nsqd.logf(LOG_ERROR,
++						"TOPIC(%s) ERROR: failed to defer msg(%s) to channel(%s) - %s",
++						t.name, msg.ID, channel.name, err)
++				}
+ 				continue
+ 			}
+ 			err := channel.PutMessage(chanMsg)
