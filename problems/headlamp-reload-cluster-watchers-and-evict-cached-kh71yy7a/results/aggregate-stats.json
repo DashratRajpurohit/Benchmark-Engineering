@@ -1,0 +1,17 @@
+{
+ "byAgent": {
+  "codex_cli": {
+   "passed": 0,
+   "total": 2
+  }
+ },
+ "byModel": {
+  "openai/gpt-6.1-sol": {
+   "passed": 0,
+   "total": 2
+  }
+ },
+ "passedRuns": 0,
+ "totalRuns": 2,
+ "updatedAt": 1792571565032
+}

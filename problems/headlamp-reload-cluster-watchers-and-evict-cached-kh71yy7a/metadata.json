@@ -1,0 +1,17 @@
+{
+  "problemId": "kh71yy7anem2d82en49xwam7js8axc8r",
+  "title": "Reload cluster watchers and evict cached clients when a request-supplied kubeconfig changes",
+  "status": "draft",
+  "version": 4,
+  "versionId": "kd7cpnxq6mc0714yqw49zr9t5n8f496q",
+  "isLocked": false,
+  "language": "go",
+  "difficulty": null,
+  "category": "bugfix",
+  "repoUrl": "https://github.com/kubernetes-sigs/headlamp",
+  "commitHash": "dab1a6c5c0039c73ba4e3ab6df8775824a46e3b9",
+  "githubIssueUrl": null,
+  "estimatedLOC": null,
+  "testOutputMode": null,
+  "downloadedAt": "2026-10-24T17:10:37.506Z"
+}

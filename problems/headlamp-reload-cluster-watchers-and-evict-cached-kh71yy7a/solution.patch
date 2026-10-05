@@ -1,0 +1,705 @@
+diff --git a/backend/cmd/server.go b/backend/cmd/server.go
+index ab3b64d..7aa7267 100644
+--- a/backend/cmd/server.go
++++ b/backend/cmd/server.go
+@@ -169,13 +169,9 @@ func setupKubeConfigStoreWatcher(kubeConfigStore kubeconfig.ContextStore) {
+ 			}
+ 			syncMu.Unlock()
+ 
+-			active, err := kubeConfigStore.GetContextKeys()
+-			if err != nil {
++			if err := k8cache.SyncWatchersToStore(k8sResponseCache, kubeConfigStore.GetContextKeys); err != nil {
+ 				logger.Log(logger.LevelWarn, nil, err, "failed to get kubeconfig context keys; skipping watcher sync")
+-				return
+ 			}
+-
+-			k8cache.SyncWatchers(k8sResponseCache, active)
+ 		})
+ 	})
+ }
+@@ -265,6 +261,15 @@ func GetContextKeyAndKContext(w http.ResponseWriter,
+ 		return nil, nil, "", nil, err
+ 	}
+ 
++	// Nothing this request produces is cached or served once the store holds a different context.
++	resolved := r.WithContext(context.WithValue(r.Context(), resolvedContextKey{}, contextKey))
++
++	*r = *k8cache.WithConfigurationCheck(resolved, func() bool {
++		current, err := c.KubeConfigStore.GetContext(contextKey)
++
++		return err == nil && current == kContext
++	})
++
+ 	return ctx, span, contextKey, kContext, nil
+ }
+ 
+@@ -321,7 +326,7 @@ func cacheMiddlewareHandler(c *HeadlampConfig, next http.Handler, w http.Respons
+ 		return
+ 	}
+ 
+-	k8cache.CheckForChanges(k8sResponseCache, contextKey, *kContext)
++	k8cache.CheckForChangesFor(r, k8sResponseCache, contextKey, *kContext)
+ 
+ 	next.ServeHTTP(rcw, r)
+ 
+diff --git a/backend/cmd/stateless.go b/backend/cmd/stateless.go
+index 0fd740b..f11a479 100644
+--- a/backend/cmd/stateless.go
++++ b/backend/cmd/stateless.go
+@@ -20,10 +20,14 @@ import (
+ 	"encoding/json"
+ 	"fmt"
+ 	"net/http"
++	"reflect"
+ 	"regexp"
+ 	"strings"
++	"sync"
++	"sync/atomic"
+ 
+ 	"github.com/gorilla/mux"
++	"github.com/kubernetes-sigs/headlamp/backend/pkg/k8cache"
+ 	"github.com/kubernetes-sigs/headlamp/backend/pkg/kubeconfig"
+ 	"github.com/kubernetes-sigs/headlamp/backend/pkg/logger"
+ 	"k8s.io/apimachinery/pkg/runtime"
+@@ -64,30 +68,87 @@ func MarshalCustomObject(info runtime.Object, contextName string) (kubeconfig.Cu
+ 	return customObj, nil
+ }
+ 
+-// setKeyInCache sets the context in the cache with the given key.
+-func (c *HeadlampConfig) setKeyInCache(key string, context kubeconfig.Context) error {
+-	// check context is present
+-	_, err := c.KubeConfigStore.GetContext(key)
+-	if err != nil && err.Error() == "key not found" {
+-		// To ensure stateless clusters are not visible to other users, they are marked as internal clusters.
+-		// They are stored in the proxy cache and accessed through the /config endpoint.
+-		context.Internal = true
+-		if err = c.KubeConfigStore.AddContextWithKeyAndTTL(&context, key, ContextCacheTTL); err != nil {
+-			logger.Log(logger.LevelError, map[string]string{"key": key},
+-				err, "adding context to cache")
+-
+-			return err
+-		}
+-	} else {
+-		if err = c.KubeConfigStore.UpdateTTL(key, ContextUpdateCacheTTL); err != nil {
+-			logger.Log(logger.LevelError, map[string]string{"key": key},
+-				err, "updating context ttl")
++// statelessStoreMu serializes reading, replacing and reloading a key's request-supplied context.
++var statelessStoreMu sync.Mutex
+ 
+-			return err
+-		}
++// statelessArrivals numbers kubeconfig-supplying requests in arrival order, before parsing.
++var statelessArrivals atomic.Uint64
++
++// resolvedContextKey marks a request whose context key has already been resolved.
++type resolvedContextKey struct{}
++
++// setKeyInCache caches context under key, replacing an earlier request's context that differs.
++func (c *HeadlampConfig) setKeyInCache(key string, context kubeconfig.Context, arrival uint64) error {
++	statelessStoreMu.Lock()
++	defer statelessStoreMu.Unlock()
++
++	existing, err := c.KubeConfigStore.GetContext(key)
++	if err != nil && err.Error() != "key not found" {
++		return err
++	}
++
++	if err == nil && !existing.Internal {
++		// A cluster the server started with is shared; requests never modify it.
++		return nil
+ 	}
+ 
+-	return nil
++	if err == nil && existing.Arrival != nil && existing.Arrival.Load() > arrival {
++		// A later request has already supplied this key's configuration; this one must not roll it back.
++		logger.Log(logger.LevelInfo, map[string]string{"key": key}, nil,
++			"ignoring kubeconfig of a request superseded by a later one")
++
++		return nil
++	}
++
++	if err == nil && !statelessConfigChanged(existing, &context) {
++		return c.refreshStatelessContext(key, existing, arrival)
++	}
++
++	return c.replaceStatelessContext(key, context, arrival)
++}
++
++// refreshStatelessContext marks the stored context as last supplied by arrival and extends its lifetime.
++// statelessStoreMu must be held.
++func (c *HeadlampConfig) refreshStatelessContext(key string, existing *kubeconfig.Context, arrival uint64) error {
++	if existing.Arrival != nil {
++		existing.Arrival.Store(arrival)
++	}
++
++	err := c.KubeConfigStore.UpdateTTL(key, ContextUpdateCacheTTL)
++	if err != nil {
++		logger.Log(logger.LevelError, map[string]string{"key": key}, err, "updating context ttl")
++	}
++
++	return err
++}
++
++// replaceStatelessContext stores context under key and drops everything cached for the one it replaces.
++// statelessStoreMu must be held.
++func (c *HeadlampConfig) replaceStatelessContext(key string, context kubeconfig.Context, arrival uint64) error {
++	// Stateless contexts are marked internal so they are not offered to other users.
++	context.Internal = true
++	context.Arrival = new(atomic.Uint64)
++	context.Arrival.Store(arrival)
++
++	// Build the proxy before the context is shared between concurrent requests.
++	if err := context.SetupProxy(); err != nil {
++		logger.Log(logger.LevelWarn, map[string]string{"key": key}, err, "setting up proxy for context")
++	}
++
++	err := k8cache.ReplaceConfiguration(k8sResponseCache, key, &context, func() error {
++		return c.KubeConfigStore.AddContextWithKeyAndTTL(&context, key, ContextCacheTTL)
++	})
++	if err != nil {
++		logger.Log(logger.LevelError, map[string]string{"key": key}, err, "storing context in cache")
++	}
++
++	return err
++}
++
++// statelessConfigChanged reports whether next connects or authenticates differently from prev.
++func statelessConfigChanged(prev, next *kubeconfig.Context) bool {
++	return !reflect.DeepEqual(prev.Cluster, next.Cluster) ||
++		!reflect.DeepEqual(prev.AuthInfo, next.AuthInfo)
+ }
+ 
+ // Handles stateless cluster requests if kubeconfig is set and dynamic clusters are enabled.
+@@ -95,6 +156,7 @@ func (c *HeadlampConfig) setKeyInCache(key string, context kubeconfig.Context) e
+ func (c *HeadlampConfig) handleStatelessReq(r *http.Request, kubeConfig string) (string, error) {
+ 	var contextKey string
+ 
++	arrival := statelessArrivals.Add(1)
+ 	userID := r.Header.Get("X-HEADLAMP-USER-ID")
+ 	targetClusterName := mux.Vars(r)["clusterName"]
+ 
+@@ -147,7 +209,7 @@ func (c *HeadlampConfig) handleStatelessReq(r *http.Request, kubeConfig string)
+ 
+ 		cacheKey := statelessContextKey(effectiveContextName, userID)
+ 
+-		if err := c.setKeyInCache(cacheKey, context); err != nil {
++		if err := c.setKeyInCache(cacheKey, context, arrival); err != nil {
+ 			return "", err
+ 		}
+ 
+@@ -267,6 +329,11 @@ func websocketConnContextKey(r *http.Request, clusterName string) string {
+ // For stateless clusters it is combination of cluster name and user id.
+ // For normal clusters it is just the cluster name.
+ func (c *HeadlampConfig) getContextKeyForRequest(r *http.Request) (string, error) {
++	// Reuse the cache middleware's resolution; applying the kubeconfig again could undo a later replacement.
++	if key, ok := r.Context().Value(resolvedContextKey{}).(string); ok {
++		return key, nil
++	}
++
+ 	var contextKey string
+ 
+ 	clusterName := mux.Vars(r)["clusterName"]
+diff --git a/backend/pkg/k8cache/authorization.go b/backend/pkg/k8cache/authorization.go
+index f91842a..ad1e519 100644
+--- a/backend/pkg/k8cache/authorization.go
++++ b/backend/pkg/k8cache/authorization.go
+@@ -20,6 +20,7 @@
+ package k8cache
+ 
+ import (
++	"errors"
+ 	"fmt"
+ 	"net/http"
+ 	"strconv"
+@@ -205,6 +206,25 @@ func EvictClientsetsForCluster(clientsetCachePrefix string) {
+ 	}
+ }
+ 
++// dropClientsetsForPrefixLocked drops cached and in-flight clientsets for contextKey. mu must be held.
++func dropClientsetsForPrefixLocked(contextKey string) {
++	prefix := contextKey + "\x00"
++
++	for key := range clientsetCache {
++		if strings.HasPrefix(key, prefix) {
++			delete(clientsetCache, key)
++		}
++	}
++
++	for key := range inFlight {
++		if strings.HasPrefix(key, prefix) {
++			delete(inFlight, key)
++		}
++	}
++
++	delete(blockedClientsetPrefixes, contextKey)
++}
++
+ // clientsetCachePrefixFromCacheKey returns the Headlamp context store key prefix
+ // from a clientset cache key (everything before the final NUL separator).
+ func clientsetCachePrefixFromCacheKey(cacheKey string) string {
+@@ -260,7 +280,19 @@ func createAndCacheClientSet(
+ 	k *kubeconfig.Context,
+ 	token, cacheKey string,
+ 	contextKey []string,
++	isCurrent func() bool,
+ ) (*kubernetes.Clientset, error) {
++	// A replacement applies its store, purge and watcher swap under reloadMu's write lock. Holding the
++	// read lock across the check and the build makes them one step: either this build completes first and
++	// the replacement then evicts it, or the replacement is already visible here and nothing is built for
++	// the configuration it replaced.
++	reloadMu.RLock()
++	defer reloadMu.RUnlock()
++
++	if superseded(isCurrent) {
++		return nil, ErrSupersededConfiguration
++	}
++
+ 	hookMu.RLock()
+ 
+ 	creator := clientsetCreator
+@@ -328,7 +360,11 @@ func finishInFlightClientset(cacheKey string, entry *inFlightEntry, cs *kubernet
+ 	entry.cs = cs
+ 	entry.err = err
+ 
+-	delete(inFlight, cacheKey)
++	// A reload may have dropped this build and let a build for the new configuration take its place.
++	if inFlight[cacheKey] == entry {
++		delete(inFlight, cacheKey)
++	}
++
+ 	close(entry.waitCh)
+ 
+ 	mu.Unlock()
+@@ -340,6 +376,13 @@ func finishInFlightClientset(cacheKey string, entry *inFlightEntry, cs *kubernet
+ // identity. headlampContextKey is the key used in the kubeconfig store (for stateless
+ // clusters this includes the user ID, e.g. "cluster\x00userID").
+ func GetClientSet(headlampContextKey string, k *kubeconfig.Context, token string) (*kubernetes.Clientset, error) {
++	return getClientSetChecked(headlampContextKey, k, token, nil)
++}
++
++// getClientSetChecked is GetClientSet for a caller whose configuration isCurrent reports on.
++func getClientSetChecked(
++	headlampContextKey string, k *kubeconfig.Context, token string, isCurrent func() bool,
++) (*kubernetes.Clientset, error) {
+ 	if headlampContextKey == "" {
+ 		return nil, fmt.Errorf("empty headlamp context key in GetClientSet")
+ 	}
+@@ -353,6 +396,28 @@ func GetClientSet(headlampContextKey string, k *kubeconfig.Context, token string
+ 
+ 	cacheKey := headlampContextKey + "\x00" + token
+ 
++	for attempt := 0; attempt < clientsetBuildAttempts; attempt++ {
++		cs, err := attemptClientSet(k, token, cacheKey, contextKey, isCurrent)
++		if !errors.Is(err, errRetryClientsetBuild) {
++			return cs, err
++		}
++	}
++
++	return nil, ErrSupersededConfiguration
++}
++
++// attemptClientSet serves or builds cacheKey's clientset once. It reports errRetryClientsetBuild when the
++// build it waited on was refused for a configuration this request does not share, so that a request which
++// is itself still current builds its own instead of inheriting that refusal.
++func attemptClientSet(
++	k *kubeconfig.Context, token, cacheKey string, contextKey []string, isCurrent func() bool,
++) (*kubernetes.Clientset, error) {
++	// A request whose configuration was replaced must not authorize against it, so it is refused before
++	// the cache is consulted and before any clientset for it is built.
++	if superseded(isCurrent) {
++		return nil, ErrSupersededConfiguration
++	}
++
+ 	// Check cache first
+ 	if cs, found := getCachedClientSet(cacheKey); found {
+ 		return cs, nil
+@@ -371,11 +436,25 @@ func GetClientSet(headlampContextKey string, k *kubeconfig.Context, token string
+ 		}
+ 	}
+ 
++	// Replacement stores and purges under mu, so re-checking here cannot interleave with it: a request
++	// superseded since entry is refused without building anything and without leaving an in-flight
++	// entry a current request could wait on.
++	if superseded(isCurrent) {
++		mu.Unlock()
++
++		return nil, ErrSupersededConfiguration
++	}
++
+ 	// If another goroutine is already creating this clientset, wait for it.
+ 	if entry, ok := inFlight[cacheKey]; ok {
+ 		mu.Unlock()
+ 
+-		return waitForInFlightClientset(entry)
++		cs, err := waitForInFlightClientset(entry)
++		if errors.Is(err, ErrSupersededConfiguration) && !superseded(isCurrent) {
++			return nil, errRetryClientsetBuild
++		}
++
++		return cs, err
+ 	}
+ 
+ 	// We are the one to create it.
+@@ -386,7 +465,7 @@ func GetClientSet(headlampContextKey string, k *kubeconfig.Context, token string
+ 
+ 	mu.Unlock()
+ 
+-	cs, err := createAndCacheClientSet(k, token, cacheKey, contextKey)
++	cs, err := createAndCacheClientSet(k, token, cacheKey, contextKey, isCurrent)
+ 
+ 	finishInFlightClientset(cacheKey, entry, cs, err)
+ 
+@@ -432,7 +511,7 @@ func IsAllowed(
+ ) (bool, error) {
+ 	token := auth.BearerTokenValue(r.Header.Get("Authorization"))
+ 
+-	clientset, err := GetClientSet(headlampContextKey, k, token)
++	clientset, err := getClientSetChecked(headlampContextKey, k, token, configurationCheck(r))
+ 	if err != nil {
+ 		return false, err
+ 	}
+diff --git a/backend/pkg/k8cache/cacheInvalidation.go b/backend/pkg/k8cache/cacheInvalidation.go
+index 69de3d0..d424b9b 100644
+--- a/backend/pkg/k8cache/cacheInvalidation.go
++++ b/backend/pkg/k8cache/cacheInvalidation.go
+@@ -183,6 +183,9 @@ func filterImportantResources(gvrList []schema.GroupVersionResource) []schema.Gr
+ var (
+ 	watcherRegistry sync.Map
+ 	contextCancel   sync.Map
++	// watcherOwner records which watcher owns each key's registration.
++	watcherOwner sync.Map
++	watcherMu    sync.Mutex
+ )
+ 
+ // CheckForChanges lets 1 go routine to run for a contextKey which prevents
+@@ -193,6 +196,32 @@ func CheckForChanges(
+ 	contextKey string,
+ 	kContext kubeconfig.Context,
+ ) {
++	watcherMu.Lock()
++	defer watcherMu.Unlock()
++
++	startWatcherLocked(k8scache, contextKey, kContext)
++}
++
++// CheckForChangesFor starts a watcher only while r's configuration is still the stored one.
++func CheckForChangesFor(r *http.Request, k8scache cache.Cache[string], contextKey string, kContext kubeconfig.Context) {
++	// A replacement applies its store, purge and watcher swap under reloadMu's write lock, so holding the
++	// read lock makes this check and the registration below one step against it: the predicate cannot go
++	// stale between them.
++	reloadMu.RLock()
++	defer reloadMu.RUnlock()
++
++	watcherMu.Lock()
++	defer watcherMu.Unlock()
++
++	if superseded(configurationCheck(r)) {
++		return
++	}
++
++	startWatcherLocked(k8scache, contextKey, kContext)
++}
++
++// startWatcherLocked starts a watcher unless one is registered. watcherMu must be held.
++func startWatcherLocked(k8scache cache.Cache[string], contextKey string, kContext kubeconfig.Context) {
+ 	if _, loaded := watcherRegistry.LoadOrStore(contextKey, struct{}{}); loaded {
+ 		return
+ 	}
+@@ -200,10 +229,76 @@ func CheckForChanges(
+ 	ctx, cancel := context.WithCancel(context.Background())
+ 
+ 	contextCancel.Store(contextKey, cancel)
++	watcherOwner.Store(contextKey, ctx)
+ 
+ 	go runWatcher(ctx, k8scache, contextKey, kContext)
+ }
+ 
++// ReplaceConfiguration stores contextKey's new configuration, drops what was cached for any earlier one
++// in the same step, and restarts the key's watcher for kContext.
++func ReplaceConfiguration(
++	k8scache cache.Cache[string], contextKey string, kContext *kubeconfig.Context, store func() error,
++) error {
++	if contextKey == "" || kContext == nil {
++		return errors.New("replacing configuration: empty context key or nil context")
++	}
++
++	// The store, the purge and the watcher swap are a single step: a request checking whether its own
++	// configuration is still current must never observe a half-applied replacement.
++	reloadMu.Lock()
++	defer reloadMu.Unlock()
++
++	if err := storeAndPurgeLocked(k8scache, contextKey, store); err != nil {
++		return err
++	}
++
++	watcherMu.Lock()
++	defer watcherMu.Unlock()
++
++	if cancel, ok := contextCancel.LoadAndDelete(contextKey); ok {
++		logger.Log(logger.LevelInfo, nil, nil, "stopping watcher for replaced configuration: "+redactContextKey(contextKey))
++
++		if stop, ok := cancel.(context.CancelFunc); ok {
++			stop()
++		}
++	}
++
++	watcherRegistry.Delete(contextKey)
++	startWatcherLocked(k8scache, contextKey, *kContext.Copy())
++
++	return nil
++}
++
++// storeAndPurgeLocked runs store and purges contextKey's cached state. reloadMu must be held.
++func storeAndPurgeLocked(k8scache cache.Cache[string], contextKey string, store func() error) error {
++	mu.Lock()
++	defer mu.Unlock()
++
++	if err := store(); err != nil {
++		return err
++	}
++
++	PurgeCacheForContext(k8scache, contextKey)
++	dropClientsetsForPrefixLocked(contextKey)
++
++	return nil
++}
++
++// SyncWatchersToStore reads the active contexts and syncs watchers to them without an interleaved replacement.
++func SyncWatchersToStore(k8scache cache.Cache[string], activeContexts func() ([]string, error)) error {
++	reloadMu.Lock()
++	defer reloadMu.Unlock()
++
++	active, err := activeContexts()
++	if err != nil {
++		return err
++	}
++
++	SyncWatchers(k8scache, active)
++
++	return nil
++}
++
+ // SyncWatchers stops watchers for contexts that are no longer active and purges
+ // their cached API responses and authorization clientsets.
+ // activeContexts is a list of currently valid context keys.
+@@ -260,6 +355,17 @@ func runWatcher(
+ 	kContext kubeconfig.Context,
+ ) {
+ 	defer func() {
++		watcherMu.Lock()
++		defer watcherMu.Unlock()
++
++		if owner, ok := watcherOwner.Load(contextKey); ok && owner != ctx {
++			logger.Log(logger.LevelInfo, nil, nil,
++				"stale watcher exited; keeping its replacement registered: "+redactContextKey(contextKey))
++
++			return
++		}
++
++		watcherOwner.Delete(contextKey)
+ 		watcherRegistry.Delete(contextKey)
+ 		contextCancel.Delete(contextKey)
+ 	}()
+diff --git a/backend/pkg/k8cache/cacheStore.go b/backend/pkg/k8cache/cacheStore.go
+index c420a44..96e8f5f 100644
+--- a/backend/pkg/k8cache/cacheStore.go
++++ b/backend/pkg/k8cache/cacheStore.go
+@@ -258,8 +258,14 @@ func FilterHeaderForCache(responseHeaders http.Header, encoding string) http.Hea
+ func LoadFromCache(k8scache cache.Cache[string], isAllowed bool,
+ 	key string, w http.ResponseWriter, r *http.Request,
+ ) (bool, error) {
++	reloadMu.RLock()
++
++	replaced := superseded(configurationCheck(r))
+ 	k8Resource, err := k8scache.Get(context.Background(), key)
+-	if err == nil && strings.TrimSpace(k8Resource) != "" && isAllowed {
++
++	reloadMu.RUnlock()
++
++	if err == nil && strings.TrimSpace(k8Resource) != "" && isAllowed && !replaced {
+ 		var cachedData CachedResponseData
+ 		if err := json.Unmarshal([]byte(k8Resource), &cachedData); err != nil {
+ 			return false, err
+@@ -316,7 +322,8 @@ func StoreK8sResponseInCache(k8scache cache.Cache[string],
+ 		}
+ 
+ 		if !strings.Contains(string(jsonBytes), "Failure") {
+-			if err = k8scache.SetWithTTL(context.Background(), key, string(jsonBytes), 10*time.Minute); err != nil {
++			stored, err := storeUnlessSuperseded(k8scache, r, key, string(jsonBytes))
++			if err != nil || !stored {
+ 				return err
+ 			}
+ 
+@@ -327,6 +334,20 @@ func StoreK8sResponseInCache(k8scache cache.Cache[string],
+ 	return nil
+ }
+ 
++// storeUnlessSuperseded caches value unless r's configuration has been replaced, reporting whether it did.
++func storeUnlessSuperseded(k8scache cache.Cache[string], r *http.Request, key, value string) (bool, error) {
++	reloadMu.RLock()
++	defer reloadMu.RUnlock()
++
++	if superseded(configurationCheck(r)) {
++		logger.Log(logger.LevelInfo, nil, nil, "not caching a response for a replaced configuration: "+redactCacheKey(key))
++
++		return false, nil
++	}
++
++	return true, k8scache.SetWithTTL(context.Background(), key, value, 10*time.Minute)
++}
++
+ // redactContextKey returns a redacted version of the context key to avoid leaking PII/sensitive info in logs.
+ func redactContextKey(key string) string {
+ 	if key == "" {
+diff --git a/backend/pkg/k8cache/export_test.go b/backend/pkg/k8cache/export_test.go
+index 230bb89..806cc04 100644
+--- a/backend/pkg/k8cache/export_test.go
++++ b/backend/pkg/k8cache/export_test.go
+@@ -21,10 +21,17 @@ func ExportedRunWatcher(
+ 	runWatcher(ctx, k8scache, contextKey, kContext)
+ }
+ 
+-// ResetRegistries clears both registries for test isolation.
++// ResetRegistries clears the watcher registries for test isolation.
+ // If no keys are provided, it clears all entries.
+ func ResetRegistries(keys ...string) {
++	watcherMu.Lock()
++	defer watcherMu.Unlock()
++
+ 	if len(keys) == 0 {
++		watcherOwner.Range(func(key, _ interface{}) bool {
++			watcherOwner.Delete(key)
++			return true
++		})
+ 		watcherRegistry.Range(func(key, _ interface{}) bool {
+ 			watcherRegistry.Delete(key)
+ 			return true
+@@ -38,6 +45,7 @@ func ResetRegistries(keys ...string) {
+ 	}
+ 
+ 	for _, k := range keys {
++		watcherOwner.Delete(k)
+ 		watcherRegistry.Delete(k)
+ 		contextCancel.Delete(k)
+ 	}
+diff --git a/backend/pkg/k8cache/superseded_config.go b/backend/pkg/k8cache/superseded_config.go
+new file mode 100644
+index 0000000..60eacfe
+--- /dev/null
++++ b/backend/pkg/k8cache/superseded_config.go
+@@ -0,0 +1,54 @@
++// Copyright 2025 The Kubernetes Authors.
++// Licensed under the Apache License, Version 2.0 (the "License");
++// you may not use this file except in compliance with the License.
++// You may obtain a copy of the License at
++//
++//	http://www.apache.org/licenses/LICENSE-2.0
++//
++// Unless required by applicable law or agreed to in writing, software
++// distributed under the License is distributed on an "AS IS" BASIS,
++// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++// See the License for the specific language governing permissions and
++// limitations under the License.
++
++package k8cache
++
++import (
++	"context"
++	"errors"
++	"net/http"
++	"sync"
++)
++
++// ErrSupersededConfiguration reports that the configuration a request resolved was replaced while it ran,
++// so nothing may be built, reused or authorized against it.
++var ErrSupersededConfiguration = errors.New("request configuration was superseded")
++
++// errRetryClientsetBuild reports that a build this request waited on was refused for a configuration the
++// request does not share, so it must build its own.
++var errRetryClientsetBuild = errors.New("retry clientset build")
++
++// clientsetBuildAttempts bounds those retries so concurrent replacements cannot spin a request forever.
++const clientsetBuildAttempts = 3
++
++// reloadMu orders cached-response reads and writes (read lock) against reload purges (write lock).
++var reloadMu sync.RWMutex
++
++type configurationCheckKey struct{}
++
++// WithConfigurationCheck attaches isCurrent to r; once it reports false, nothing for r is cached or served.
++func WithConfigurationCheck(r *http.Request, isCurrent func() bool) *http.Request {
++	return r.WithContext(context.WithValue(r.Context(), configurationCheckKey{}, isCurrent))
++}
++
++// configurationCheck returns the check r carries, or nil when it carries none.
++func configurationCheck(r *http.Request) func() bool {
++	isCurrent, _ := r.Context().Value(configurationCheckKey{}).(func() bool)
++
++	return isCurrent
++}
++
++// superseded reports whether the configuration isCurrent reports on was replaced.
++func superseded(isCurrent func() bool) bool {
++	return isCurrent != nil && !isCurrent()
++}
+diff --git a/backend/pkg/k8cache/testing_reset.go b/backend/pkg/k8cache/testing_reset.go
+index 590028e..ead5bb8 100644
+--- a/backend/pkg/k8cache/testing_reset.go
++++ b/backend/pkg/k8cache/testing_reset.go
+@@ -29,6 +29,14 @@ func ResetForTesting() {
+ }
+ 
+ func clearWatcherRegistriesForTesting() {
++	watcherMu.Lock()
++	defer watcherMu.Unlock()
++
++	watcherOwner.Range(func(key, _ interface{}) bool {
++		watcherOwner.Delete(key)
++
++		return true
++	})
+ 	contextCancel.Range(func(key, value interface{}) bool {
+ 		if cancel, ok := value.(context.CancelFunc); ok {
+ 			cancel()
+diff --git a/backend/pkg/kubeconfig/kubeconfig.go b/backend/pkg/kubeconfig/kubeconfig.go
+index f48ca92..d9db317 100644
+--- a/backend/pkg/kubeconfig/kubeconfig.go
++++ b/backend/pkg/kubeconfig/kubeconfig.go
+@@ -10,6 +10,7 @@ import (
+ 	"os"
+ 	"runtime"
+ 	"strings"
++	"sync/atomic"
+ 
+ 	"gopkg.in/yaml.v2"
+ 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+@@ -77,6 +78,8 @@ type Context struct {
+ 	ClusterID string `json:"clusterID"`
+ 	// ClusterInventory stores metadata copied from a Cluster Inventory ClusterProfile.
+ 	ClusterInventory *inventorymetadata.Metadata `json:"clusterInventory,omitempty"`
++	// Arrival is the arrival order of the latest request that supplied this context; nil otherwise.
++	Arrival *atomic.Uint64 `json:"-"`
+ }
+ 
+ // Copy creates a deep copy of the Context, excluding the proxy field which is created on demand.
+@@ -118,6 +121,12 @@ func (c *Context) Copy() *Context {
+ 		authInfo = c.AuthInfo.DeepCopy()
+ 	}
+ 
++	var arrival *atomic.Uint64
++	if c.Arrival != nil {
++		arrival = new(atomic.Uint64)
++		arrival.Store(c.Arrival.Load())
++	}
++
+ 	return &Context{
+ 		Name:             c.Name,
+ 		KubeContext:      kubeContext,
+@@ -130,6 +139,7 @@ func (c *Context) Copy() *Context {
+ 		KubeConfigPath:   c.KubeConfigPath,
+ 		ClusterID:        c.ClusterID,
+ 		ClusterInventory: c.ClusterInventory.DeepCopy(),
++		Arrival:          arrival,
+ 	}
+ }
+ 

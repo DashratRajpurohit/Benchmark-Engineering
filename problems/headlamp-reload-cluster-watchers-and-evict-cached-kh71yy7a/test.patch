@@ -1,0 +1,921 @@
+diff --git a/backend/cmd/headlamp_test.go b/backend/cmd/headlamp_test.go
+index 6792ff2..5d7afe9 100644
+--- a/backend/cmd/headlamp_test.go
++++ b/backend/cmd/headlamp_test.go
+@@ -1551,10 +1551,11 @@ func TestHandleClusterAPI_XForwardedHost(t *testing.T) {
+ 	assert.Equal(t, "OK", rr.Body.String())
+ }
+ 
+-// handleClusterRenameRequest handles a cluster rename request.
++// handleClusterRenameRequest handles a cluster rename request against renameFixture.
+ func handleClusterRenameRequest(
+ 	t *testing.T,
+ 	handler http.Handler,
++	renameFixture string,
+ 	tc struct {
+ 		name          string
+ 		clusterReq    RenameClusterRequest
+@@ -1566,7 +1567,7 @@ func handleClusterRenameRequest(
+ 	var err error
+ 
+ 	if tc.clusterReq.Source == "kubeconfig" {
+-		url := "/cluster/minikubetestnondynamic?ClusterID=./headlamp_testdata/kubeconfig_rename:minikubetestnondynamic"
++		url := "/cluster/minikubetestnondynamic?ClusterID=" + renameFixture + ":minikubetestnondynamic"
+ 		r, err = getResponseFromRestrictedEndpoint(handler, "PUT", url, tc.clusterReq)
+ 		require.NoError(t, err)
+ 		assert.Equal(t, tc.expectedState, r.Code)
+@@ -1752,16 +1753,16 @@ func runClusterRenameTests(
+ 		expectedState int
+ 	},
+ ) {
+-	resetConfigByte, err := os.ReadFile("./headlamp_testdata/kubeconfig_rename")
++	original, err := os.ReadFile("./headlamp_testdata/kubeconfig_rename")
+ 	require.NoError(t, err)
+ 
++	// Renaming rewrites the kubeconfig, so it runs against a copy rather than the checked-in fixture.
++	renameFixture := filepath.Join(t.TempDir(), "kubeconfig_rename")
++	require.NoError(t, os.WriteFile(renameFixture, original, 0o600)) //nolint:gosec // the test's own temp directory
++
+ 	for _, tc := range tests {
+-		handleClusterRenameRequest(t, handler, tc)
++		handleClusterRenameRequest(t, handler, renameFixture, tc)
+ 	}
+-
+-	// This test modifies the test file, so we have to restore the test file at the end of the test.
+-	err = os.WriteFile("./headlamp_testdata/kubeconfig_rename", resetConfigByte, 0o600) //nolint:gosec
+-	require.NoError(t, err)
+ }
+ 
+ // TestRenameCluster checks the cluster rename functionality.
+diff --git a/backend/cmd/stateless_reload_test.go b/backend/cmd/stateless_reload_test.go
+new file mode 100644
+index 0000000..23c3bb1
+--- /dev/null
++++ b/backend/cmd/stateless_reload_test.go
+@@ -0,0 +1,799 @@
++//go:build reconciliation
++
++package main
++
++import (
++	"bytes"
++	"context"
++	"encoding/base64"
++	"fmt"
++	"net/http"
++	"net/http/httptest"
++	"net/url"
++	"runtime/pprof"
++	"strings"
++	"sync"
++	"testing"
++	"time"
++
++	"github.com/gorilla/mux"
++	"github.com/kubernetes-sigs/headlamp/backend/pkg/cache"
++	"github.com/kubernetes-sigs/headlamp/backend/pkg/headlampconfig"
++	"github.com/kubernetes-sigs/headlamp/backend/pkg/k8cache"
++	"github.com/kubernetes-sigs/headlamp/backend/pkg/kubeconfig"
++	"github.com/stretchr/testify/assert"
++	"github.com/stretchr/testify/require"
++)
++
++const reloadCluster = "reload-cluster"
++
++// reloadServer is a stand-in cluster API server that counts the watches it serves.
++type reloadServer struct {
++	*httptest.Server
++	mu     sync.Mutex
++	open   int
++	opened int
++	// reviewed counts the authorization reviews sent to the server, which answers them only with
++	// authorizeReviews set. With holdReview set, the next review closes reviewHeld and waits for release.
++	reviewed         int
++	authorizeReviews bool
++	holdReview       bool
++	reviewHeld       chan struct{}
++	done             chan struct{}
++	// A pods list carrying holdHeader waits for release, after closing held.
++	held     chan struct{}
++	release  chan struct{}
++	heldOnce sync.Once
++	// With holdDiscovery set, the next discovery request closes discoveryHeld, then fails on release.
++	holdDiscovery    bool
++	discoveryHeld    chan struct{}
++	discoveryRelease chan struct{}
++}
++
++// holdHeader marks the one request a test wants its cluster to keep waiting.
++const holdHeader = "X-Reload-Hold"
++
++func newReloadServer(t *testing.T, name string) *reloadServer {
++	t.Helper()
++
++	s := &reloadServer{
++		done: make(chan struct{}), held: make(chan struct{}), release: make(chan struct{}),
++		discoveryHeld: make(chan struct{}), discoveryRelease: make(chan struct{}), reviewHeld: make(chan struct{}),
++	}
++	m := http.NewServeMux()
++	respond := func(w http.ResponseWriter, body string) {
++		w.Header().Set("Content-Type", "application/json")
++		_, _ = fmt.Fprint(w, body)
++	}
++
++	m.HandleFunc("/api", func(w http.ResponseWriter, _ *http.Request) {
++		s.mu.Lock()
++		hold := s.holdDiscovery
++		s.holdDiscovery = false
++		s.mu.Unlock()
++
++		if hold {
++			close(s.discoveryHeld)
++			<-s.discoveryRelease
++			w.WriteHeader(http.StatusInternalServerError)
++
++			return
++		}
++
++		respond(w, `{"kind":"APIVersions","versions":["v1"]}`)
++	})
++	m.HandleFunc("/api/v1", func(w http.ResponseWriter, _ *http.Request) {
++		respond(w, `{"kind":"APIResourceList","groupVersion":"v1","resources":[`+
++			`{"name":"pods","namespaced":true,"kind":"Pod","verbs":["list","watch"]}]}`)
++	})
++	m.HandleFunc("/apis", func(w http.ResponseWriter, _ *http.Request) {
++		respond(w, `{"kind":"APIGroupList","groups":[]}`)
++	})
++	m.HandleFunc("/version", func(w http.ResponseWriter, _ *http.Request) {
++		respond(w, `{"major":"1","minor":"30","gitVersion":"`+name+`"}`)
++	})
++	m.HandleFunc("/api/v1/pods", func(w http.ResponseWriter, r *http.Request) { s.servePods(w, r, name, respond) })
++	m.HandleFunc("/apis/authorization.k8s.io/v1/selfsubjectaccessreviews", s.serveReview)
++
++	s.Server = httptest.NewServer(m)
++
++	t.Cleanup(func() {
++		close(s.done)
++		s.Close()
++	})
++
++	return s
++}
++
++// servePods answers a pods list, or keeps a pods watch open until the client or test goes away.
++func (s *reloadServer) servePods(w http.ResponseWriter, r *http.Request, name string,
++	respond func(http.ResponseWriter, string),
++) {
++	if r.URL.Query().Get("watch") != "true" {
++		if r.Header.Get(holdHeader) != "" {
++			s.heldOnce.Do(func() { close(s.held) })
++			<-s.release
++		}
++
++		respond(w, `{"kind":"PodList","apiVersion":"v1","metadata":{"resourceVersion":"1"},`+
++			`"items":[{"metadata":{"name":"`+name+`"}}]}`)
++
++		return
++	}
++
++	s.mu.Lock()
++	s.open++
++	s.opened++
++	s.mu.Unlock()
++
++	defer func() {
++		s.mu.Lock()
++		s.open--
++		s.mu.Unlock()
++	}()
++
++	w.WriteHeader(http.StatusOK)
++	w.(http.Flusher).Flush()
++
++	select {
++	case <-r.Context().Done():
++	case <-s.done:
++	}
++}
++
++func (s *reloadServer) openWatches() int {
++	s.mu.Lock()
++	defer s.mu.Unlock()
++
++	return s.open
++}
++
++func (s *reloadServer) serveReview(w http.ResponseWriter, r *http.Request) {
++	s.mu.Lock()
++	s.reviewed++
++	authorize, hold := s.authorizeReviews, s.holdReview
++	s.holdReview = false
++	s.mu.Unlock()
++
++	if hold {
++		close(s.reviewHeld)
++		<-s.release
++	}
++
++	if !authorize {
++		http.NotFound(w, r)
++		return
++	}
++
++	w.Header().Set("Content-Type", "application/json")
++	w.WriteHeader(http.StatusCreated)
++	_, _ = fmt.Fprint(w, `{"kind":"SelfSubjectAccessReview","apiVersion":"authorization.k8s.io/v1",`+
++		`"status":{"allowed":true}}`)
++}
++
++func (s *reloadServer) reviews() int {
++	s.mu.Lock()
++	defer s.mu.Unlock()
++
++	return s.reviewed
++}
++
++// openedWatches counts every watch the server has been sent, including ones since closed.
++func (s *reloadServer) openedWatches() int {
++	s.mu.Lock()
++	defer s.mu.Unlock()
++
++	return s.opened
++}
++
++func tokenUser(token string) string { return "token: " + token }
++
++// oidcIDToken is an unexpired, unsigned ID token, so a watcher can authenticate without the issuer.
++func oidcIDToken(clientID, issuer string) string {
++	enc := base64.RawURLEncoding
++	claims := fmt.Sprintf(`{"iss":%q,"aud":%q,"exp":4102444800}`, issuer, clientID)
++
++	return enc.EncodeToString([]byte(`{"alg":"none"}`)) + "." + enc.EncodeToString([]byte(claims)) + ".sig"
++}
++
++func oidcUser(clientID, issuer string) string {
++	return "auth-provider:\n      name: oidc\n      config:\n        client-id: " + clientID +
++		"\n        client-secret: s\n        idp-issuer-url: " + issuer +
++		"\n        id-token: " + oidcIDToken(clientID, issuer) + "\n        scope: openid"
++}
++
++func reloadKubeConfig(server, user string) string {
++	yaml := fmt.Sprintf(`apiVersion: v1
++kind: Config
++clusters:
++- cluster:
++    server: %[1]s
++    insecure-skip-tls-verify: true
++  name: %[2]s
++contexts:
++- context:
++    cluster: %[2]s
++    user: %[2]s
++  name: %[2]s
++current-context: %[2]s
++users:
++- name: %[2]s
++  user:
++    %[3]s
++`, server, reloadCluster, user)
++
++	return base64.StdEncoding.EncodeToString([]byte(yaml))
++}
++
++// reloadChain mounts the cache middleware the way the server does, in front of a fresh store.
++func reloadChain(t *testing.T) (*HeadlampConfig, http.Handler) {
++	t.Helper()
++
++	k8cache.ResetForTesting()
++	t.Cleanup(k8cache.ResetForTesting)
++
++	c := &HeadlampConfig{HeadlampConfig: &headlampconfig.HeadlampConfig{
++		HeadlampCFG: &headlampconfig.HeadlampCFG{
++			EnableDynamicClusters: true,
++			KubeConfigStore:       kubeconfig.NewContextStore(),
++		},
++		Cache: cache.New[interface{}](),
++	}}
++	c.CacheEnabled = true
++
++	router := mux.NewRouter()
++	router.PathPrefix("/clusters/{clusterName}/{api:.*}").Handler(CacheMiddleWare(c)(clusterRequestHandler(c)))
++
++	return c, router
++}
++
++// reloadRequest sends an ordinary pods list request, optionally carrying marker headers.
++func reloadRequest(router http.Handler, kubeConfig, userID string, extra ...string) string {
++	headers := http.Header{}
++	for _, header := range extra {
++		headers.Set(header, "1")
++	}
++
++	return reloadRequestWith(router, http.MethodGet, "/api/v1/pods", kubeConfig, userID, headers)
++}
++
++func reloadRequestWith(router http.Handler, method, path, kubeConfig, userID string, headers http.Header) string {
++	req := httptest.NewRequestWithContext(context.Background(), method, "/clusters/"+reloadCluster+path, nil)
++	req.Header.Set("KUBECONFIG", kubeConfig)
++	req.Header.Set("X-HEADLAMP-USER-ID", userID)
++	req.Header.Set("Authorization", "Bearer user-token")
++
++	for name, values := range headers {
++		req.Header[name] = values
++	}
++
++	rec := httptest.NewRecorder()
++	router.ServeHTTP(rec, req)
++
++	return rec.Body.String()
++}
++
++// startWatcher ensures a watcher runs for key, as the cache middleware does after authorization.
++func startWatcher(t *testing.T, c *HeadlampConfig, key string) *kubeconfig.Context {
++	t.Helper()
++
++	stored, err := c.KubeConfigStore.GetContext(key)
++	require.NoError(t, err)
++	k8cache.CheckForChanges(k8sResponseCache, key, *stored)
++
++	return stored
++}
++
++func eventuallyOpen(t *testing.T, s *reloadServer, want int, msg string) {
++	t.Helper()
++
++	assert.Eventually(t, func() bool { return s.openWatches() == want }, 5*time.Second, 20*time.Millisecond, msg)
++}
++
++func TestReplacedRequestContextReloadsWatcherAndCaches(t *testing.T) {
++	c, router := reloadChain(t)
++	a, b, o := newReloadServer(t, "server-a"), newReloadServer(t, "server-b"), newReloadServer(t, "other-user")
++	key, otherKey := statelessContextKey(reloadCluster, "user-1"), statelessContextKey(reloadCluster, "user-2")
++
++	// Another user of the same cluster, whose state the replacement must leave alone.
++	reloadRequest(router, reloadKubeConfig(o.URL, tokenUser("t")), "user-2")
++
++	otherBuiltFor := *startWatcher(t, c, otherKey)
++	otherBuiltFor.ClusterID = "kubeconfig+" + otherKey
++	otherClientset, err := k8cache.GetClientSet(otherKey, &otherBuiltFor, "token")
++	require.NoError(t, err)
++
++	// Only a clientset that is cached can be shown to be kept.
++	otherCached, err := k8cache.GetClientSet(otherKey, &otherBuiltFor, "token")
++	require.NoError(t, err)
++
++	otherCacheKey := servedResponse(t, otherKey)
++
++	reloadRequest(router, reloadKubeConfig(a.URL, tokenUser("t")), "user-1")
++
++	builtFor := *startWatcher(t, c, key)
++	eventuallyOpen(t, a, 1, "a watcher must run against the first configuration")
++	eventuallyOpen(t, o, 1, "and against the other user's configuration")
++
++	builtFor.ClusterID = "kubeconfig+" + key
++	oldClientset, err := k8cache.GetClientSet(key, &builtFor, "token")
++	require.NoError(t, err)
++
++	cacheKey := servedResponse(t, key)
++	otherWatches := o.openedWatches()
++
++	reloadRequest(router, reloadKubeConfig(b.URL, tokenUser("t")), "user-1")
++
++	eventuallyOpen(t, a, 0, "the watcher for the old configuration must be stopped")
++	eventuallyOpen(t, b, 1, "a watcher must run against the new configuration")
++
++	_, err = k8sResponseCache.Get(context.Background(), cacheKey)
++	assert.Error(t, err, "responses cached for the old configuration must be evicted")
++
++	newClientset, err := k8cache.GetClientSet(key, &builtFor, "token")
++	require.NoError(t, err)
++	assert.NotSame(t, oldClientset, newClientset, "clientsets built for the old configuration must be evicted")
++
++	_, err = k8sResponseCache.Get(context.Background(), otherCacheKey)
++	assert.NoError(t, err, "another user's cached responses must be kept")
++
++	if otherCached == otherClientset {
++		keptClientset, err := k8cache.GetClientSet(otherKey, &otherBuiltFor, "token")
++		require.NoError(t, err)
++		assert.Same(t, otherClientset, keptClientset, "another user's clientsets must be kept")
++	}
++
++	assert.Equal(t, 1, o.openWatches(), "another user's watcher must keep running")
++	assert.Equal(t, otherWatches, o.openedWatches(), "and must not be restarted")
++}
++
++// servedResponse caches a response for key and returns the cache key it was stored under.
++func servedResponse(t *testing.T, key string) string {
++	t.Helper()
++
++	cacheKey, err := k8cache.GenerateKey(&url.URL{Path: "/clusters/" + reloadCluster + "/api/v1/services"}, key)
++	require.NoError(t, err)
++	require.NoError(t, k8sResponseCache.Set(context.Background(), cacheKey, "response for the old configuration"))
++
++	return cacheKey
++}
++
++// assertConfigurationReplaced supplies prev then next and checks that prev's context, watcher and caches are replaced.
++func assertConfigurationReplaced(t *testing.T, name, prev, next string, newServer bool,
++	check func(*kubeconfig.Context) bool,
++) {
++	t.Helper()
++
++	c, router := reloadChain(t)
++	a, b := newReloadServer(t, "server-a"), newReloadServer(t, "server-b")
++	key := statelessContextKey(reloadCluster, "user-1")
++
++	target := a
++	if newServer {
++		target = b
++	}
++
++	reloadRequest(router, reloadKubeConfig(a.URL, prev), "user-1")
++
++	old := startWatcher(t, c, key)
++	eventuallyOpen(t, a, 1, "a watcher must run against the first configuration")
++
++	builtFor := *old
++	builtFor.ClusterID = "kubeconfig+" + key
++	oldClientset, err := k8cache.GetClientSet(key, &builtFor, "token")
++	require.NoError(t, err)
++
++	cacheKey := servedResponse(t, key)
++	watchesBefore := target.openedWatches()
++
++	reloadRequest(router, reloadKubeConfig(target.URL, next), "user-1")
++
++	stored, err := c.KubeConfigStore.GetContext(key)
++	require.NoError(t, err)
++	assert.Equal(t, target.URL, stored.Cluster.Server)
++	assert.True(t, check(stored), "the cached context must reflect the request's new %s", name)
++	assert.True(t, stored.Internal, "a replaced context stays this user's own")
++
++	for _, listed := range c.getClusters() {
++		assert.NotEqual(t, key, listed.Name, "a per-user context must not be offered to every user")
++	}
++
++	// The old watcher is stopped and a new one opens its own watch, even on the same server.
++	assert.Eventually(t, func() bool {
++		return target.openedWatches() > watchesBefore && target.openWatches() == 1 &&
++			a.openWatches()+b.openWatches() == 1
++	}, 5*time.Second, 20*time.Millisecond, "the watcher must be replaced for the new %s", name)
++
++	_, err = k8sResponseCache.Get(context.Background(), cacheKey)
++	assert.Error(t, err, "responses cached for the old %s must be evicted", name)
++
++	newClientset, err := k8cache.GetClientSet(key, &builtFor, "token")
++	require.NoError(t, err)
++	assert.NotSame(t, oldClientset, newClientset, "clientsets built for the old %s must be evicted", name)
++}
++
++func TestRequestContextChangeIsDetectedForEveryConfigurationField(t *testing.T) {
++	const issuer, otherIssuer = "https://issuer.example", "https://other-issuer.example"
++
++	for name, tc := range map[string]struct {
++		prev, next string
++		newServer  bool
++		check      func(*kubeconfig.Context) bool
++	}{
++		"server": {
++			prev: tokenUser("t"), next: tokenUser("t"), newServer: true,
++			check: func(*kubeconfig.Context) bool { return true },
++		},
++		"credentials": {
++			prev: tokenUser("t"), next: tokenUser("rotated"),
++			check: func(k *kubeconfig.Context) bool { return k.AuthInfo.Token == "rotated" },
++		},
++		"oidc client": {
++			prev: oidcUser("client-1", issuer), next: oidcUser("client-2", issuer),
++			check: func(k *kubeconfig.Context) bool {
++				return k.AuthInfo.AuthProvider.Config["client-id"] == "client-2"
++			},
++		},
++		"oidc issuer": {
++			prev: oidcUser("client-1", issuer), next: oidcUser("client-1", otherIssuer),
++			check: func(k *kubeconfig.Context) bool {
++				return k.AuthInfo.AuthProvider.Config["idp-issuer-url"] == otherIssuer
++			},
++		},
++	} {
++		t.Run(name, func(t *testing.T) { assertConfigurationReplaced(t, name, tc.prev, tc.next, tc.newServer, tc.check) })
++	}
++}
++
++func TestEveryKindOfRequestReplacesConfiguration(t *testing.T) {
++	const review = "/apis/authorization.k8s.io/v1/selfsubjectaccessreviews"
++
++	websocket := http.Header{}
++	websocket.Set("Connection", "Upgrade")
++	websocket.Set("Upgrade", "websocket")
++	websocket.Set("Sec-Websocket-Protocol", "base64url.headlamp.authorization.k8s.io.user-1")
++
++	for name, route := range map[string]struct {
++		method, path string
++		headers      http.Header
++	}{
++		"POST request":               {method: http.MethodPost, path: "/api/v1/pods"},
++		"self subject access review": {method: http.MethodPost, path: review},
++		"non-API path":               {method: http.MethodGet, path: "/version"},
++		"websocket upgrade":          {method: http.MethodGet, path: "/api/v1/pods", headers: websocket},
++	} {
++		t.Run(name, func(t *testing.T) {
++			c, router := reloadChain(t)
++			a, b := newReloadServer(t, "server-a"), newReloadServer(t, "server-b")
++			key := statelessContextKey(reloadCluster, "user-1")
++
++			reloadRequest(router, reloadKubeConfig(a.URL, tokenUser("t")), "user-1")
++			startWatcher(t, c, key)
++			eventuallyOpen(t, a, 1, "a watcher must run against the first configuration")
++
++			cacheKey := servedResponse(t, key)
++
++			// The only request after the first, so nothing else can start the new watcher.
++			reloadRequestWith(router, route.method, route.path, reloadKubeConfig(b.URL, tokenUser("t")), "user-1", route.headers)
++
++			stored, err := c.KubeConfigStore.GetContext(key)
++			require.NoError(t, err)
++			assert.Equal(t, b.URL, stored.Cluster.Server, "the request must replace the context")
++			eventuallyOpen(t, a, 0, "and stop the old watcher")
++			eventuallyOpen(t, b, 1, "and start one for the new configuration")
++
++			_, err = k8sResponseCache.Get(context.Background(), cacheKey)
++			assert.Error(t, err, "and evict the responses cached for the old configuration")
++		})
++	}
++}
++
++// labelledGoroutines counts live goroutines carrying label whose stack mentions frame; goroutines
++// inherit the labels of the goroutine that creates them.
++func labelledGoroutines(t *testing.T, label, frame string) int {
++	t.Helper()
++
++	var profile bytes.Buffer
++	require.NoError(t, pprof.Lookup("goroutine").WriteTo(&profile, 1))
++
++	count := 0
++
++	for _, record := range strings.Split(profile.String(), "\n\n") {
++		if strings.Contains(record, `"reload":"`+label+`"`) && strings.Contains(record, frame) {
++			var goroutines int
++
++			_, err := fmt.Sscanf(record, "%d @", &goroutines)
++			require.NoError(t, err)
++
++			count += goroutines
++		}
++	}
++
++	return count
++}
++
++func TestStaleWatcherShutdownKeepsReplacementRegistered(t *testing.T) {
++	c, router := reloadChain(t)
++	a, b := newReloadServer(t, "server-a"), newReloadServer(t, "server-b")
++	key := statelessContextKey(reloadCluster, "user-1")
++
++	// The clientset janitor runs for the life of the process; start it outside the labelled region.
++	k8cache.EvictClientsetsForCluster(reloadCluster + "-unused")
++
++	// The first watcher is held in discovery, so it shuts down only after its replacement has registered.
++	a.mu.Lock()
++	a.holdDiscovery = true
++	a.mu.Unlock()
++
++	pprof.Do(context.Background(), pprof.Labels("reload", "stale"), func(context.Context) {
++		reloadRequest(router, reloadKubeConfig(a.URL, tokenUser("t")), "user-1")
++		startWatcher(t, c, key)
++	})
++	<-a.discoveryHeld
++
++	reloadRequest(router, reloadKubeConfig(b.URL, tokenUser("t")), "user-1")
++	eventuallyOpen(t, b, 1, "the replacement's watcher must be running")
++
++	close(a.discoveryRelease)
++	require.Eventually(t, func() bool { return labelledGoroutines(t, "stale", "/backend/pkg/k8cache.") == 0 },
++		5*time.Second, 10*time.Millisecond, "the stale watcher must shut down")
++
++	// Had that shutdown removed the replacement's registration, this would start a second watcher.
++	pprof.Do(context.Background(), pprof.Labels("reload", "probe"), func(context.Context) {
++		startWatcher(t, c, key)
++	})
++	assert.Zero(t, labelledGoroutines(t, "probe", ""),
++		"the stale watcher shutting down must not remove the registration of its replacement")
++	assert.Equal(t, 1, b.openWatches())
++}
++
++func TestInFlightRequestDoesNotCacheResponseForReplacedConfiguration(t *testing.T) {
++	c, router := reloadChain(t)
++	a, b := newReloadServer(t, "server-a"), newReloadServer(t, "server-b")
++	key := statelessContextKey(reloadCluster, "user-1")
++
++	done := make(chan struct{})
++
++	go func() {
++		defer close(done)
++
++		reloadRequest(router, reloadKubeConfig(a.URL, tokenUser("t")), "user-1", holdHeader)
++	}()
++
++	<-a.held
++
++	// The replacement completes while the first request is still waiting on its cluster.
++	reloadRequest(router, reloadKubeConfig(b.URL, tokenUser("t")), "user-1")
++	close(a.release)
++	<-done
++
++	cacheKey, err := k8cache.GenerateKey(&url.URL{Path: "/clusters/" + reloadCluster + "/api/v1/pods"}, key)
++	require.NoError(t, err)
++
++	cached, err := k8sResponseCache.Get(context.Background(), cacheKey)
++	require.NoError(t, err, "the replacement's own response must be cached")
++	assert.Contains(t, cached, "server-b")
++	assert.NotContains(t, cached, "server-a", "a response received for the replaced configuration must not be cached")
++
++	stored, err := c.KubeConfigStore.GetContext(key)
++	require.NoError(t, err)
++	assert.Equal(t, b.URL, stored.Cluster.Server)
++}
++
++// pausingStore gives each context a request stores a cluster ID, so authorization builds and caches
++// clientsets for it. Once armed, it holds the next request after that request has applied its
++// kubeconfig and read the stored context back, as a busy server may preempt it before authorization.
++type pausingStore struct {
++	kubeconfig.ContextStore
++	mu             sync.Mutex
++	armed, applied bool
++	paused, resume chan struct{}
++	resumeOnce     sync.Once
++}
++
++func (s *pausingStore) setArmed(armed bool) {
++	s.mu.Lock()
++	s.armed, s.applied = armed, false
++	s.mu.Unlock()
++}
++
++func (s *pausingStore) markApplied() {
++	s.mu.Lock()
++	s.applied = true
++	s.mu.Unlock()
++}
++
++func (s *pausingStore) UpdateTTL(key string, ttl time.Duration) error {
++	defer s.markApplied()
++
++	return s.ContextStore.UpdateTTL(key, ttl)
++}
++
++func (s *pausingStore) AddContextWithKeyAndTTL(context *kubeconfig.Context, key string, ttl time.Duration) error {
++	defer s.markApplied()
++
++	context.ClusterID = "request+" + key
++
++	return s.ContextStore.AddContextWithKeyAndTTL(context, key, ttl)
++}
++
++func (s *pausingStore) GetContext(key string) (*kubeconfig.Context, error) {
++	stored, err := s.ContextStore.GetContext(key)
++
++	s.mu.Lock()
++	pause := s.armed && s.applied
++	s.armed = s.armed && !pause
++	s.mu.Unlock()
++
++	if pause {
++		close(s.paused)
++		<-s.resume
++	}
++
++	return stored, err
++}
++
++func (s *pausingStore) release() { s.resumeOnce.Do(func() { close(s.resume) }) }
++
++func TestRequestResumingAfterReplacementLeavesNoClientsetForLaterRequests(t *testing.T) {
++	c, router := reloadChain(t)
++	store := &pausingStore{ContextStore: c.KubeConfigStore, paused: make(chan struct{}), resume: make(chan struct{})}
++	c.KubeConfigStore = store
++	a, b := newReloadServer(t, "server-a"), newReloadServer(t, "server-b")
++	earlier, later := reloadKubeConfig(a.URL, tokenUser("t")), reloadKubeConfig(b.URL, tokenUser("t"))
++
++	reloadRequest(router, earlier, "user-1")
++
++	store.setArmed(true)
++
++	done := make(chan struct{})
++
++	go func() {
++		defer close(done)
++
++		reloadRequest(router, earlier, "user-1")
++	}()
++
++	select {
++	case <-store.paused:
++	case <-done:
++	}
++
++	store.setArmed(false)
++
++	// A request the cache passes straight through replaces the configuration without authorizing.
++	replaced := make(chan struct{})
++
++	go func() {
++		defer close(replaced)
++
++		reloadRequestWith(router, http.MethodGet, "/version", later, "user-1", nil)
++	}()
++
++	select {
++	case <-replaced:
++	case <-time.After(5 * time.Second): // the replacement waits for the held request instead
++	}
++
++	store.release()
++	<-replaced
++	<-done
++
++	reviewsA, reviewsB := a.reviews(), b.reviews()
++
++	reloadRequest(router, later, "user-1")
++
++	assert.Equal(t, reviewsA, a.reviews(),
++		"a clientset built for the replaced configuration must not authorize requests for the new one")
++	assert.Equal(t, reviewsB+1, b.reviews(), "requests for the new configuration must be authorized by its cluster")
++}
++
++func TestExpiredContextReplacedByLaterRequest(t *testing.T) {
++	c, router := reloadChain(t)
++	a, b := newReloadServer(t, "server-a"), newReloadServer(t, "server-b")
++	key := statelessContextKey(reloadCluster, "user-1")
++
++	earlier := reloadKubeConfig(a.URL, tokenUser("t"))
++	contexts, _, err := kubeconfig.LoadContextsFromBase64String(earlier, kubeconfig.DynamicCluster)
++	require.NoError(t, err)
++
++	// Stored the way a request stores it, with a lifetime short enough to lapse within the test.
++	previous := contexts[0]
++	previous.Internal = true
++	require.NoError(t, c.KubeConfigStore.AddContextWithKeyAndTTL(&previous, key, 50*time.Millisecond))
++	k8cache.CheckForChanges(k8sResponseCache, key, previous)
++	eventuallyOpen(t, a, 1, "a watcher must run against the earlier configuration")
++
++	builtFor := previous
++	builtFor.ClusterID = "kubeconfig+" + key
++	oldClientset, err := k8cache.GetClientSet(key, &builtFor, "token")
++	require.NoError(t, err)
++
++	cacheKey, err := k8cache.GenerateKey(&url.URL{Path: "/clusters/" + reloadCluster + "/api/v1/services"}, key)
++	require.NoError(t, err)
++	require.NoError(t, k8sResponseCache.Set(context.Background(), cacheKey, "response for the earlier configuration"))
++
++	require.Eventually(t, func() bool {
++		_, err := c.KubeConfigStore.GetContext(key)
++		return err != nil
++	}, 5*time.Second, 10*time.Millisecond, "the earlier context must have expired")
++
++	reloadRequest(router, reloadKubeConfig(b.URL, tokenUser("t")), "user-1")
++
++	eventuallyOpen(t, a, 0, "the watcher left from the expired configuration must be stopped")
++	eventuallyOpen(t, b, 1, "a watcher must run against the new configuration")
++
++	_, err = k8sResponseCache.Get(context.Background(), cacheKey)
++	assert.Error(t, err, "responses cached for the expired configuration must be evicted")
++
++	newClientset, err := k8cache.GetClientSet(key, &builtFor, "token")
++	require.NoError(t, err)
++	assert.NotSame(t, oldClientset, newClientset, "clientsets built for the expired configuration must be evicted")
++}
++
++// paddedKubeConfig is reloadKubeConfig plus n unused contexts, which makes it far slower to parse.
++func paddedKubeConfig(t *testing.T, server string, n int) string {
++	t.Helper()
++
++	raw, err := base64.StdEncoding.DecodeString(reloadKubeConfig(server, tokenUser("t")))
++	require.NoError(t, err)
++
++	var unused strings.Builder
++	for i := range n {
++		fmt.Fprintf(&unused, "- context:\n    cluster: %[1]s\n    user: %[1]s\n  name: unused-%[2]d\n", reloadCluster, i)
++	}
++
++	padded := strings.Replace(string(raw), "contexts:\n", "contexts:\n"+unused.String(), 1)
++
++	return base64.StdEncoding.EncodeToString([]byte(padded))
++}
++
++// await waits for ch, failing the test if it stays open.
++func await(t *testing.T, ch <-chan struct{}, msg string) {
++	t.Helper()
++
++	select {
++	case <-ch:
++	case <-time.After(10 * time.Second):
++		t.Fatal(msg)
++	}
++}
++
++// TestLaterRequestThatFailsToParseDoesNotSuppressEarlierValidRequest guards against reserving an
++// ordering position before a kubeconfig is known to be valid: a later request that never supplies
++// a configuration must not be able to block an earlier request that does.
++func TestLaterRequestThatFailsToParseDoesNotSuppressEarlierValidRequest(t *testing.T) {
++	c, router := reloadChain(t)
++	a, seeded := newReloadServer(t, "server-a"), newReloadServer(t, "server-c")
++	key := statelessContextKey(reloadCluster, "user-1")
++
++	// Establishes a configuration for the earlier request below to replace.
++	reloadRequest(router, reloadKubeConfig(seeded.URL, tokenUser("t")), "user-1")
++
++	earlier := paddedKubeConfig(t, a.URL, 3000)
++	done := make(chan struct{})
++
++	pprof.Do(context.Background(), pprof.Labels("reload", "earlierValid"), func(context.Context) {
++		go func() {
++			defer close(done)
++
++			reloadRequest(router, earlier, "user-1")
++		}()
++	})
++
++	// The later request is sent once the earlier one has arrived and is parsing its kubeconfig.
++	require.Eventually(t, func() bool {
++		return labelledGoroutines(t, "earlierValid", "kubeconfig.LoadContextsFromBase64String") > 0
++	}, 5*time.Second, time.Millisecond, "the earlier request must be observed parsing its kubeconfig")
++
++	// This KUBECONFIG header fails to decode: the request arrives later but supplies no configuration.
++	reloadRequest(router, "not-a-valid-base64-kubeconfig!!", "user-1")
++	<-done
++
++	stored, err := c.KubeConfigStore.GetContext(key)
++	require.NoError(t, err)
++	assert.Equal(t, a.URL, stored.Cluster.Server,
++		"a later request that fails to parse must not suppress an earlier request's valid configuration")
++	eventuallyOpen(t, a, 1, "a watcher must run against the earlier request's configuration")
++	eventuallyOpen(t, seeded, 0, "the watcher for the replaced configuration must be stopped")
++}
+diff --git a/test.sh b/test.sh
+new file mode 100755
+index 0000000..1bc19c0
+--- /dev/null
++++ b/test.sh
+@@ -0,0 +1,61 @@
++#!/usr/bin/env bash
++# Runs the backend suites for this change.
++#   ./test.sh [--output_path <junit.xml>] base|new
++# base: the existing tests of ./cmd and ./pkg/k8cache.
++# new:  the tests that exist only under the "reconciliation" build tag.
++set -uo pipefail
++
++OUTPUT_PATH=""
++if [ "${1:-}" = "--output_path" ]; then
++  OUTPUT_PATH="$(realpath -m -- "$2")"
++  shift 2
++fi
++
++MODE="${1:-new}"
++cd "$(dirname "$0")/backend" || exit 1
++
++TEST_LOG="$(mktemp)"
++trap 'rm -f "$TEST_LOG"' EXIT
++STATUS=0
++
++run_tests() {
++  go test -count=1 -v "$@" 2>&1 | tee -a "$TEST_LOG"
++  local status=${PIPESTATUS[0]}
++  if [ "$status" -ne 0 ]; then
++    STATUS=$status
++  fi
++}
++
++list_tests() {
++  go test "$@" -list '^Test' ./cmd/... ./pkg/k8cache/... 2>>"$TEST_LOG" | grep -E '^Test' | sort -u
++}
++
++case "$MODE" in
++  base)
++    run_tests ./cmd/... ./pkg/k8cache/...
++    ;;
++  new)
++    new_only="$(comm -13 <(list_tests) <(list_tests -tags reconciliation))"
++    if [ -z "$new_only" ]; then
++      echo "no reconciliation-only tests found" >&2
++      cat "$TEST_LOG" >&2
++      STATUS=1
++    else
++      run_tests -tags reconciliation -run "^($(paste -sd '|' <<<"$new_only"))\$" ./cmd/... ./pkg/k8cache/...
++    fi
++    ;;
++  *)
++    echo "unknown mode: $MODE (expected base or new)" >&2
++    exit 2
++    ;;
++esac
++
++if [ -n "$OUTPUT_PATH" ]; then
++  # Without -set-exit-code, go-junit-report fails only when it cannot write the report.
++  if ! command -v go-junit-report >/dev/null 2>&1 || ! go-junit-report <"$TEST_LOG" >"$OUTPUT_PATH"; then
++    echo "failed to write JUnit report to $OUTPUT_PATH" >&2
++    exit 1
++  fi
++fi
++
++exit "$STATUS"
