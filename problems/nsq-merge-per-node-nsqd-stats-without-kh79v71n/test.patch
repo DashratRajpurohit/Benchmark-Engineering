@@ -1,0 +1,2457 @@
+diff --git a/internal/clusterinfo/aggregation_cl7f3a_test.go b/internal/clusterinfo/aggregation_cl7f3a_test.go
+new file mode 100644
+index 0000000..2ef3d4f
+--- /dev/null
++++ b/internal/clusterinfo/aggregation_cl7f3a_test.go
+@@ -0,0 +1,484 @@
++//go:build clusteragg
++
++package clusterinfo_test
++
++import (
++	"net/http"
++	"net/http/httptest"
++	"strings"
++	"testing"
++	"time"
++
++	"github.com/nsqio/nsq/internal/clusterinfo"
++	"github.com/nsqio/nsq/internal/http_api"
++	"github.com/nsqio/nsq/internal/lg"
++	"github.com/nsqio/nsq/internal/quantile"
++)
++
++func latencyCl7f3a(topic, node string, p99 float64) *quantile.E2eProcessingLatencyAggregate {
++	return &quantile.E2eProcessingLatencyAggregate{
++		Count: 1,
++		Percentiles: []map[string]float64{
++			{"quantile": 0.99, "value": p99, "min": p99, "max": p99, "average": p99, "count": 1},
++		},
++		Topic: topic,
++		Addr:  node,
++	}
++}
++
++// nodeTopicCl7f3a gives every mutable counter a distinct, node-derived value.
++func nodeTopicCl7f3a(node string, depth int64, p99 float64) *clusterinfo.TopicStats {
++	return &clusterinfo.TopicStats{
++		Node: node, Hostname: node, TopicName: "t1",
++		Depth: depth, MessageCount: depth * 10,
++		BackendDepth: depth * 2, MemoryDepth: depth * 3,
++		E2eProcessingLatency: latencyCl7f3a("t1", node, p99),
++		Channels: []*clusterinfo.ChannelStats{{
++			Node: node, Hostname: node, TopicName: "t1", ChannelName: "c1",
++			Depth: depth, MessageCount: depth * 10,
++			BackendDepth: depth * 2, MemoryDepth: depth * 3,
++			InFlightCount: depth * 4, DeferredCount: depth * 5,
++			RequeueCount: depth * 6, TimeoutCount: depth * 7,
++			ZoneLocalMsgCount: depth * 8, RegionLocalMsgCount: depth * 9,
++			GlobalMsgCount: depth * 11, ClientCount: int(depth),
++			Paused:               depth == 7,
++			E2eProcessingLatency: latencyCl7f3a("t1", node, p99),
++		}},
++	}
++}
++
++func mergeTwoNodesCl7f3a() (all, nodeA *clusterinfo.TopicStats) {
++	nodeA = nodeTopicCl7f3a("A:4151", 5, 10)
++	nodeB := nodeTopicCl7f3a("B:4151", 7, 100)
++	all = &clusterinfo.TopicStats{TopicName: "t1"}
++	all.Add(nodeA)
++	all.Add(nodeB)
++	return all, nodeA
++}
++
++func TestMergedTopicKeepsPerNodeChannelCountsCl7f3a(t *testing.T) {
++	all, nodeA := mergeTwoNodesCl7f3a()
++	if len(all.NodeStats) != 2 {
++		t.Fatalf("expected 2 per-node entries, got %d", len(all.NodeStats))
++	}
++	if len(nodeA.Channels) != 1 {
++		t.Fatalf("expected node A to still have 1 channel, got %d", len(nodeA.Channels))
++	}
++	ch := nodeA.Channels[0]
++	if ch.Node != "A:4151" {
++		t.Errorf("node A channel node: got %q want %q", ch.Node, "A:4151")
++	}
++	if ch.Paused {
++		t.Error("node A channel paused: got true, want false (node B was the paused one)")
++	}
++	if ch.ClientCount != 5 {
++		t.Errorf("node A channel client count: got %d want 5", ch.ClientCount)
++	}
++	for _, f := range []struct {
++		name string
++		got  int64
++		want int64
++	}{
++		{"depth", ch.Depth, 5},
++		{"message count", ch.MessageCount, 50},
++		{"backend depth", ch.BackendDepth, 10},
++		{"memory depth", ch.MemoryDepth, 15},
++		{"in-flight count", ch.InFlightCount, 20},
++		{"deferred count", ch.DeferredCount, 25},
++		{"requeue count", ch.RequeueCount, 30},
++		{"timeout count", ch.TimeoutCount, 35},
++		{"zone-local count", ch.ZoneLocalMsgCount, 40},
++		{"region-local count", ch.RegionLocalMsgCount, 45},
++		{"global count", ch.GlobalMsgCount, 55},
++	} {
++		if f.got != f.want {
++			t.Errorf("node A channel %s: got %d want %d", f.name, f.got, f.want)
++		}
++	}
++
++	if len(all.Channels) != 1 {
++		t.Fatalf("expected 1 merged channel, got %d", len(all.Channels))
++	}
++	merged := all.Channels[0]
++	if !merged.Paused {
++		t.Error("merged channel paused: got false, want true (node B was paused)")
++	}
++	if merged.ClientCount != 12 {
++		t.Errorf("merged channel client count: got %d want 12", merged.ClientCount)
++	}
++	for _, f := range []struct {
++		name string
++		got  int64
++		want int64
++	}{
++		{"depth", merged.Depth, 12},
++		{"message count", merged.MessageCount, 120},
++		{"backend depth", merged.BackendDepth, 24},
++		{"memory depth", merged.MemoryDepth, 36},
++		{"in-flight count", merged.InFlightCount, 48},
++		{"deferred count", merged.DeferredCount, 60},
++		{"requeue count", merged.RequeueCount, 72},
++		{"timeout count", merged.TimeoutCount, 84},
++		{"zone-local count", merged.ZoneLocalMsgCount, 96},
++		{"region-local count", merged.RegionLocalMsgCount, 108},
++		{"global count", merged.GlobalMsgCount, 132},
++	} {
++		if f.got != f.want {
++			t.Errorf("merged channel %s: got %d want %d", f.name, f.got, f.want)
++		}
++	}
++}
++
++func TestMergedTopicKeepsPerNodeChannelLatencyCl7f3a(t *testing.T) {
++	_, nodeA := mergeTwoNodesCl7f3a()
++	e := nodeA.Channels[0].E2eProcessingLatency
++	if e == nil {
++		t.Fatal("node A channel lost its latency aggregate")
++	}
++	if e.Addr != "A:4151" {
++		t.Errorf("node A channel latency host: got %q want %q", e.Addr, "A:4151")
++	}
++	if e.Count != 1 {
++		t.Errorf("node A channel latency count: got %d want 1", e.Count)
++	}
++	if len(e.Percentiles) != 1 {
++		t.Fatalf("node A channel latency percentiles: got %d want 1", len(e.Percentiles))
++	}
++	if got := e.Percentiles[0]["max"]; got != 10 {
++		t.Errorf("node A channel latency max: got %v want 10", got)
++	}
++}
++
++func TestMergedLatencyReportsTrueMinimumCl7f3a(t *testing.T) {
++	cases := []struct {
++		name string
++		vals []float64
++	}{
++		{"min-first", []float64{10, 100}},
++		{"min-middle", []float64{100, 10, 50}},
++		{"min-first-of-three", []float64{10, 50, 100}},
++		{"min-then-higher", []float64{100, 50, 10, 20}},
++	}
++	for _, c := range cases {
++		t.Run(c.name, func(t *testing.T) {
++			agg := &quantile.E2eProcessingLatencyAggregate{Topic: "t1"}
++			for i, v := range c.vals {
++				agg.Add(latencyCl7f3a("t1", string(rune('A'+i)), v))
++			}
++			if len(agg.Percentiles) != 1 {
++				t.Fatalf("expected 1 percentile, got %d", len(agg.Percentiles))
++			}
++			p := agg.Percentiles[0]
++			if p["min"] != 10 {
++				t.Errorf("merged min: got %v want 10", p["min"])
++			}
++			if p["max"] != 100 {
++				t.Errorf("merged max: got %v want 100", p["max"])
++			}
++		})
++	}
++}
++
++func TestMergedLatencyPercentileOrderCl7f3a(t *testing.T) {
++	agg := &quantile.E2eProcessingLatencyAggregate{Topic: "t1"}
++	low := latencyCl7f3a("t1", "A", 10)
++	low.Percentiles[0]["quantile"] = 0.50
++	agg.Add(low)
++	agg.Add(latencyCl7f3a("t1", "B", 20))
++
++	if len(agg.Percentiles) != 2 {
++		t.Fatalf("expected 2 percentiles, got %d", len(agg.Percentiles))
++	}
++	first := agg.Percentiles[0]["quantile"]
++	second := agg.Percentiles[1]["quantile"]
++	if !(first > second) {
++		t.Errorf("percentiles not highest-first: got %v then %v", first, second)
++	}
++}
++
++// fakeNSQDCl7f3a serves the /info and /stats endpoints the direct-nsqd
++// discovery paths query. If gate is non-nil the responder waits for it, which
++// fixes the order in which the concurrent queries complete.
++func fakeNSQDCl7f3a(t *testing.T, host, ip, topic string, gate <-chan struct{}) *httptest.Server {
++	t.Helper()
++	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
++		if gate != nil {
++			select {
++			case <-gate:
++			case <-time.After(5 * time.Second):
++			}
++		}
++		if strings.HasPrefix(r.URL.Path, "/info") {
++			_, _ = w.Write([]byte(`{"version":"1.3.0","broadcast_address":"` + ip +
++				`","hostname":"` + host + `","http_port":4151,"tcp_port":4150}`))
++			return
++		}
++		_, _ = w.Write([]byte(`{"topics":[{"topic_name":"` + topic + `"}]}`))
++	}))
++	return srv
++}
++
++func addrOfCl7f3a(srv *httptest.Server) string {
++	return strings.TrimPrefix(srv.URL, "http://")
++}
++
++func ciCl7f3aNew() *clusterinfo.ClusterInfo {
++	return clusterinfo.New(func(lvl lg.LogLevel, f string, args ...interface{}) {},
++		http_api.NewClient(nil, 2*time.Second, 5*time.Second))
++}
++
++func hostsOfCl7f3a(ps clusterinfo.Producers) []string {
++	out := make([]string, 0, len(ps))
++	for _, p := range ps {
++		out = append(out, p.Hostname)
++	}
++	return out
++}
++
++func sameOrderCl7f3a(t *testing.T, what string, first, second []string) {
++	t.Helper()
++	if len(first) != len(second) {
++		t.Fatalf("%s: count changed, %v then %v", what, first, second)
++	}
++	for i := range first {
++		if first[i] != second[i] {
++			t.Fatalf("%s: order depends on which node answered first: %v then %v", what, first, second)
++		}
++	}
++}
++
++// statsNSQDCl7f3a serves a /stats payload whose latency percentiles are not in
++// descending order.
++func statsNSQDCl7f3a(t *testing.T, host string) *httptest.Server {
++	t.Helper()
++	var srv *httptest.Server
++	srv = httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
++		if strings.HasPrefix(r.URL.Path, "/info") {
++			hostPort := strings.Split(addrOfCl7f3a(srv), ":")
++			_, _ = w.Write([]byte(`{"version":"1.3.0","broadcast_address":"` + hostPort[0] +
++				`","hostname":"` + host + `","http_port":` + hostPort[1] + `,"tcp_port":4150}`))
++			return
++		}
++		latency := `{"count":3,"percentiles":[` +
++			`{"quantile":0.75,"value":400},` +
++			`{"quantile":0.5,"value":100},` +
++			`{"quantile":0.99,"value":900}]}`
++		_, _ = w.Write([]byte(`{"topics":[{"topic_name":"events","depth":1,` +
++			`"e2e_processing_latency":` + latency + `,` +
++			`"channels":[{"channel_name":"c1","depth":1,` +
++			`"e2e_processing_latency":` + latency + `}]}]}`))
++	}))
++	return srv
++}
++
++func quantilesOfCl7f3a(e *quantile.E2eProcessingLatencyAggregate) []float64 {
++	if e == nil {
++		return nil
++	}
++	out := make([]float64, 0, len(e.Percentiles))
++	for _, p := range e.Percentiles {
++		out = append(out, p["quantile"])
++	}
++	return out
++}
++
++func assertHighestFirstCl7f3a(t *testing.T, what string, qs []float64) {
++	t.Helper()
++	if len(qs) < 3 {
++		t.Fatalf("%s: expected at least 3 percentiles, got %v", what, qs)
++	}
++	for i := 1; i < len(qs); i++ {
++		if !(qs[i-1] > qs[i]) {
++			t.Errorf("%s: percentiles not highest-quantile-first: %v", what, qs)
++			return
++		}
++	}
++}
++
++func TestPerNodeLatencyPercentileOrderCl7f3a(t *testing.T) {
++	ci := ciCl7f3aNew()
++	a := statsNSQDCl7f3a(t, "a-host")
++	defer a.Close()
++	b := statsNSQDCl7f3a(t, "b-host")
++	defer b.Close()
++
++	producers, err := ci.GetNSQDProducers([]string{addrOfCl7f3a(a), addrOfCl7f3a(b)})
++	if err != nil {
++		t.Fatalf("GetNSQDProducers: %v", err)
++	}
++	if len(producers) != 2 {
++		t.Fatalf("expected 2 producers, got %d", len(producers))
++	}
++
++	topics, channels, err := ci.GetNSQDStats(producers, "events", "", false)
++	if err != nil {
++		t.Fatalf("GetNSQDStats: %v", err)
++	}
++	if len(topics) != 2 {
++		t.Fatalf("expected per-node stats for 2 nodes, got %d", len(topics))
++	}
++
++	for _, node := range topics {
++		assertHighestFirstCl7f3a(t, "node "+node.Hostname+" topic latency",
++			quantilesOfCl7f3a(node.E2eProcessingLatency))
++		if len(node.Channels) != 1 {
++			t.Fatalf("node %s: expected 1 channel, got %d", node.Hostname, len(node.Channels))
++		}
++		assertHighestFirstCl7f3a(t, "node "+node.Hostname+" channel latency",
++			quantilesOfCl7f3a(node.Channels[0].E2eProcessingLatency))
++	}
++
++	merged, ok := channels["c1"]
++	if !ok {
++		t.Fatal(`expected a merged entry for channel "c1"`)
++	}
++	assertHighestFirstCl7f3a(t, "merged channel latency",
++		quantilesOfCl7f3a(merged.E2eProcessingLatency))
++	if len(merged.NodeStats) != 2 {
++		t.Fatalf("expected 2 per-node channel entries, got %d", len(merged.NodeStats))
++	}
++	for _, node := range merged.NodeStats {
++		assertHighestFirstCl7f3a(t, "merged node "+node.Hostname+" channel latency",
++			quantilesOfCl7f3a(node.E2eProcessingLatency))
++	}
++}
++
++// latencyNCl7f3a builds a node's aggregate with an explicit sample count.
++func latencyNCl7f3a(topic, node string, p99, count float64) *quantile.E2eProcessingLatencyAggregate {
++	return &quantile.E2eProcessingLatencyAggregate{
++		Count: int(count),
++		Percentiles: []map[string]float64{
++			{"quantile": 0.99, "value": p99, "min": p99, "max": p99,
++				"average": p99, "count": count},
++		},
++		Topic: topic,
++		Addr:  node,
++	}
++}
++
++func TestMergedTopicHandlesUnequalChannelMembershipCl7f3a(t *testing.T) {
++	nodeA := &clusterinfo.TopicStats{
++		Node: "A:4151", Hostname: "A", TopicName: "t1", Depth: 5,
++		E2eProcessingLatency: latencyCl7f3a("t1", "A:4151", 10),
++		Channels: []*clusterinfo.ChannelStats{
++			{Node: "A:4151", Hostname: "A", TopicName: "t1", ChannelName: "shared", Depth: 5, MessageCount: 50,
++				E2eProcessingLatency: latencyCl7f3a("t1", "A:4151", 10)},
++			{Node: "A:4151", Hostname: "A", TopicName: "t1", ChannelName: "only-on-a", Depth: 1, MessageCount: 10,
++				E2eProcessingLatency: latencyCl7f3a("t1", "A:4151", 10)},
++		},
++	}
++	nodeB := &clusterinfo.TopicStats{
++		Node: "B:4151", Hostname: "B", TopicName: "t1", Depth: 7,
++		E2eProcessingLatency: latencyCl7f3a("t1", "B:4151", 100),
++		Channels: []*clusterinfo.ChannelStats{
++			{Node: "B:4151", Hostname: "B", TopicName: "t1", ChannelName: "shared", Depth: 7, MessageCount: 70,
++				E2eProcessingLatency: latencyCl7f3a("t1", "B:4151", 100)},
++			{Node: "B:4151", Hostname: "B", TopicName: "t1", ChannelName: "only-on-b", Depth: 3, MessageCount: 30,
++				E2eProcessingLatency: latencyCl7f3a("t1", "B:4151", 100)},
++		},
++	}
++	all := &clusterinfo.TopicStats{TopicName: "t1"}
++	all.Add(nodeA)
++	all.Add(nodeB)
++
++	byName := map[string]*clusterinfo.ChannelStats{}
++	for _, ch := range all.Channels {
++		if _, dup := byName[ch.ChannelName]; dup {
++			t.Fatalf("channel %q merged into more than one entry", ch.ChannelName)
++		}
++		byName[ch.ChannelName] = ch
++	}
++	if len(byName) != 3 {
++		names := make([]string, 0, len(all.Channels))
++		for _, ch := range all.Channels {
++			names = append(names, ch.ChannelName)
++		}
++		t.Fatalf("expected 3 distinct merged channels, got %d: %v", len(byName), names)
++	}
++
++	for _, c := range []struct {
++		name  string
++		depth int64
++		msgs  int64
++	}{
++		{"shared", 12, 120},
++		{"only-on-a", 1, 10},
++		{"only-on-b", 3, 30},
++	} {
++		got, ok := byName[c.name]
++		if !ok {
++			t.Errorf("merged channel %q missing", c.name)
++			continue
++		}
++		if got.Depth != c.depth {
++			t.Errorf("channel %q depth: got %d want %d", c.name, got.Depth, c.depth)
++		}
++		if got.MessageCount != c.msgs {
++			t.Errorf("channel %q message count: got %d want %d", c.name, got.MessageCount, c.msgs)
++		}
++	}
++
++	for _, n := range []struct {
++		node  *clusterinfo.TopicStats
++		depth map[string]int64
++		msgs  map[string]int64
++	}{
++		{nodeA, map[string]int64{"shared": 5, "only-on-a": 1}, map[string]int64{"shared": 50, "only-on-a": 10}},
++		{nodeB, map[string]int64{"shared": 7, "only-on-b": 3}, map[string]int64{"shared": 70, "only-on-b": 30}},
++	} {
++		for _, ch := range n.node.Channels {
++			if ch.Depth != n.depth[ch.ChannelName] {
++				t.Errorf("node %s channel %q depth: got %d want %d",
++					n.node.Hostname, ch.ChannelName, ch.Depth, n.depth[ch.ChannelName])
++			}
++			if ch.MessageCount != n.msgs[ch.ChannelName] {
++				t.Errorf("node %s channel %q message count: got %d want %d",
++					n.node.Hostname, ch.ChannelName, ch.MessageCount, n.msgs[ch.ChannelName])
++			}
++		}
++	}
++}
++
++func TestMergedTopicKeepsPerNodeTopicLatencyCl7f3a(t *testing.T) {
++	nodeA := &clusterinfo.TopicStats{
++		Node: "A:4151", Hostname: "A", TopicName: "t1", Depth: 5,
++		E2eProcessingLatency: latencyNCl7f3a("t1", "A:4151", 10, 1),
++	}
++	nodeB := &clusterinfo.TopicStats{
++		Node: "B:4151", Hostname: "B", TopicName: "t1", Depth: 7,
++		E2eProcessingLatency: latencyNCl7f3a("t1", "B:4151", 100, 3),
++	}
++	all := &clusterinfo.TopicStats{TopicName: "t1"}
++	all.Add(nodeA)
++	all.Add(nodeB)
++
++	if nodeA.E2eProcessingLatency == nil {
++		t.Fatal("node A lost its topic latency aggregate")
++	}
++	a := nodeA.E2eProcessingLatency
++	if a.Addr != "A:4151" {
++		t.Errorf("node A topic latency host: got %q want %q (turned into the cluster total)", a.Addr, "A:4151")
++	}
++	if a.Count != 1 {
++		t.Errorf("node A topic latency count: got %d want 1", a.Count)
++	}
++	if len(a.Percentiles) != 1 {
++		t.Fatalf("node A topic latency percentiles: got %d want 1", len(a.Percentiles))
++	}
++	for key, want := range map[string]float64{"min": 10, "max": 10, "average": 10, "count": 1} {
++		if got := a.Percentiles[0][key]; got != want {
++			t.Errorf("node A topic latency %q: got %v want %v", key, got, want)
++		}
++	}
++
++	if all.E2eProcessingLatency == nil {
++		t.Fatal("merged topic has no latency aggregate")
++	}
++	m := all.E2eProcessingLatency
++	if got := m.Percentiles[0]["max"]; got != 100 {
++		t.Errorf("merged topic latency max: got %v want 100", got)
++	}
++	if got := m.Percentiles[0]["min"]; got != 10 {
++		t.Errorf("merged topic latency min: got %v want 10", got)
++	}
++}
+diff --git a/internal/clusterinfo/weighted_latency_cl7f3a_test.go b/internal/clusterinfo/weighted_latency_cl7f3a_test.go
+new file mode 100644
+index 0000000..05ae0c0
+--- /dev/null
++++ b/internal/clusterinfo/weighted_latency_cl7f3a_test.go
+@@ -0,0 +1,45 @@
++//go:build clusteragg
++
++package clusterinfo_test
++
++import (
++	"testing"
++
++	"github.com/nsqio/nsq/internal/quantile"
++)
++
++// nodeLatencyWeightedCl7f3a builds one node's aggregate with an explicit sample
++// count.
++func nodeLatencyWeightedCl7f3a(min, max, average, count float64) *quantile.E2eProcessingLatencyAggregate {
++	return &quantile.E2eProcessingLatencyAggregate{
++		Count: int(count),
++		Percentiles: []map[string]float64{
++			{"quantile": 0.99, "value": max, "min": min, "max": max,
++				"average": average, "count": count},
++		},
++		Topic: "t1",
++	}
++}
++
++func TestMergedLatencyAverageIsSampleWeightedCl7f3a(t *testing.T) {
++	agg := &quantile.E2eProcessingLatencyAggregate{Topic: "t1"}
++	agg.Add(nodeLatencyWeightedCl7f3a(2, 10, 6, 1))
++	agg.Add(nodeLatencyWeightedCl7f3a(40, 100, 70, 3))
++
++	if len(agg.Percentiles) != 1 {
++		t.Fatalf("expected 1 percentile, got %d", len(agg.Percentiles))
++	}
++	p := agg.Percentiles[0]
++	if got := p["min"]; got != 2 {
++		t.Errorf("merged min: got %v want 2", got)
++	}
++	if got := p["max"]; got != 100 {
++		t.Errorf("merged max: got %v want 100", got)
++	}
++	if got := p["count"]; got != 4 {
++		t.Errorf("merged sample count: got %v want 4", got)
++	}
++	if got := p["average"]; got != 54 {
++		t.Errorf("merged average: got %v want 54 (38 means the counts were ignored)", got)
++	}
++}
+diff --git a/internal/quantile/result_order_cl7f3a_test.go b/internal/quantile/result_order_cl7f3a_test.go
+new file mode 100644
+index 0000000..9c965fe
+--- /dev/null
++++ b/internal/quantile/result_order_cl7f3a_test.go
+@@ -0,0 +1,31 @@
++//go:build clusteragg
++
++package quantile_test
++
++import (
++	"testing"
++	"time"
++
++	"github.com/nsqio/nsq/internal/quantile"
++)
++
++func TestResultIsHighestQuantileFirstCl7f3a(t *testing.T) {
++	q := quantile.New(time.Minute, []float64{0.75, 0.5, 0.99})
++	for i := 0; i < 100; i++ {
++		q.Insert(time.Now().Add(-time.Duration(i) * time.Millisecond).UnixNano())
++	}
++
++	result := q.Result()
++	if len(result.Percentiles) != 3 {
++		t.Fatalf("expected 3 percentiles, got %d", len(result.Percentiles))
++	}
++	got := make([]float64, 0, 3)
++	for _, p := range result.Percentiles {
++		got = append(got, p["quantile"])
++	}
++	for i := 1; i < len(got); i++ {
++		if !(got[i-1] > got[i]) {
++			t.Fatalf("percentiles not highest-quantile-first: %v", got)
++		}
++	}
++}
+diff --git a/nsqadmin/channel_api_cl7f3a_test.go b/nsqadmin/channel_api_cl7f3a_test.go
+new file mode 100644
+index 0000000..6d49b99
+--- /dev/null
++++ b/nsqadmin/channel_api_cl7f3a_test.go
+@@ -0,0 +1,762 @@
++//go:build clusteragg
++
++package nsqadmin
++
++import (
++	"encoding/json"
++	"fmt"
++	"io"
++	"math/rand"
++	"net"
++	"net/http"
++	"net/http/httptest"
++	"os"
++	"runtime"
++	"strconv"
++	"strings"
++	"sync"
++	"testing"
++	"time"
++
++	"github.com/nsqio/nsq/internal/test"
++)
++
++func getStatusCl7f3a(t *testing.T, url string) (int, []byte) {
++	t.Helper()
++	req, err := http.NewRequest("GET", url, nil)
++	test.Nil(t, err)
++	resp, err := http.DefaultClient.Do(req)
++	test.Nil(t, err)
++	body, _ := io.ReadAll(resp.Body)
++	_ = resp.Body.Close()
++	return resp.StatusCode, body
++}
++
++func TestChannelAPIMissingChannelCl7f3a(t *testing.T) {
++	dataPath, nsqds, nsqlookupds, nsqadmin1 := bootstrapNSQCluster(t)
++	defer func() { _ = os.RemoveAll(dataPath) }()
++	defer nsqds[0].Exit()
++	defer nsqlookupds[0].Exit()
++	defer nsqadmin1.Exit()
++
++	topicName := "test_missing_channel_cl7f3a" + strconv.Itoa(int(time.Now().Unix()))
++	nsqds[0].GetTopic(topicName)
++
++	topicURL := fmt.Sprintf("http://%s/api/topics/%s", nsqadmin1.RealHTTPAddr(), topicName)
++
++	// Wait until the topic is discoverable.
++	deadline := time.Now().Add(10 * time.Second)
++	var topicStatus int
++	for time.Now().Before(deadline) {
++		topicStatus, _ = getStatusCl7f3a(t, topicURL)
++		if topicStatus == 200 {
++			break
++		}
++		time.Sleep(10 * time.Millisecond)
++	}
++	if topicStatus != 200 {
++		t.Fatalf("topic never became discoverable: last status %d", topicStatus)
++	}
++
++	channelURL := fmt.Sprintf("http://%s/api/topics/%s/%s",
++		nsqadmin1.RealHTTPAddr(), topicName, "no_such_channel")
++	status, body := getStatusCl7f3a(t, channelURL)
++	t.Logf("topic status=%d, missing channel status=%d body=%s", topicStatus, status, body)
++	test.Equal(t, 404, status)
++}
++
++// phaseGateCl7f3a fixes which fake nsqd answers first in each round of
++// concurrent queries. setLeader applies to every later round.
++type phaseGateCl7f3a struct {
++	mu       sync.Mutex
++	leader   int
++	rounds   map[int]chan struct{}
++	timedOut bool
++}
++
++func newPhaseGateCl7f3a() *phaseGateCl7f3a {
++	return &phaseGateCl7f3a{rounds: map[int]chan struct{}{}}
++}
++
++// stalled reports whether any round gave up waiting.
++func (g *phaseGateCl7f3a) stalled() bool {
++	g.mu.Lock()
++	defer g.mu.Unlock()
++	return g.timedOut
++}
++
++func (g *phaseGateCl7f3a) setLeader(id int) {
++	g.mu.Lock()
++	g.leader = id
++	g.mu.Unlock()
++}
++
++func (g *phaseGateCl7f3a) leads(id int) bool {
++	g.mu.Lock()
++	defer g.mu.Unlock()
++	return g.leader == id
++}
++
++func (g *phaseGateCl7f3a) chanFor(round int) chan struct{} {
++	g.mu.Lock()
++	defer g.mu.Unlock()
++	if _, ok := g.rounds[round]; !ok {
++		g.rounds[round] = make(chan struct{})
++	}
++	return g.rounds[round]
++}
++
++// await blocks a follower until the leader has answered this round, then
++// repeatedly yields the scheduler so nsqadmin's goroutine for the leader's
++// response gets real opportunities to run and record its result, instead of
++// assuming one fixed delay is always long enough under load.
++func (g *phaseGateCl7f3a) await(round int) {
++	select {
++	case <-g.chanFor(round):
++		deadline := time.Now().Add(time.Second)
++		for time.Now().Before(deadline) {
++			runtime.Gosched()
++			time.Sleep(time.Millisecond)
++		}
++	case <-time.After(10 * time.Second):
++		g.mu.Lock()
++		g.timedOut = true
++		g.mu.Unlock()
++	}
++}
++
++// done records that the leader has answered this round.
++func (g *phaseGateCl7f3a) done(round int) {
++	ch := g.chanFor(round)
++	g.mu.Lock()
++	defer g.mu.Unlock()
++	select {
++	case <-ch:
++	default:
++		close(ch)
++	}
++}
++
++// nsqdFakeCl7f3a is one fake nsqd. With failFiltered set, channel-filtered
++// /stats requests fail. With gate set, the gate decides whether this node
++// answers first or second in every round.
++type nsqdFakeCl7f3a struct {
++	hostname     string
++	stats        string
++	failFiltered bool
++	gate         *phaseGateCl7f3a
++	id           int
++	srv          *httptest.Server
++
++	mu    sync.Mutex
++	round int
++}
++
++func startNSQDFakeCl7f3a(t *testing.T, f *nsqdFakeCl7f3a) *nsqdFakeCl7f3a {
++	t.Helper()
++	f.srv = httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
++		if f.gate != nil {
++			f.mu.Lock()
++			f.round++
++			round := f.round
++			f.mu.Unlock()
++			if !f.gate.leads(f.id) {
++				f.gate.await(round)
++			} else {
++				defer f.gate.done(round)
++			}
++		}
++		if strings.HasPrefix(r.URL.Path, "/info") {
++			host, port, _ := net.SplitHostPort(f.addr())
++			w.Header().Set("Content-Type", "application/json")
++			_, _ = fmt.Fprintf(w, `{"version":"1.3.0","broadcast_address":%q,"hostname":%q,`+
++				`"http_port":%s,"tcp_port":4150}`, host, f.hostname, port)
++			return
++		}
++		if f.failFiltered && r.URL.Query().Get("channel") != "" {
++			http.Error(w, "INTERNAL_ERROR", http.StatusInternalServerError)
++			return
++		}
++		w.Header().Set("Content-Type", "application/json")
++		_, _ = io.WriteString(w, f.stats)
++	}))
++	t.Cleanup(f.srv.Close)
++	return f
++}
++
++func (f *nsqdFakeCl7f3a) addr() string { return strings.TrimPrefix(f.srv.URL, "http://") }
++
++// producerJSONCl7f3a renders the entry a nsqlookupd would report for this node.
++func (f *nsqdFakeCl7f3a) producerJSONCl7f3a() string {
++	host, port, _ := net.SplitHostPort(f.addr())
++	return fmt.Sprintf(`{"hostname":%q,"broadcast_address":%q,"tcp_port":4150,`+
++		`"http_port":%s,"version":"1.3.0","topics":[]}`, f.hostname, host, port)
++}
++
++// startLookupdAbsentCl7f3a serves /lookup the way a real nsqlookupd answers for
++// a topic it does not know: 404 TOPIC_NOT_FOUND.
++func startLookupdAbsentCl7f3a(t *testing.T) string {
++	t.Helper()
++	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
++		http.Error(w, "TOPIC_NOT_FOUND", http.StatusNotFound)
++	}))
++	t.Cleanup(srv.Close)
++	return strings.TrimPrefix(srv.URL, "http://")
++}
++
++// startLookupdFakeCl7f3a serves /lookup, reporting the given nodes as the
++// producers for the topic.
++func startLookupdFakeCl7f3a(t *testing.T, nodes []*nsqdFakeCl7f3a) string {
++	t.Helper()
++	parts := make([]string, 0, len(nodes))
++	for _, f := range nodes {
++		parts = append(parts, f.producerJSONCl7f3a())
++	}
++	body := `{"producers":[` + strings.Join(parts, ",") + `]}`
++	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
++		w.Header().Set("Content-Type", "application/json")
++		_, _ = io.WriteString(w, body)
++	}))
++	t.Cleanup(srv.Close)
++	return strings.TrimPrefix(srv.URL, "http://")
++}
++
++func startNSQAdminCl7f3a(t *testing.T, lookupdAddrs, nsqdAddrs []string) *NSQAdmin {
++	t.Helper()
++	opts := NewOptions()
++	opts.HTTPAddress = "127.0.0.1:0"
++	opts.NSQLookupdHTTPAddresses = lookupdAddrs
++	opts.NSQDHTTPAddresses = nsqdAddrs
++	opts.Logger = test.NewTestLogger(t)
++	admin, err := New(opts)
++	if err != nil {
++		t.Fatalf("nsqadmin.New: %v", err)
++	}
++	go func() { _ = admin.Main() }()
++	t.Cleanup(admin.Exit)
++
++	deadline := time.Now().Add(10 * time.Second)
++	for time.Now().Before(deadline) {
++		if admin.RealHTTPAddr() != nil {
++			c, err := net.DialTimeout("tcp", admin.RealHTTPAddr().String(), 100*time.Millisecond)
++			if err == nil {
++				_ = c.Close()
++				return admin
++			}
++		}
++		time.Sleep(10 * time.Millisecond)
++	}
++	t.Fatal("nsqadmin never started listening")
++	return nil
++}
++
++// statsBodyCl7f3a renders a /stats body for one topic with one channel.
++func statsBodyCl7f3a(topic, channel string, depth int64, clients string) string {
++	latency := `{"count":3,"percentiles":[` +
++		`{"quantile":0.75,"value":400},` +
++		`{"quantile":0.5,"value":100},` +
++		`{"quantile":0.99,"value":900}]}`
++	return fmt.Sprintf(`{"topics":[{"topic_name":%q,"depth":%d,"message_count":%d,`+
++		`"e2e_processing_latency":%s,"channels":[{"channel_name":%q,"depth":%d,`+
++		`"message_count":%d,"client_count":%d,"clients":[%s],"e2e_processing_latency":%s}]}]}`,
++		topic, depth, depth*10, latency, channel, depth, depth*10,
++		strings.Count(clients, "{"), clients, latency)
++}
++
++// clientsSharingIdentityCl7f3a renders consumers that differ only in remote
++// address.
++func clientsSharingIdentityCl7f3a(ports ...int) string {
++	parts := make([]string, 0, len(ports))
++	for _, p := range ports {
++		parts = append(parts, fmt.Sprintf(`{"client_id":"consumer","hostname":"worker",`+
++			`"remote_address":"10.0.0.7:%d","version":"V2","user_agent":"go-nsq/1.1.0"}`, p))
++	}
++	return strings.Join(parts, ",")
++}
++
++func getJSONCl7f3a(t *testing.T, url string) (int, map[string]interface{}) {
++	t.Helper()
++	status, body := getStatusCl7f3a(t, url)
++	var parsed map[string]interface{}
++	if len(body) > 0 {
++		_ = json.Unmarshal(body, &parsed)
++	}
++	return status, parsed
++}
++
++// nodeHostnamesCl7f3a reads the per-node breakdown out of a topic response.
++func nodeHostnamesCl7f3a(t *testing.T, resp map[string]interface{}) []string {
++	t.Helper()
++	nodes, _ := resp["nodes"].([]interface{})
++	out := make([]string, 0, len(nodes))
++	for _, n := range nodes {
++		m, _ := n.(map[string]interface{})
++		host, _ := m["hostname"].(string)
++		node, _ := m["node"].(string)
++		out = append(out, host+"|"+node)
++	}
++	return out
++}
++
++// depthsOfNodesCl7f3a identifies nodes by the depth each one reported.
++func depthsOfNodesCl7f3a(resp map[string]interface{}) []string {
++	nodes, _ := resp["nodes"].([]interface{})
++	out := make([]string, 0, len(nodes))
++	for _, n := range nodes {
++		m, _ := n.(map[string]interface{})
++		depth, _ := m["depth"].(float64)
++		out = append(out, fmt.Sprintf("depth=%v", depth))
++	}
++	return out
++}
++
++func sameSequenceCl7f3a(t *testing.T, what string, first, second []string) {
++	t.Helper()
++	if len(first) != len(second) {
++		t.Fatalf("%s: count changed between calls, %v then %v", what, first, second)
++	}
++	for i := range first {
++		if first[i] != second[i] {
++			t.Fatalf("%s: order changed between calls: %v then %v", what, first, second)
++		}
++	}
++}
++
++const topicCl7f3a = "events"
++
++func TestTopicAPINodeOrderIsStableForSameHostnameCl7f3a(t *testing.T) {
++	gate := newPhaseGateCl7f3a()
++	one := startNSQDFakeCl7f3a(t, &nsqdFakeCl7f3a{hostname: "same-host", id: 0,
++		stats: statsBodyCl7f3a(topicCl7f3a, "c1", 5, ""), gate: gate})
++	two := startNSQDFakeCl7f3a(t, &nsqdFakeCl7f3a{hostname: "same-host", id: 1,
++		stats: statsBodyCl7f3a(topicCl7f3a, "c1", 7, ""), gate: gate})
++	lookupd := startLookupdFakeCl7f3a(t, []*nsqdFakeCl7f3a{one, two})
++	admin := startNSQAdminCl7f3a(t, []string{lookupd}, nil)
++	url := fmt.Sprintf("http://%s/api/topics/%s", admin.RealHTTPAddr(), topicCl7f3a)
++
++	ask := func(leader int) []string {
++		gate.setLeader(leader)
++		status, resp := getJSONCl7f3a(t, url)
++		if status != 200 {
++			t.Fatalf("topic request failed with status %d", status)
++		}
++		return depthsOfNodesCl7f3a(resp)
++	}
++
++	first, second := ask(0), ask(1)
++	t.Logf("node one answered first -> %v ; node two answered first -> %v", first, second)
++	if gate.stalled() {
++		t.Fatal("the answering order could not be fixed, so the result proves nothing")
++	}
++	if len(first) != 2 {
++		t.Fatalf("expected 2 nodes sharing a hostname, got %v", first)
++	}
++	sameSequenceCl7f3a(t, "topic nodes sharing a hostname via nsqlookupd", first, second)
++}
++
++func TestTopicAPINodeOrderIsStableDirectNSQDCl7f3a(t *testing.T) {
++	gate := newPhaseGateCl7f3a()
++	one := startNSQDFakeCl7f3a(t, &nsqdFakeCl7f3a{hostname: "same-host", id: 0,
++		stats: statsBodyCl7f3a(topicCl7f3a, "c1", 5, ""), gate: gate})
++	two := startNSQDFakeCl7f3a(t, &nsqdFakeCl7f3a{hostname: "same-host", id: 1,
++		stats: statsBodyCl7f3a(topicCl7f3a, "c1", 7, ""), gate: gate})
++	admin := startNSQAdminCl7f3a(t, nil, []string{one.addr(), two.addr()})
++	url := fmt.Sprintf("http://%s/api/topics/%s", admin.RealHTTPAddr(), topicCl7f3a)
++
++	ask := func(leader int) []string {
++		gate.setLeader(leader)
++		status, resp := getJSONCl7f3a(t, url)
++		if status != 200 {
++			t.Fatalf("topic request failed with status %d", status)
++		}
++		return depthsOfNodesCl7f3a(resp)
++	}
++
++	first, second := ask(0), ask(1)
++	t.Logf("node one answered first -> %v ; node two answered first -> %v", first, second)
++	if gate.stalled() {
++		t.Fatal("the answering order could not be fixed, so the result proves nothing")
++	}
++	if len(first) != 2 {
++		t.Fatalf("expected 2 nodes, got %v", first)
++	}
++	sameSequenceCl7f3a(t, "topic nodes discovered directly from nsqd", first, second)
++}
++
++func TestChannelAPIClientOrderIsStableCl7f3a(t *testing.T) {
++	clientOrder := func(resp map[string]interface{}) []string {
++		clients, _ := resp["clients"].([]interface{})
++		out := make([]string, 0, len(clients))
++		for _, c := range clients {
++			m, _ := c.(map[string]interface{})
++			addr, _ := m["remote_address"].(string)
++			out = append(out, addr)
++		}
++		return out
++	}
++
++	forward := clientsSharingIdentityCl7f3a(51001, 51002, 51003, 51004)
++	reversed := clientsSharingIdentityCl7f3a(51004, 51003, 51002, 51001)
++
++	query := func(clients string) []string {
++		node := startNSQDFakeCl7f3a(t, &nsqdFakeCl7f3a{hostname: "worker-host",
++			stats: statsBodyCl7f3a(topicCl7f3a, "c1", 5, clients)})
++		admin := startNSQAdminCl7f3a(t, nil, []string{node.addr()})
++		status, resp := getJSONCl7f3a(t, fmt.Sprintf("http://%s/api/topics/%s/%s",
++			admin.RealHTTPAddr(), topicCl7f3a, "c1"))
++		if status != 200 {
++			t.Fatalf("channel request failed with status %d", status)
++		}
++		return clientOrder(resp)
++	}
++
++	first, second := query(forward), query(reversed)
++	t.Logf("reported ascending -> %v ; reported descending -> %v", first, second)
++	if len(first) != 4 {
++		t.Fatalf("expected 4 clients, got %v", first)
++	}
++	sameSequenceCl7f3a(t, "channel clients sharing hostname and client ID", first, second)
++}
++
++func TestTopicAPIPercentileLabelsMatchValuesCl7f3a(t *testing.T) {
++	a := startNSQDFakeCl7f3a(t, &nsqdFakeCl7f3a{
++		hostname: "a-host", stats: statsBodyCl7f3a(topicCl7f3a, "c1", 5, "")})
++	b := startNSQDFakeCl7f3a(t, &nsqdFakeCl7f3a{
++		hostname: "b-host", stats: statsBodyCl7f3a(topicCl7f3a, "c1", 7, "")})
++	admin := startNSQAdminCl7f3a(t, nil, []string{a.addr(), b.addr()})
++
++	status, resp := getJSONCl7f3a(t, fmt.Sprintf("http://%s/api/topics/%s",
++		admin.RealHTTPAddr(), topicCl7f3a))
++	if status != 200 {
++		t.Fatalf("topic request failed with status %d", status)
++	}
++
++	wantValue := map[float64]float64{0.99: 900, 0.75: 400, 0.5: 100}
++	checkList := func(where string, latency interface{}) {
++		m, ok := latency.(map[string]interface{})
++		if !ok {
++			t.Errorf("%s: no latency object in the response", where)
++			return
++		}
++		raw, _ := m["percentiles"].([]interface{})
++		if len(raw) != 3 {
++			t.Errorf("%s: expected 3 percentiles, got %d", where, len(raw))
++			return
++		}
++		quantiles := make([]float64, 0, len(raw))
++		for _, p := range raw {
++			pm, _ := p.(map[string]interface{})
++			q, _ := pm["quantile"].(float64)
++			quantiles = append(quantiles, q)
++			want, known := wantValue[q]
++			if !known {
++				t.Errorf("%s: unexpected quantile %v", where, q)
++				continue
++			}
++			for _, key := range []string{"max", "min"} {
++				got, present := pm[key].(float64)
++				if !present {
++					continue
++				}
++				if got != want {
++					t.Errorf("%s: quantile %v carries %s %v, want %v (labels and values are misaligned)",
++						where, q, key, got, want)
++				}
++			}
++		}
++		for i := 1; i < len(quantiles); i++ {
++			if !(quantiles[i-1] > quantiles[i]) {
++				t.Errorf("%s: percentiles not highest-quantile-first: %v", where, quantiles)
++				break
++			}
++		}
++	}
++
++	checkList("all-nodes topic", resp["e2e_processing_latency"])
++	nodes, _ := resp["nodes"].([]interface{})
++	if len(nodes) != 2 {
++		t.Fatalf("expected 2 nodes, got %d", len(nodes))
++	}
++	for i, n := range nodes {
++		nm, _ := n.(map[string]interface{})
++		checkList(fmt.Sprintf("node %d topic", i), nm["e2e_processing_latency"])
++	}
++	channels, _ := resp["channels"].([]interface{})
++	if len(channels) != 1 {
++		t.Fatalf("expected 1 merged channel, got %d", len(channels))
++	}
++	for i, c := range channels {
++		cm, _ := c.(map[string]interface{})
++		checkList(fmt.Sprintf("channel %d", i), cm["e2e_processing_latency"])
++	}
++}
++
++func TestNodesAPIOrderIsStableCl7f3a(t *testing.T) {
++	gate := newPhaseGateCl7f3a()
++	a := startNSQDFakeCl7f3a(t, &nsqdFakeCl7f3a{hostname: "a-host", id: 0,
++		stats: statsBodyCl7f3a(topicCl7f3a, "c1", 5, ""), gate: gate})
++	z := startNSQDFakeCl7f3a(t, &nsqdFakeCl7f3a{hostname: "z-host", id: 1,
++		stats: statsBodyCl7f3a(topicCl7f3a, "c1", 7, ""), gate: gate})
++	admin := startNSQAdminCl7f3a(t, nil, []string{z.addr(), a.addr()})
++	url := fmt.Sprintf("http://%s/api/nodes", admin.RealHTTPAddr())
++
++	ask := func(leader int) []string {
++		gate.setLeader(leader)
++		status, resp := getJSONCl7f3a(t, url)
++		if status != 200 {
++			t.Fatalf("nodes request failed with status %d", status)
++		}
++		nodes, _ := resp["nodes"].([]interface{})
++		out := make([]string, 0, len(nodes))
++		for _, n := range nodes {
++			m, _ := n.(map[string]interface{})
++			host, _ := m["hostname"].(string)
++			out = append(out, host)
++		}
++		return out
++	}
++
++	first, second := ask(0), ask(1)
++	t.Logf("a answered first -> %v ; z answered first -> %v", first, second)
++	if gate.stalled() {
++		t.Fatal("the answering order could not be fixed, so the result proves nothing")
++	}
++	if len(first) != 2 {
++		t.Fatalf("expected 2 nodes, got %v", first)
++	}
++	sameSequenceCl7f3a(t, "nodes listing", first, second)
++}
++
++func TestChannelAPINodeOrderIsStableCl7f3a(t *testing.T) {
++	gate := newPhaseGateCl7f3a()
++	one := startNSQDFakeCl7f3a(t, &nsqdFakeCl7f3a{hostname: "same-host", id: 0,
++		stats: statsBodyCl7f3a(topicCl7f3a, "c1", 5, ""), gate: gate})
++	two := startNSQDFakeCl7f3a(t, &nsqdFakeCl7f3a{hostname: "same-host", id: 1,
++		stats: statsBodyCl7f3a(topicCl7f3a, "c1", 7, ""), gate: gate})
++	admin := startNSQAdminCl7f3a(t, nil, []string{one.addr(), two.addr()})
++	url := fmt.Sprintf("http://%s/api/topics/%s/%s", admin.RealHTTPAddr(), topicCl7f3a, "c1")
++
++	ask := func(leader int) []string {
++		gate.setLeader(leader)
++		status, resp := getJSONCl7f3a(t, url)
++		if status != 200 {
++			t.Fatalf("channel request failed with status %d", status)
++		}
++		nodes, _ := resp["nodes"].([]interface{})
++		out := make([]string, 0, len(nodes))
++		for _, n := range nodes {
++			m, _ := n.(map[string]interface{})
++			depth, _ := m["depth"].(float64)
++			out = append(out, fmt.Sprintf("depth=%v", depth))
++		}
++		return out
++	}
++
++	first, second := ask(0), ask(1)
++	t.Logf("node one answered first -> %v ; node two answered first -> %v", first, second)
++	if gate.stalled() {
++		t.Fatal("the answering order could not be fixed, so the result proves nothing")
++	}
++	if len(first) != 2 {
++		t.Fatalf("expected 2 contributors under the channel, got %v", first)
++	}
++	sameSequenceCl7f3a(t, "channel nodes sharing a hostname", first, second)
++}
++
++// topicOnlyCl7f3a is a /stats body for a node that has the topic but reports no
++// channel matching the filter.
++func topicOnlyCl7f3a() string {
++	return fmt.Sprintf(`{"topics":[{"topic_name":%q,"depth":0,"channels":[]}]}`, topicCl7f3a)
++}
++
++func TestChannelAPIAbsentWhenAllNSQDsReportNoTopicCl7f3a(t *testing.T) {
++	a := startNSQDFakeCl7f3a(t, &nsqdFakeCl7f3a{hostname: "a-host", stats: `{"topics":[]}`})
++	b := startNSQDFakeCl7f3a(t, &nsqdFakeCl7f3a{hostname: "b-host", stats: `{"topics":[]}`})
++	admin := startNSQAdminCl7f3a(t, nil, []string{a.addr(), b.addr()})
++
++	status, body := getStatusCl7f3a(t, fmt.Sprintf("http://%s/api/topics/%s/%s",
++		admin.RealHTTPAddr(), topicCl7f3a, "no_such_channel"))
++	t.Logf("status=%d body=%s", status, body)
++	if status != 404 {
++		t.Fatalf("every nsqd reported no topic: got status %d, want 404 (body %s)", status, body)
++	}
++}
++
++func TestChannelAPIAbsentWhenLookupdReportsNoTopicCl7f3a(t *testing.T) {
++	ask := func(lookupds ...string) (int, []byte) {
++		admin := startNSQAdminCl7f3a(t, lookupds, nil)
++		return getStatusCl7f3a(t, fmt.Sprintf("http://%s/api/topics/%s/%s",
++			admin.RealHTTPAddr(), topicCl7f3a, "no_such_channel"))
++	}
++
++	status, body := ask(startLookupdAbsentCl7f3a(t))
++	t.Logf("one nsqlookupd, topic unknown: status=%d body=%s", status, body)
++	if status != 404 {
++		t.Fatalf("nsqlookupd confirmed it knows of no node with the topic: got status %d, want 404 (body %s)",
++			status, body)
++	}
++
++	for _, order := range []string{"unknown-first", "unreachable-first"} {
++		dead := deadAddrDiscoCl7f3a(t)
++		lookupds := []string{startLookupdAbsentCl7f3a(t), dead}
++		if order == "unreachable-first" {
++			lookupds[0], lookupds[1] = lookupds[1], lookupds[0]
++		}
++		admin := startNSQAdminCl7f3a(t, lookupds, nil)
++		status, resp := getJSONCl7f3a(t, fmt.Sprintf("http://%s/api/topics/%s/%s",
++			admin.RealHTTPAddr(), topicCl7f3a, "no_such_channel"))
++		t.Logf("%s: status=%d body=%v", order, status, resp)
++		if status == 404 {
++			t.Fatalf("%s: one nsqlookupd could not be reached, so the topic may still exist: got 404, want an error status (body %v)",
++				order, resp)
++		}
++		if status < 400 {
++			t.Fatalf("%s: got status %d, want an error status (body %v)", order, status, resp)
++		}
++		failed := failedNodesCl7f3a(resp)
++		if !listsNodeCl7f3a(failed, dead) {
++			t.Errorf("%s: failed_nodes %v does not list the unreachable lookupd %s", order, failed, dead)
++		}
++	}
++}
++
++// startShufflingNSQDCl7f3a serves a node whose client list comes back in a
++// different order on every /stats response.
++func startShufflingNSQDCl7f3a(t *testing.T, hostname string, ports []int) string {
++	t.Helper()
++	var addr string
++	var mu sync.Mutex
++	responses := 0
++	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
++		w.Header().Set("Content-Type", "application/json")
++		if strings.HasPrefix(r.URL.Path, "/info") {
++			host, port, _ := net.SplitHostPort(addr)
++			_, _ = fmt.Fprintf(w, `{"version":"1.3.0","broadcast_address":%q,"hostname":%q,`+
++				`"http_port":%s,"tcp_port":4150}`, host, hostname, port)
++			return
++		}
++		mu.Lock()
++		responses++
++		rng := rand.New(rand.NewSource(int64(responses)))
++		mu.Unlock()
++
++		shuffled := append([]int(nil), ports...)
++		rng.Shuffle(len(shuffled), func(i, j int) {
++			shuffled[i], shuffled[j] = shuffled[j], shuffled[i]
++		})
++		_, _ = io.WriteString(w, statsBodyCl7f3a(topicCl7f3a, "c1", 5,
++			clientsSharingIdentityCl7f3a(shuffled...)))
++	}))
++	t.Cleanup(srv.Close)
++	addr = srv.Listener.Addr().String()
++	return addr
++}
++
++func TestChannelAPINodeClientOrderIsStableCl7f3a(t *testing.T) {
++	node := startShufflingNSQDCl7f3a(t, "a-host", []int{9001, 9002, 9003, 9004})
++	admin := startNSQAdminCl7f3a(t, nil, []string{node})
++	url := fmt.Sprintf("http://%s/api/topics/%s/%s", admin.RealHTTPAddr(), topicCl7f3a, "c1")
++
++	perNode := func() []string {
++		_, resp := getJSONCl7f3a(t, url)
++		nodes, _ := resp["nodes"].([]interface{})
++		if len(nodes) != 1 {
++			t.Fatalf("expected 1 contributor under the channel, got %d", len(nodes))
++		}
++		m, _ := nodes[0].(map[string]interface{})
++		clients, _ := m["clients"].([]interface{})
++		if len(clients) != 4 {
++			t.Fatalf("expected 4 clients on the node, got %d", len(clients))
++		}
++		out := make([]string, 0, len(clients))
++		for _, c := range clients {
++			cm, _ := c.(map[string]interface{})
++			addr, _ := cm["remote_address"].(string)
++			out = append(out, addr)
++		}
++		return out
++	}
++
++	first := perNode()
++	for i := 2; i <= 4; i++ {
++		sameSequenceCl7f3a(t, fmt.Sprintf("clients on the node, read %d", i), first, perNode())
++	}
++}
++
++func TestChannelAPIKeepsErrorWhenAnOwnerCannotBeInspectedCl7f3a(t *testing.T) {
++	ask := func(failFiltered bool) (int, []byte) {
++		ok := startNSQDFakeCl7f3a(t, &nsqdFakeCl7f3a{hostname: "a-host", stats: topicOnlyCl7f3a()})
++		other := startNSQDFakeCl7f3a(t, &nsqdFakeCl7f3a{
++			hostname: "b-host", stats: topicOnlyCl7f3a(), failFiltered: failFiltered})
++		admin := startNSQAdminCl7f3a(t, nil, []string{ok.addr(), other.addr()})
++		return getStatusCl7f3a(t, fmt.Sprintf("http://%s/api/topics/%s/%s",
++			admin.RealHTTPAddr(), topicCl7f3a, "some_channel"))
++	}
++
++	status, body := ask(false)
++	t.Logf("both owners inspected: status=%d body=%s", status, body)
++	if status != 404 {
++		t.Fatalf("both owners answered without the channel: got status %d, want 404 (body %s)",
++			status, body)
++	}
++
++	status, body = ask(true)
++	t.Logf("one owner cannot be inspected: status=%d body=%s", status, body)
++	if status == 404 {
++		t.Fatalf("a node could not be inspected, so absence is unproven: got 404, want an error status (body %s)",
++			body)
++	}
++	if status < 400 {
++		t.Fatalf("a node could not be inspected: got status %d, want an error status (body %s)",
++			status, body)
++	}
++}
++
++// statsBodyWithLatencyCl7f3a renders a /stats body for one topic/channel
++// whose only percentile has the given sample count and value.
++func statsBodyWithLatencyCl7f3a(topic, channel string, count int, value float64) string {
++	return fmt.Sprintf(`{"topics":[{"topic_name":%q,"depth":1,"message_count":10,`+
++		`"channels":[{"channel_name":%q,"depth":1,"message_count":10,"client_count":0,"clients":[],`+
++		`"e2e_processing_latency":{"count":%d,"percentiles":[{"quantile":0.99,"value":%v}]}}]}]}`,
++		topic, channel, count, value)
++}
++
++// TestChannelAPILatencyAverageIsStableAcrossNodeOrderCl7f3a covers merging
++// three nodes' latency into one channel aggregate: the incremental
++// weighted-average update is not exactly associative in floating point, so
++// the nodes must always be merged in the same order, not in whichever order
++// their HTTP responses happen to arrive.
++func TestChannelAPILatencyAverageIsStableAcrossNodeOrderCl7f3a(t *testing.T) {
++	channel := "c1"
++	a := startNSQDFakeCl7f3a(t, &nsqdFakeCl7f3a{hostname: "a-host",
++		stats: statsBodyWithLatencyCl7f3a(topicCl7f3a, channel, 1, 0.1)})
++	b := startNSQDFakeCl7f3a(t, &nsqdFakeCl7f3a{hostname: "b-host",
++		stats: statsBodyWithLatencyCl7f3a(topicCl7f3a, channel, 1, 0.2)})
++	c := startNSQDFakeCl7f3a(t, &nsqdFakeCl7f3a{hostname: "c-host",
++		stats: statsBodyWithLatencyCl7f3a(topicCl7f3a, channel, 1, 0.4)})
++
++	admin := startNSQAdminCl7f3a(t, nil, []string{a.addr(), b.addr(), c.addr()})
++	url := fmt.Sprintf("http://%s/api/topics/%s/%s", admin.RealHTTPAddr(), topicCl7f3a, channel)
++
++	read := func() float64 {
++		status, resp := getJSONCl7f3a(t, url)
++		if status != 200 {
++			t.Fatalf("got status %d, want 200", status)
++		}
++		latency, _ := resp["e2e_processing_latency"].(map[string]interface{})
++		percentiles, _ := latency["percentiles"].([]interface{})
++		if len(percentiles) != 1 {
++			t.Fatalf("expected 1 percentile, got %d: %v", len(percentiles), percentiles)
++		}
++		p, _ := percentiles[0].(map[string]interface{})
++		avg, _ := p["average"].(float64)
++		return avg
++	}
++
++	first := read()
++	for i := 2; i <= 30; i++ {
++		if got := read(); got != first {
++			t.Errorf("read %d: average %.20f, read 1: %.20f (merge order is not deterministic)", i, got, first)
++		}
++	}
++}
+diff --git a/nsqadmin/compat_cl7f3a_test.go b/nsqadmin/compat_cl7f3a_test.go
+new file mode 100644
+index 0000000..8195531
+--- /dev/null
++++ b/nsqadmin/compat_cl7f3a_test.go
+@@ -0,0 +1,195 @@
++//go:build clusteragg
++
++package nsqadmin
++
++import (
++	"encoding/json"
++	"fmt"
++	"io"
++	"math/rand"
++	"net"
++	"net/http"
++	"net/http/httptest"
++	"sync"
++	"testing"
++
++	"github.com/nsqio/nsq/internal/test"
++)
++
++const compatTopicCl7f3a = "compat_cl7f3a"
++
++const compatLatencyCl7f3a = `"e2e_processing_latency":{"count":1,"percentiles":[` +
++	`{"quantile":0.99,"value":1,"min":1,"max":1,"average":1,"count":1}]}`
++
++func getJSONCompatCl7f3a(t *testing.T, url string) map[string]interface{} {
++	t.Helper()
++	resp, err := http.DefaultClient.Get(url)
++	test.Nil(t, err)
++	body, _ := io.ReadAll(resp.Body)
++	_ = resp.Body.Close()
++	if resp.StatusCode != 200 {
++		t.Fatalf("GET %s: status %d (body %s)", url, resp.StatusCode, body)
++	}
++	var parsed map[string]interface{}
++	test.Nil(t, json.Unmarshal(body, &parsed))
++	return parsed
++}
++
++// startCompatNodeCl7f3a serves /info with the given topology and /stats with the
++// body stats returns for the nth /stats response.
++func startCompatNodeCl7f3a(t *testing.T, hostname, region, zone string, stats func(n int) string) string {
++	t.Helper()
++	var addr string
++	var mu sync.Mutex
++	responses := 0
++	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
++		w.Header().Set("Content-Type", "application/json")
++		if r.URL.Path == "/info" {
++			host, port, _ := net.SplitHostPort(addr)
++			_, _ = fmt.Fprintf(w, `{"version":"1.3.0","broadcast_address":%q,"hostname":%q,`+
++				`"http_port":%s,"tcp_port":4150,"topology_region":%q,"topology_zone":%q}`,
++				host, hostname, port, region, zone)
++			return
++		}
++		mu.Lock()
++		responses++
++		n := responses
++		mu.Unlock()
++		_, _ = io.WriteString(w, stats(n))
++	}))
++	t.Cleanup(srv.Close)
++	addr = srv.Listener.Addr().String()
++	return addr
++}
++
++func TestChannelAPIKeepsClientTopologyOrderCl7f3a(t *testing.T) {
++	client := func(hostname, region, zone string, port int) string {
++		return fmt.Sprintf(`{"client_id":%q,"hostname":%q,"remote_address":"10.0.0.7:%d",`+
++			`"version":"V2","topology_region":%q,"topology_zone":%q}`,
++			hostname, hostname, port, region, zone)
++	}
++	clients := []string{
++		client("a-remote", "r1", "z1", 9001),
++		client("m-region", "r5", "z2", 9002),
++		client("m-region", "r5", "z2", 9003),
++		client("z-local", "r5", "z5", 9004),
++		client("z-local", "r5", "z5", 9005),
++	}
++	tier := map[string]int{"z-local": 0, "m-region": 1, "a-remote": 2}
++	stats := func(n int) string {
++		shuffled := append([]string(nil), clients...)
++		rand.New(rand.NewSource(int64(n))).Shuffle(len(shuffled), func(i, j int) {
++			shuffled[i], shuffled[j] = shuffled[j], shuffled[i]
++		})
++		return fmt.Sprintf(`{"topics":[{"topic_name":%q,"depth":1,%s,"channels":[`+
++			`{"channel_name":"c1","depth":1,%s,"clients":[%s,%s,%s,%s,%s]}]}]}`,
++			compatTopicCl7f3a, compatLatencyCl7f3a, compatLatencyCl7f3a,
++			shuffled[0], shuffled[1], shuffled[2], shuffled[3], shuffled[4])
++	}
++	node := startCompatNodeCl7f3a(t, "node-host", "r5", "z5", stats)
++	admin := startAdminDiscoCl7f3a(t, []string{node})
++
++	read := func() ([]string, []string) {
++		resp := getJSONCompatCl7f3a(t, fmt.Sprintf("http://%s/api/topics/%s/c1",
++			admin.RealHTTPAddr(), compatTopicCl7f3a))
++		list, _ := resp["clients"].([]interface{})
++		hosts := make([]string, 0, len(list))
++		addrs := make([]string, 0, len(list))
++		for _, c := range list {
++			m, _ := c.(map[string]interface{})
++			hostname, _ := m["hostname"].(string)
++			addr, _ := m["remote_address"].(string)
++			hosts = append(hosts, hostname)
++			addrs = append(addrs, addr)
++		}
++		return hosts, addrs
++	}
++
++	hosts, first := read()
++	if len(hosts) != len(clients) {
++		t.Fatalf("expected %d clients, got %v", len(clients), hosts)
++	}
++	for i := 1; i < len(hosts); i++ {
++		if tier[hosts[i]] < tier[hosts[i-1]] {
++			t.Fatalf("clients of a node in region r5 zone z5 are not nearest first: got %v", hosts)
++		}
++	}
++	for i := 2; i <= 5; i++ {
++		if _, got := read(); fmt.Sprint(got) != fmt.Sprint(first) {
++			t.Fatalf("client order changed between calls: read 1 %v, read %d %v", first, i, got)
++		}
++	}
++}
++
++func TestTopicAPIReportsClusterTopicTotalsCl7f3a(t *testing.T) {
++	type counters struct {
++		depth, backend, messages, zone, region, global int64
++	}
++	nodeStats := func(c counters) string {
++		return fmt.Sprintf(`{"topics":[{"topic_name":%q,"depth":%d,"backend_depth":%d,`+
++			`"message_count":%d,"zone_local_msg_count":%d,"region_local_msg_count":%d,`+
++			`"global_msg_count":%d,%s,"channels":[{"channel_name":"c1","depth":%d,%s}]}]}`,
++			compatTopicCl7f3a, c.depth, c.backend, c.messages, c.zone, c.region, c.global,
++			compatLatencyCl7f3a, c.depth, compatLatencyCl7f3a)
++	}
++	a := counters{depth: 5, backend: 2, messages: 50, zone: 4, region: 6, global: 8}
++	b := counters{depth: 7, backend: 3, messages: 70, zone: 5, region: 9, global: 11}
++	admin := startAdminDiscoCl7f3a(t, []string{
++		startCompatNodeCl7f3a(t, "a-host", "", "", func(int) string { return nodeStats(a) }),
++		startCompatNodeCl7f3a(t, "b-host", "", "", func(int) string { return nodeStats(b) }),
++	})
++
++	resp := getJSONCompatCl7f3a(t, fmt.Sprintf("http://%s/api/topics/%s",
++		admin.RealHTTPAddr(), compatTopicCl7f3a))
++
++	expect := func(where string, obj map[string]interface{}, c counters) {
++		t.Helper()
++		want := map[string]int64{
++			"depth":                  c.depth,
++			"backend_depth":          c.backend,
++			"memory_depth":           c.depth - c.backend,
++			"message_count":          c.messages,
++			"zone_local_msg_count":   c.zone,
++			"region_local_msg_count": c.region,
++			"global_msg_count":       c.global,
++			"delivery_msg_count":     c.zone + c.region + c.global,
++		}
++		for field, w := range want {
++			got, _ := obj[field].(float64)
++			if int64(got) != w {
++				t.Errorf("%s %s: got %v, want %d", where, field, obj[field], w)
++			}
++		}
++		channels, _ := obj["channels"].([]interface{})
++		if len(channels) != 1 {
++			t.Errorf("%s: expected channel c1 only, got %v", where, obj["channels"])
++			return
++		}
++		ch, _ := channels[0].(map[string]interface{})
++		if got, _ := ch["depth"].(float64); ch["channel_name"] != "c1" || int64(got) != c.depth {
++			t.Errorf("%s channel c1 depth: got %v, want %d", where, ch["depth"], c.depth)
++		}
++	}
++
++	expect("all-nodes topic", resp, counters{
++		depth: a.depth + b.depth, backend: a.backend + b.backend,
++		messages: a.messages + b.messages, zone: a.zone + b.zone,
++		region: a.region + b.region, global: a.global + b.global,
++	})
++
++	nodes, _ := resp["nodes"].([]interface{})
++	if len(nodes) != 2 {
++		t.Fatalf("expected 2 per-node entries, got %d", len(nodes))
++	}
++	for _, n := range nodes {
++		m, _ := n.(map[string]interface{})
++		switch m["hostname"] {
++		case "a-host":
++			expect("node a-host", m, a)
++		case "b-host":
++			expect("node b-host", m, b)
++		default:
++			t.Errorf("unexpected node %v", m["hostname"])
++		}
++	}
++}
+diff --git a/nsqadmin/discovery_error_cl7f3a_test.go b/nsqadmin/discovery_error_cl7f3a_test.go
+new file mode 100644
+index 0000000..77a8046
+--- /dev/null
++++ b/nsqadmin/discovery_error_cl7f3a_test.go
+@@ -0,0 +1,174 @@
++//go:build clusteragg
++
++package nsqadmin
++
++import (
++	"fmt"
++	"io"
++	"net"
++	"net/http"
++	"net/http/httptest"
++	"strings"
++	"sync"
++	"testing"
++	"time"
++
++	"github.com/nsqio/nsq/internal/test"
++)
++
++func TestChannelAPIDiscoveryFailureIsNotAbsenceCl7f3a(t *testing.T) {
++	reachable := startStatsNodeDiscoCl7f3a(t)
++	ask := func(nodes []string) (int, []byte) {
++		admin := startAdminDiscoCl7f3a(t, nodes)
++		url := fmt.Sprintf("http://%s/api/topics/%s/%s", admin.RealHTTPAddr(),
++			"events_cl7f3a", "some_channel")
++		req, err := http.NewRequest("GET", url, nil)
++		test.Nil(t, err)
++		resp, err := http.DefaultClient.Do(req)
++		test.Nil(t, err)
++		body, _ := io.ReadAll(resp.Body)
++		_ = resp.Body.Close()
++		return resp.StatusCode, body
++	}
++
++	status, body := ask([]string{reachable})
++	t.Logf("every node answered: status=%d body=%s", status, body)
++	if status != 404 {
++		t.Fatalf("the only node answered without the channel: got status %d, want 404 (body %s)",
++			status, body)
++	}
++
++	status, body = ask([]string{reachable, deadAddrDiscoCl7f3a(t)})
++	t.Logf("one node unreachable: status=%d body=%s", status, body)
++	if status == 404 {
++		t.Fatalf("a node that could own the channel was never reached, so its absence "+
++			"is unproven: got 404, want an error status (body %s)", body)
++	}
++	if status < 400 {
++		t.Fatalf("discovery was incomplete: got status %d, want an error status (body %s)",
++			status, body)
++	}
++}
++
++// startStatsNodeDiscoCl7f3a serves a node that has the topic but no channels.
++func startStatsNodeDiscoCl7f3a(t *testing.T) string {
++	t.Helper()
++	var addr string
++	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
++		w.Header().Set("Content-Type", "application/json")
++		if r.URL.Path == "/info" {
++			host, port, _ := net.SplitHostPort(addr)
++			_, _ = fmt.Fprintf(w, `{"version":"1.3.0","broadcast_address":%q,`+
++				`"hostname":"reachable-host","http_port":%s,"tcp_port":4150}`, host, port)
++			return
++		}
++		_, _ = io.WriteString(w, `{"topics":[{"topic_name":"events_cl7f3a","depth":0,"channels":[]}]}`)
++	}))
++	t.Cleanup(srv.Close)
++	addr = srv.Listener.Addr().String()
++	return addr
++}
++
++// deadAddrDiscoCl7f3a returns an address nothing is listening on.
++func deadAddrDiscoCl7f3a(t *testing.T) string {
++	t.Helper()
++	l, err := net.Listen("tcp", "127.0.0.1:0")
++	test.Nil(t, err)
++	addr := l.Addr().String()
++	_ = l.Close()
++	return addr
++}
++
++func startAdminDiscoCl7f3a(t *testing.T, nsqdAddrs []string) *NSQAdmin {
++	t.Helper()
++	opts := NewOptions()
++	opts.HTTPAddress = "127.0.0.1:0"
++	opts.NSQDHTTPAddresses = nsqdAddrs
++	opts.Logger = test.NewTestLogger(t)
++	admin, err := New(opts)
++	if err != nil {
++		t.Fatalf("nsqadmin.New: %v", err)
++	}
++	go func() { _ = admin.Main() }()
++	t.Cleanup(admin.Exit)
++
++	deadline := time.Now().Add(10 * time.Second)
++	for time.Now().Before(deadline) {
++		if admin.RealHTTPAddr() != nil {
++			c, err := net.DialTimeout("tcp", admin.RealHTTPAddr().String(), 100*time.Millisecond)
++			if err == nil {
++				_ = c.Close()
++				return admin
++			}
++		}
++		time.Sleep(10 * time.Millisecond)
++	}
++	t.Fatal("nsqadmin never started listening")
++	return nil
++}
++
++// TestTopicsMessageOrderIsAddressSortedCl7f3a covers /api/topics when every
++// lookupd is unreachable: the error message joins each node's failure, and
++// that join must not depend on which node's dial failed first.
++// startLookupdErrorGatedCl7f3a serves a distinct, fixed error body for every
++// request. If gate is non-nil, it fixes which of a pair of such lookupds
++// answers first in each round.
++func startLookupdErrorGatedCl7f3a(t *testing.T, body string, gate *phaseGateCl7f3a, id int) string {
++	t.Helper()
++	var mu sync.Mutex
++	round := 0
++	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
++		if gate != nil {
++			mu.Lock()
++			round++
++			rnd := round
++			mu.Unlock()
++			if !gate.leads(id) {
++				gate.await(rnd)
++			} else {
++				defer gate.done(rnd)
++			}
++		}
++		http.Error(w, body, http.StatusInternalServerError)
++	}))
++	t.Cleanup(srv.Close)
++	return strings.TrimPrefix(srv.URL, "http://")
++}
++
++// TestTopicAPIWholeResponseIsStableAcrossFailureOrderCl7f3a covers a topic
++// stats request where one lookupd reports the owner and two others fail with
++// distinct, fixed errors: the whole response must be the same whichever
++// failing lookupd answers first.
++func TestTopicAPIWholeResponseIsStableAcrossFailureOrderCl7f3a(t *testing.T) {
++	owner := startNSQDFakeCl7f3a(t, &nsqdFakeCl7f3a{hostname: "owner-host",
++		stats: statsBodyCl7f3a(topicCl7f3a, "c1", 5, "")})
++	live := startLookupdFakeCl7f3a(t, []*nsqdFakeCl7f3a{owner})
++	gate := newPhaseGateCl7f3a()
++	failA := startLookupdErrorGatedCl7f3a(t, "ERROR_A", gate, 0)
++	failB := startLookupdErrorGatedCl7f3a(t, "ERROR_B", gate, 1)
++
++	read := func(leader int) string {
++		gate.setLeader(leader)
++		admin := startNSQAdminCl7f3a(t, []string{live, failA, failB}, nil)
++		status, body := getStatusCl7f3a(t, fmt.Sprintf("http://%s/api/topics/%s",
++			admin.RealHTTPAddr(), topicCl7f3a))
++		if status != 200 {
++			t.Fatalf("leader %d: one lookupd reported the owner: got status %d, want 200 (body %s)",
++				leader, status, body)
++		}
++		return string(body)
++	}
++
++	aFirst := read(0)
++	if gate.stalled() {
++		t.Fatal("the answering order could not be fixed, so the result proves nothing")
++	}
++	bFirst := read(1)
++	if gate.stalled() {
++		t.Fatal("the answering order could not be fixed, so the result proves nothing")
++	}
++	if aFirst != bFirst {
++		t.Errorf("the topic response depends on which lookupd failed first:\n  A answered first: %s\n  B answered first: %s",
++			aFirst, bFirst)
++	}
++}
+diff --git a/nsqadmin/unreachable_nodes_cl7f3a_test.go b/nsqadmin/unreachable_nodes_cl7f3a_test.go
+new file mode 100644
+index 0000000..5a2bd45
+--- /dev/null
++++ b/nsqadmin/unreachable_nodes_cl7f3a_test.go
+@@ -0,0 +1,420 @@
++//go:build clusteragg
++
++package nsqadmin
++
++import (
++	"encoding/json"
++	"fmt"
++	"io"
++	"net"
++	"net/http"
++	"net/http/httptest"
++	"strings"
++	"sync"
++	"testing"
++)
++
++// failedNodesCl7f3a reads the failed_nodes list out of a response.
++func failedNodesCl7f3a(resp map[string]interface{}) []string {
++	list, _ := resp["failed_nodes"].([]interface{})
++	out := make([]string, 0, len(list))
++	for _, v := range list {
++		if s, ok := v.(string); ok {
++			out = append(out, s)
++			continue
++		}
++		b, _ := json.Marshal(v)
++		out = append(out, string(b))
++	}
++	return out
++}
++
++func listsNodeCl7f3a(nodes []string, addr string) bool {
++	for _, n := range nodes {
++		if strings.Contains(n, addr) {
++			return true
++		}
++	}
++	return false
++}
++
++func TestAPIListsUnreachableNodesCl7f3a(t *testing.T) {
++	live := startNSQDFakeCl7f3a(t, &nsqdFakeCl7f3a{hostname: "live-host",
++		stats: statsBodyCl7f3a(topicCl7f3a, "c1", 5, "")})
++	dead := deadAddrDiscoCl7f3a(t)
++	paths := []string{
++		"/api/topics",
++		"/api/topics/" + topicCl7f3a,
++		"/api/topics/" + topicCl7f3a + "/c1",
++		"/api/nodes",
++		"/api/nodes/" + live.addr(),
++	}
++
++	admin := startNSQAdminCl7f3a(t, nil, []string{live.addr(), dead})
++	for _, path := range paths {
++		status, resp := getJSONCl7f3a(t, fmt.Sprintf("http://%s%s", admin.RealHTTPAddr(), path))
++		if status < 200 || status > 299 {
++			t.Fatalf("%s with one node unreachable: got status %d, want a successful response", path, status)
++		}
++		failed := failedNodesCl7f3a(resp)
++		if !listsNodeCl7f3a(failed, dead) {
++			t.Errorf("%s: failed_nodes %v does not list the unreachable node %s", path, failed, dead)
++		}
++		if listsNodeCl7f3a(failed, live.addr()) {
++			t.Errorf("%s: failed_nodes %v lists %s, which answered", path, failed, live.addr())
++		}
++	}
++
++	admin = startNSQAdminCl7f3a(t, nil, []string{live.addr()})
++	for _, path := range paths {
++		status, resp := getJSONCl7f3a(t, fmt.Sprintf("http://%s%s", admin.RealHTTPAddr(), path))
++		if status < 200 || status > 299 {
++			t.Fatalf("%s with every node answering: got status %d, want a successful response", path, status)
++		}
++		if failed := failedNodesCl7f3a(resp); len(failed) != 0 {
++			t.Errorf("%s: every node answered, but failed_nodes is %v", path, failed)
++		}
++	}
++}
++
++func TestTopicAPIAbsentOnlyWhenEveryNodeAnsweredCl7f3a(t *testing.T) {
++	ask := func(nsqds ...string) (int, []byte) {
++		admin := startNSQAdminCl7f3a(t, nil, nsqds)
++		return getStatusCl7f3a(t, fmt.Sprintf("http://%s/api/topics/%s",
++			admin.RealHTTPAddr(), topicCl7f3a))
++	}
++	a := startNSQDFakeCl7f3a(t, &nsqdFakeCl7f3a{hostname: "a-host", stats: `{"topics":[]}`})
++	b := startNSQDFakeCl7f3a(t, &nsqdFakeCl7f3a{hostname: "b-host", stats: `{"topics":[]}`})
++
++	status, body := ask(a.addr(), b.addr())
++	t.Logf("every nsqd answered: status=%d body=%s", status, body)
++	if status != 404 {
++		t.Fatalf("every nsqd answered without the topic: got status %d, want 404 (body %s)", status, body)
++	}
++
++	status, body = ask(a.addr(), deadAddrDiscoCl7f3a(t))
++	t.Logf("one nsqd unreachable: status=%d body=%s", status, body)
++	if status == 404 {
++		t.Fatalf("one nsqd could not be reached: got 404, want an error status (body %s)", body)
++	}
++	if status < 400 {
++		t.Fatalf("one nsqd could not be reached: got status %d, want an error status (body %s)", status, body)
++	}
++}
++
++func TestNodeAPIAbsentOnlyWhenEveryNodeAnsweredCl7f3a(t *testing.T) {
++	live := startNSQDFakeCl7f3a(t, &nsqdFakeCl7f3a{hostname: "live-host", stats: `{"topics":[]}`})
++	dead := deadAddrDiscoCl7f3a(t)
++	ask := func(nsqds ...string) (int, []byte) {
++		admin := startNSQAdminCl7f3a(t, nil, nsqds)
++		return getStatusCl7f3a(t, fmt.Sprintf("http://%s/api/nodes/%s", admin.RealHTTPAddr(), dead))
++	}
++
++	status, body := ask(live.addr(), dead)
++	t.Logf("requested node unreachable: status=%d body=%s", status, body)
++	if status == 404 {
++		t.Fatalf("the requested node could not be reached: got 404, want an error status (body %s)", body)
++	}
++	if status < 400 {
++		t.Fatalf("the requested node could not be reached: got status %d, want an error status (body %s)",
++			status, body)
++	}
++
++	status, body = ask(live.addr())
++	t.Logf("every node answered: status=%d body=%s", status, body)
++	if status != 404 {
++		t.Fatalf("every node answered and none is %s: got status %d, want 404 (body %s)", dead, status, body)
++	}
++}
++
++// startLookupdTopicsFakeCl7f3a serves /topics, /lookup, and /channels for an
++// nsqlookupd that knows the given topics but currently has no producer for
++// them. If failQueries is true, /lookup and /channels still succeed for the
++// initial /topics listing but fail every per-topic request with a 500,
++// simulating a lookupd that answers the overall scan but cannot be queried
++// about a specific topic afterward.
++func startLookupdTopicsFakeCl7f3a(t *testing.T, topics []string, channels []string, failQueries bool) string {
++	t.Helper()
++	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
++		switch r.URL.Path {
++		case "/topics":
++			b, _ := json.Marshal(struct {
++				Topics []string `json:"topics"`
++			}{topics})
++			w.Header().Set("Content-Type", "application/json")
++			_, _ = w.Write(b)
++		case "/lookup":
++			if failQueries {
++				http.Error(w, "INTERNAL_ERROR", http.StatusInternalServerError)
++				return
++			}
++			_, _ = io.WriteString(w, `{"producers":[]}`)
++		case "/channels":
++			if failQueries {
++				http.Error(w, "INTERNAL_ERROR", http.StatusInternalServerError)
++				return
++			}
++			b, _ := json.Marshal(struct {
++				Channels []string `json:"channels"`
++			}{channels})
++			w.Header().Set("Content-Type", "application/json")
++			_, _ = w.Write(b)
++		default:
++			http.NotFound(w, r)
++		}
++	}))
++	t.Cleanup(srv.Close)
++	return strings.TrimPrefix(srv.URL, "http://")
++}
++
++// TestInactiveTopicsListFailedNodesWhenPerTopicQueryFailsCl7f3a covers a
++// lookupd that answers the overall /topics scan but then fails when asked
++// about that topic specifically (its /lookup and /channels requests). The
++// topic is still known overall, so this must not be reported as absent; the
++// failing lookupd must appear in failed_nodes.
++func TestInactiveTopicsListFailedNodesWhenPerTopicQueryFailsCl7f3a(t *testing.T) {
++	good := startLookupdTopicsFakeCl7f3a(t, []string{topicCl7f3a}, []string{"c1"}, false)
++	bad := startLookupdTopicsFakeCl7f3a(t, []string{topicCl7f3a}, nil, true)
++
++	admin := startNSQAdminCl7f3a(t, []string{good, bad}, nil)
++	status, resp := getJSONCl7f3a(t, fmt.Sprintf("http://%s/api/topics?inactive=true", admin.RealHTTPAddr()))
++	if status < 200 || status > 299 {
++		t.Fatalf("one lookupd failed the per-topic query: got status %d, want a successful response", status)
++	}
++	failed := failedNodesCl7f3a(resp)
++	if !listsNodeCl7f3a(failed, bad) {
++		t.Errorf("failed_nodes %v does not list the lookupd that failed the per-topic query %s", failed, bad)
++	}
++}
++
++// TestNodesAPIRemoteAddressesAreSortedCl7f3a covers /api/nodes when two
++// lookupds both report the same producer: remote_addresses must be sorted,
++// not left in whichever order the two lookupds happened to answer.
++// startLookupdFakeGatedCl7f3a is startLookupdFakeCl7f3a, but gate (if
++// non-nil) fixes which of a pair of such lookupds answers first in each
++// round.
++func startLookupdFakeGatedCl7f3a(t *testing.T, nodes []*nsqdFakeCl7f3a, gate *phaseGateCl7f3a, id int) string {
++	t.Helper()
++	parts := make([]string, 0, len(nodes))
++	for _, f := range nodes {
++		parts = append(parts, f.producerJSONCl7f3a())
++	}
++	body := `{"producers":[` + strings.Join(parts, ",") + `]}`
++	var mu sync.Mutex
++	round := 0
++	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
++		if gate != nil {
++			mu.Lock()
++			round++
++			rnd := round
++			mu.Unlock()
++			if !gate.leads(id) {
++				gate.await(rnd)
++			} else {
++				defer gate.done(rnd)
++			}
++		}
++		w.Header().Set("Content-Type", "application/json")
++		_, _ = io.WriteString(w, body)
++	}))
++	t.Cleanup(srv.Close)
++	return strings.TrimPrefix(srv.URL, "http://")
++}
++
++// TestNodesAPIRemoteAddressesAreStableAcrossAnswerOrderCl7f3a covers
++// /api/nodes when two lookupds both report the same producer: the
++// remote_addresses list must not depend on which lookupd answers first.
++func TestNodesAPIRemoteAddressesAreStableAcrossAnswerOrderCl7f3a(t *testing.T) {
++	node := startNSQDFakeCl7f3a(t, &nsqdFakeCl7f3a{hostname: "shared-host", stats: `{"topics":[]}`})
++	gate := newPhaseGateCl7f3a()
++	lookupA := startLookupdFakeGatedCl7f3a(t, []*nsqdFakeCl7f3a{node}, gate, 0)
++	lookupB := startLookupdFakeGatedCl7f3a(t, []*nsqdFakeCl7f3a{node}, gate, 1)
++
++	read := func(leader int) []string {
++		gate.setLeader(leader)
++		admin := startNSQAdminCl7f3a(t, []string{lookupA, lookupB}, nil)
++		status, resp := getJSONCl7f3a(t, fmt.Sprintf("http://%s/api/nodes", admin.RealHTTPAddr()))
++		if status != 200 {
++			t.Fatalf("leader %d: got status %d, want 200", leader, status)
++		}
++		nodes, _ := resp["nodes"].([]interface{})
++		if len(nodes) != 1 {
++			t.Fatalf("leader %d: expected 1 node, got %d: %v", leader, len(nodes), nodes)
++		}
++		n, _ := nodes[0].(map[string]interface{})
++		raw, _ := n["remote_addresses"].([]interface{})
++		out := make([]string, 0, len(raw))
++		for _, r := range raw {
++			out = append(out, r.(string))
++		}
++		return out
++	}
++
++	aFirst := read(0)
++	if gate.stalled() {
++		t.Fatal("the answering order could not be fixed, so the result proves nothing")
++	}
++	bFirst := read(1)
++	if gate.stalled() {
++		t.Fatal("the answering order could not be fixed, so the result proves nothing")
++	}
++	if fmt.Sprint(aFirst) != fmt.Sprint(bFirst) {
++		t.Errorf("remote_addresses depends on answer order:\n  A answered first: %v\n  B answered first: %v", aFirst, bFirst)
++	}
++}
++
++// startLookupdFakeHostnameCl7f3a serves /lookup and /nodes, reporting one
++// producer at the given address under the given hostname.
++// startLookupdFakeHostnameCl7f3a serves /lookup and /nodes, reporting one
++// producer at the given address under the given hostname. If gate is
++// non-nil, it fixes which of a pair of such lookupds answers first in each
++// round.
++func startLookupdFakeHostnameCl7f3a(t *testing.T, addr, hostname string, gate *phaseGateCl7f3a, id int) string {
++	t.Helper()
++	host, port, _ := net.SplitHostPort(addr)
++	body := fmt.Sprintf(`{"producers":[{"hostname":%q,"broadcast_address":%q,`+
++		`"tcp_port":4150,"http_port":%s,"version":"1.3.0","topics":[]}]}`, hostname, host, port)
++	var mu sync.Mutex
++	round := 0
++	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
++		if gate != nil {
++			mu.Lock()
++			round++
++			rnd := round
++			mu.Unlock()
++			if !gate.leads(id) {
++				gate.await(rnd)
++			} else {
++				defer gate.done(rnd)
++			}
++		}
++		w.Header().Set("Content-Type", "application/json")
++		_, _ = io.WriteString(w, body)
++	}))
++	t.Cleanup(srv.Close)
++	return strings.TrimPrefix(srv.URL, "http://")
++}
++
++// TestNodesAPIProducerMetadataChoiceIsStableAcrossAnswerOrderCl7f3a covers
++// two lookupds reporting the same producer address under different
++// hostnames: the chosen record must not depend on which lookupd answered
++// first.
++func TestNodesAPIProducerMetadataChoiceIsStableAcrossAnswerOrderCl7f3a(t *testing.T) {
++	node := startNSQDFakeCl7f3a(t, &nsqdFakeCl7f3a{hostname: "unused", stats: `{"topics":[]}`})
++	gate := newPhaseGateCl7f3a()
++	lookupAlpha := startLookupdFakeHostnameCl7f3a(t, node.addr(), "alpha-host", gate, 0)
++	lookupBeta := startLookupdFakeHostnameCl7f3a(t, node.addr(), "beta-host", gate, 1)
++
++	read := func(leader int) string {
++		gate.setLeader(leader)
++		admin := startNSQAdminCl7f3a(t, []string{lookupAlpha, lookupBeta}, nil)
++		status, resp := getJSONCl7f3a(t, fmt.Sprintf("http://%s/api/nodes", admin.RealHTTPAddr()))
++		if status != 200 {
++			t.Fatalf("leader %d: got status %d, want 200", leader, status)
++		}
++		nodes, _ := resp["nodes"].([]interface{})
++		if len(nodes) != 1 {
++			t.Fatalf("leader %d: expected 1 node, got %d: %v", leader, len(nodes), nodes)
++		}
++		n, _ := nodes[0].(map[string]interface{})
++		hostname, _ := n["hostname"].(string)
++		return hostname
++	}
++
++	alphaFirst := read(0)
++	if gate.stalled() {
++		t.Fatal("the answering order could not be fixed, so the result proves nothing")
++	}
++	betaFirst := read(1)
++	if gate.stalled() {
++		t.Fatal("the answering order could not be fixed, so the result proves nothing")
++	}
++	if alphaFirst != betaFirst {
++		t.Errorf("the chosen producer metadata depends on answer order: alpha answered first picked %q, beta answered first picked %q",
++			alphaFirst, betaFirst)
++	}
++}
++
++// TestTopicAPIUnionsFailedNodesAcrossDiscoveryAndStatsCl7f3a covers a topic
++// whose discovery stage already failed one lookupd, and whose one surviving
++// producer then fails the stats stage entirely: failed_nodes on the
++// resulting error response must include both nodes, not just the one from
++// whichever stage produced the final error.
++func TestTopicAPIUnionsFailedNodesAcrossDiscoveryAndStatsCl7f3a(t *testing.T) {
++	deadLookupd := deadAddrDiscoCl7f3a(t)
++	deadProducerAddr := deadAddrDiscoCl7f3a(t)
++	liveLookupd := startLookupdFakeHostnameCl7f3a(t, deadProducerAddr, "dead-producer", nil, 0)
++
++	admin := startNSQAdminCl7f3a(t, []string{deadLookupd, liveLookupd}, nil)
++	status, resp := getJSONCl7f3a(t, fmt.Sprintf("http://%s/api/topics/%s",
++		admin.RealHTTPAddr(), topicCl7f3a))
++	if status < 400 {
++		t.Fatalf("discovery and stats both failed: got status %d, want an error status", status)
++	}
++	failed := failedNodesCl7f3a(resp)
++	if !listsNodeCl7f3a(failed, deadLookupd) {
++		t.Errorf("failed_nodes %v does not list the discovery-stage failure %s", failed, deadLookupd)
++	}
++	if !listsNodeCl7f3a(failed, deadProducerAddr) {
++		t.Errorf("failed_nodes %v does not list the stats-stage failure %s", failed, deadProducerAddr)
++	}
++}
++
++// startLookupdHealthyCl7f3a serves the nsqlookupd endpoints nsqadmin uses for
++// topic and node listings, reporting node as the only producer.
++func startLookupdHealthyCl7f3a(t *testing.T, node *nsqdFakeCl7f3a) string {
++	t.Helper()
++	producers := `{"producers":[` + node.producerJSONCl7f3a() + `]}`
++	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
++		w.Header().Set("Content-Type", "application/json")
++		switch r.URL.Path {
++		case "/topics":
++			_, _ = fmt.Fprintf(w, `{"topics":[%q]}`, topicCl7f3a)
++		case "/channels":
++			_, _ = io.WriteString(w, `{"channels":["c1"]}`)
++		default:
++			_, _ = io.WriteString(w, producers)
++		}
++	}))
++	t.Cleanup(srv.Close)
++	return strings.TrimPrefix(srv.URL, "http://")
++}
++
++func TestLookupdListingsNameUnreachableLookupdCl7f3a(t *testing.T) {
++	live := startNSQDFakeCl7f3a(t, &nsqdFakeCl7f3a{hostname: "live-host",
++		stats: statsBodyCl7f3a(topicCl7f3a, "c1", 5, "")})
++	healthy := startLookupdHealthyCl7f3a(t, live)
++	dead := deadAddrDiscoCl7f3a(t)
++	paths := []string{
++		"/api/topics",
++		"/api/nodes",
++		"/api/nodes/" + live.addr(),
++	}
++
++	admin := startNSQAdminCl7f3a(t, []string{healthy, dead}, nil)
++	for _, path := range paths {
++		status, resp := getJSONCl7f3a(t, fmt.Sprintf("http://%s%s", admin.RealHTTPAddr(), path))
++		if status < 200 || status > 299 {
++			t.Fatalf("%s with one nsqlookupd unreachable: got status %d, want a successful response",
++				path, status)
++		}
++		failed := failedNodesCl7f3a(resp)
++		if !listsNodeCl7f3a(failed, dead) {
++			t.Errorf("%s: failed_nodes %v does not list the unreachable nsqlookupd %s", path, failed, dead)
++		}
++		if listsNodeCl7f3a(failed, healthy) || listsNodeCl7f3a(failed, live.addr()) {
++			t.Errorf("%s: failed_nodes %v lists a node that answered", path, failed)
++		}
++	}
++
++	admin = startNSQAdminCl7f3a(t, []string{healthy}, nil)
++	for _, path := range paths {
++		status, resp := getJSONCl7f3a(t, fmt.Sprintf("http://%s%s", admin.RealHTTPAddr(), path))
++		if status < 200 || status > 299 {
++			t.Fatalf("%s with every node answering: got status %d, want a successful response", path, status)
++		}
++		if failed := failedNodesCl7f3a(resp); len(failed) != 0 {
++			t.Errorf("%s: every node answered, but failed_nodes is %v", path, failed)
++		}
++	}
++}
+diff --git a/nsqd/stats_latency_cl7f3a_test.go b/nsqd/stats_latency_cl7f3a_test.go
+new file mode 100644
+index 0000000..4f315d9
+--- /dev/null
++++ b/nsqd/stats_latency_cl7f3a_test.go
+@@ -0,0 +1,138 @@
++//go:build clusteragg
++
++package nsqd
++
++import (
++	"bytes"
++	"fmt"
++	"net"
++	"net/http"
++	"os"
++	"testing"
++	"time"
++
++	"github.com/nsqio/go-nsq"
++	"github.com/nsqio/nsq/internal/http_api"
++	"github.com/nsqio/nsq/internal/test"
++)
++
++func TestStatsTopicLatencyIsStableCl7f3a(t *testing.T) {
++	opts := NewOptions()
++	opts.Logger = test.NewTestLogger(t)
++	opts.E2EProcessingLatencyPercentiles = []float64{0.5, 0.9, 0.99}
++	tcpAddr, httpAddr, nsqd := mustStartNSQD(opts)
++	defer func() { _ = os.RemoveAll(opts.DataPath) }()
++	defer nsqd.Exit()
++
++	topicName := "latency_cl7f3a"
++	const channels, messages = 6, 20
++
++	conns := make([]net.Conn, 0, channels)
++	defer func() {
++		for _, c := range conns {
++			_ = c.Close()
++		}
++	}()
++	for i := 0; i < channels; i++ {
++		conn, err := mustConnectNSQD(tcpAddr)
++		test.Nil(t, err)
++		conns = append(conns, conn)
++		identify(t, conn, nil, frameTypeResponse)
++		sub(t, conn, topicName, fmt.Sprintf("ch%d", i))
++		_, err = nsq.Ready(messages).WriteTo(conn)
++		test.Nil(t, err)
++	}
++
++	for m := 0; m < messages; m++ {
++		resp, err := http.Post(fmt.Sprintf("http://%s/pub?topic=%s", httpAddr, topicName),
++			"application/octet-stream", bytes.NewBufferString("body"))
++		test.Nil(t, err)
++		_ = resp.Body.Close()
++	}
++
++	// Each channel finishes its messages at its own pace, so every channel
++	// reports a different latency distribution.
++	done := make(chan error, channels)
++	for i, conn := range conns {
++		go func(i int, conn net.Conn) {
++			for n := 0; n < messages; n++ {
++				resp, err := nsq.ReadResponse(conn)
++				if err != nil {
++					done <- err
++					return
++				}
++				frameType, data, _ := nsq.UnpackResponse(resp)
++				if frameType != frameTypeMessage {
++					n--
++					continue
++				}
++				msg, err := decodeMessage(data)
++				if err != nil {
++					done <- err
++					return
++				}
++				time.Sleep(time.Duration(i+1) * time.Millisecond * time.Duration(n%4+1))
++				if _, err := nsq.Finish(nsq.MessageID(msg.ID)).WriteTo(conn); err != nil {
++					done <- err
++					return
++				}
++			}
++			done <- nil
++		}(i, conn)
++	}
++	for i := 0; i < channels; i++ {
++		test.Nil(t, <-done)
++	}
++
++	client := http_api.NewClient(nil, ConnectTimeout, RequestTimeout)
++	endpoint := fmt.Sprintf("http://%s/stats?format=json&topic=%s", httpAddr, topicName)
++	type latency struct {
++		Count       int                  `json:"count"`
++		Percentiles []map[string]float64 `json:"percentiles"`
++	}
++	read := func() (latency, []int) {
++		var d struct {
++			Topics []struct {
++				Latency  latency `json:"e2e_processing_latency"`
++				Channels []struct {
++					Latency latency `json:"e2e_processing_latency"`
++				} `json:"channels"`
++			} `json:"topics"`
++		}
++		test.Nil(t, client.GETV1(endpoint, &d))
++		if len(d.Topics) != 1 {
++			t.Fatalf("expected one topic, got %+v", d.Topics)
++		}
++		counts := make([]int, 0, channels)
++		for _, c := range d.Topics[0].Channels {
++			counts = append(counts, c.Latency.Count)
++		}
++		return d.Topics[0].Latency, counts
++	}
++
++	deadline := time.Now().Add(10 * time.Second)
++	for {
++		_, counts := read()
++		finished := len(counts) == channels
++		for _, c := range counts {
++			finished = finished && c == messages
++		}
++		if finished {
++			break
++		}
++		if time.Now().After(deadline) {
++			t.Fatalf("channels never recorded every finished message: %v", counts)
++		}
++		time.Sleep(10 * time.Millisecond)
++	}
++
++	first, _ := read()
++	if len(first.Percentiles) == 0 {
++		t.Fatal("the topic reported no latency percentiles")
++	}
++	for i := 2; i <= 20; i++ {
++		if got, _ := read(); fmt.Sprint(got) != fmt.Sprint(first) {
++			t.Fatalf("read %d reported the topic latency as %v, read 1 as %v", i, got, first)
++		}
++	}
++}
+diff --git a/nsqd/stats_order_cl7f3a_test.go b/nsqd/stats_order_cl7f3a_test.go
+new file mode 100644
+index 0000000..cea0979
+--- /dev/null
++++ b/nsqd/stats_order_cl7f3a_test.go
+@@ -0,0 +1,72 @@
++//go:build clusteragg
++
++package nsqd
++
++import (
++	"fmt"
++	"net"
++	"os"
++	"testing"
++
++	"github.com/nsqio/nsq/internal/http_api"
++	"github.com/nsqio/nsq/internal/test"
++)
++
++func TestStatsChannelClientOrderIsStableCl7f3a(t *testing.T) {
++	opts := NewOptions()
++	opts.Logger = test.NewTestLogger(t)
++	tcpAddr, httpAddr, nsqd := mustStartNSQD(opts)
++	defer func() { _ = os.RemoveAll(opts.DataPath) }()
++	defer nsqd.Exit()
++
++	topicName := "client_order_cl7f3a"
++	nsqd.GetTopic(topicName)
++
++	const consumers = 8
++	conns := make([]net.Conn, 0, consumers)
++	defer func() {
++		for _, c := range conns {
++			_ = c.Close()
++		}
++	}()
++	for i := 0; i < consumers; i++ {
++		conn, err := mustConnectNSQD(tcpAddr)
++		test.Nil(t, err)
++		conns = append(conns, conn)
++		identify(t, conn, nil, frameTypeResponse)
++		sub(t, conn, topicName, "ch")
++	}
++
++	client := http_api.NewClient(nil, ConnectTimeout, RequestTimeout)
++	endpoint := fmt.Sprintf("http://%s/stats?format=json&topic=%s&channel=ch", httpAddr, topicName)
++	read := func() []string {
++		var d struct {
++			Topics []struct {
++				Channels []struct {
++					Clients []struct {
++						RemoteAddress string `json:"remote_address"`
++					} `json:"clients"`
++				} `json:"channels"`
++			} `json:"topics"`
++		}
++		test.Nil(t, client.GETV1(endpoint, &d))
++		if len(d.Topics) != 1 || len(d.Topics[0].Channels) != 1 {
++			t.Fatalf("expected one topic with one channel, got %+v", d.Topics)
++		}
++		out := make([]string, 0, consumers)
++		for _, c := range d.Topics[0].Channels[0].Clients {
++			out = append(out, c.RemoteAddress)
++		}
++		return out
++	}
++
++	first := read()
++	if len(first) != consumers {
++		t.Fatalf("expected %d clients, got %d: %v", consumers, len(first), first)
++	}
++	for i := 2; i <= 20; i++ {
++		if got := read(); fmt.Sprint(got) != fmt.Sprint(first) {
++			t.Fatalf("read %d listed the clients as %v, read 1 as %v", i, got, first)
++		}
++	}
++}
+diff --git a/test.sh b/test.sh
+index 5874b6a..4c3b8d9 100755
+--- a/test.sh
++++ b/test.sh
+@@ -1,6 +1,77 @@
+ #!/bin/sh
+ set -e
+ 
++# ./test.sh [--output_path <junit.xml>] base|new runs one test set and exits.
++# base runs the existing tests of the packages listed below; new runs only the
++# tests in files behind the clusteragg build tag. Without arguments the
++# repository's CI checks below run as before.
++if [ "$#" -gt 0 ]; then
++    OUTPUT_PATH=""
++    MODE=""
++    while [ "$#" -gt 0 ]; do
++        case "$1" in
++            --output_path)
++                if [ "$#" -lt 2 ] || [ -z "$2" ]; then
++                    echo "--output_path needs a file path" >&2
++                    exit 2
++                fi
++                OUTPUT_PATH="$2"
++                shift 2
++                ;;
++            base|new)
++                if [ -n "$MODE" ]; then
++                    echo "mode given more than once: $MODE and $1" >&2
++                    exit 2
++                fi
++                MODE="$1"
++                shift
++                ;;
++            *)
++                echo "usage: ./test.sh [--output_path <junit.xml>] [base|new]" >&2
++                exit 2
++                ;;
++        esac
++    done
++    if [ -z "$MODE" ]; then
++        echo "a mode is required: base or new" >&2
++        exit 2
++    fi
++    case "$OUTPUT_PATH" in
++        "" | /*) ;;
++        *) OUTPUT_PATH="$PWD/$OUTPUT_PATH" ;;
++    esac
++    [ -f go.mod ] || cd "$(dirname "$0")"
++
++    case "$MODE" in
++        base)
++            set -- -timeout 600s ./internal/clusterinfo/... ./internal/quantile/... \
++                ./internal/http_api/... ./nsqadmin/... ./nsqlookupd/... ./nsqd/... \
++                ./apps/nsq_stat/... ./apps/nsq_to_file/...
++            ;;
++        new)
++            files=$(grep -rl --include='*_test.go' '^//go:build clusteragg$' .)
++            tests=$(sed -n 's/^func \(Test[A-Za-z0-9_]*\)(t \*testing\.T) {$/\1/p' $files | paste -sd '|' -)
++            set -- -tags clusteragg -timeout 300s -run "^($tests)\$" \
++                $(for f in $files; do dirname "$f"; done | sort -u)
++            ;;
++    esac
++
++    TEST_LOG="$(mktemp)"
++    STATUS=0
++    go test -count=1 -v "$@" >"$TEST_LOG" 2>&1 || STATUS=$?
++    cat "$TEST_LOG"
++
++    if [ -n "$OUTPUT_PATH" ]; then
++        junit_status=0
++        go-junit-report -set-exit-code <"$TEST_LOG" >"$OUTPUT_PATH" || junit_status=$?
++        if [ "$junit_status" -ne 0 ] && [ "$STATUS" -eq 0 ]; then
++            echo "go-junit-report failed to convert the test log (exit $junit_status)" >&2
++            STATUS=$junit_status
++        fi
++    fi
++    exit "$STATUS"
++fi
++
+ GOMAXPROCS=1 go test -vet=all -timeout 90s ./...
+ 
+ if [ "$GOARCH" = "amd64" ] || [ "$GOARCH" = "arm64" ]; then

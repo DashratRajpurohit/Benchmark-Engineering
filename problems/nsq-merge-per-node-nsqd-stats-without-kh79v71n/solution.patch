@@ -1,0 +1,1472 @@
+diff --git a/internal/clusterinfo/data.go b/internal/clusterinfo/data.go
+index be68289..a36d0db 100644
+--- a/internal/clusterinfo/data.go
++++ b/internal/clusterinfo/data.go
+@@ -1,9 +1,11 @@
+ package clusterinfo
+ 
+ import (
++	"errors"
+ 	"fmt"
+ 	"net"
+ 	"net/url"
++	"slices"
+ 	"sort"
+ 	"strconv"
+ 	"strings"
+@@ -34,6 +36,84 @@ func (l ErrList) Errors() []error {
+ 	return l
+ }
+ 
++// sortedErrList builds an ErrList ordered by node address rather than by
++// which goroutine finished first, so the same set of failures always
++// produces the same error text and message ordering.
++func sortedErrList(errs []error) ErrList {
++	out := make([]error, len(errs))
++	copy(out, errs)
++	sort.Slice(out, func(i, j int) bool {
++		return nodeErrAddr(out[i]) < nodeErrAddr(out[j])
++	})
++	return ErrList(out)
++}
++
++func nodeErrAddr(err error) string {
++	var ne NodeErr
++	if errors.As(err, &ne) {
++		return ne.Addr
++	}
++	return ""
++}
++
++// pendingChannelMerge is one node's report of a channel, held until
++// every node has answered so channels can be merged in address order.
++type pendingChannelMerge struct {
++	addr    string
++	channel *ChannelStats
++}
++
++// NodeErr is a failure to get an answer from the nsqd or nsqlookupd at Addr.
++type NodeErr struct {
++	Addr string
++	Err  error
++}
++
++func (e NodeErr) Error() string {
++	return e.Err.Error()
++}
++
++func (e NodeErr) Unwrap() error {
++	return e.Err
++}
++
++// FailedNodes returns the sorted addresses of the nodes that errs report as
++// unreachable.
++func FailedNodes(errs ...error) []string {
++	var addrs []string
++	for _, err := range errs {
++		var pe PartialErr
++		if !errors.As(err, &pe) {
++			continue
++		}
++		for _, e := range pe.Errors() {
++			var ne NodeErr
++			if errors.As(e, &ne) && !slices.Contains(addrs, ne.Addr) {
++				addrs = append(addrs, ne.Addr)
++			}
++		}
++	}
++	sort.Strings(addrs)
++	return addrs
++}
++
++// UnionFailedNodes merges already-extracted failed-node address lists, for
++// example a discovery-stage list and a later stats-stage list, so an error
++// response at any stage still reports every node that failed, not just the
++// ones from the stage that produced the final error.
++func UnionFailedNodes(lists ...[]string) []string {
++	var addrs []string
++	for _, list := range lists {
++		for _, addr := range list {
++			if !slices.Contains(addrs, addr) {
++				addrs = append(addrs, addr)
++			}
++		}
++	}
++	sort.Strings(addrs)
++	return addrs
++}
++
+ type ClusterInfo struct {
+ 	log    lg.AppLogFunc
+ 	client *http_api.Client
+@@ -92,7 +172,7 @@ func (c *ClusterInfo) GetLookupdTopics(lookupdHTTPAddrs []string) ([]string, err
+ 			err := c.client.GETV1(endpoint, &resp)
+ 			if err != nil {
+ 				lock.Lock()
+-				errs = append(errs, err)
++				errs = append(errs, NodeErr{Addr: addr, Err: err})
+ 				lock.Unlock()
+ 				return
+ 			}
+@@ -105,14 +185,14 @@ func (c *ClusterInfo) GetLookupdTopics(lookupdHTTPAddrs []string) ([]string, err
+ 	wg.Wait()
+ 
+ 	if len(errs) == len(lookupdHTTPAddrs) {
+-		return nil, fmt.Errorf("failed to query any nsqlookupd: %s", ErrList(errs))
++		return nil, fmt.Errorf("failed to query any nsqlookupd: %w", sortedErrList(errs))
+ 	}
+ 
+ 	topics = stringy.Uniq(topics)
+ 	sort.Strings(topics)
+ 
+ 	if len(errs) > 0 {
+-		return topics, ErrList(errs)
++		return topics, sortedErrList(errs)
+ 	}
+ 	return topics, nil
+ }
+@@ -141,7 +221,7 @@ func (c *ClusterInfo) GetLookupdTopicChannels(topic string, lookupdHTTPAddrs []s
+ 			err := c.client.GETV1(endpoint, &resp)
+ 			if err != nil {
+ 				lock.Lock()
+-				errs = append(errs, err)
++				errs = append(errs, NodeErr{Addr: addr, Err: err})
+ 				lock.Unlock()
+ 				return
+ 			}
+@@ -154,28 +234,27 @@ func (c *ClusterInfo) GetLookupdTopicChannels(topic string, lookupdHTTPAddrs []s
+ 	wg.Wait()
+ 
+ 	if len(errs) == len(lookupdHTTPAddrs) {
+-		return nil, fmt.Errorf("failed to query any nsqlookupd: %s", ErrList(errs))
++		return nil, fmt.Errorf("failed to query any nsqlookupd: %w", sortedErrList(errs))
+ 	}
+ 
+ 	channels = stringy.Uniq(channels)
+ 	sort.Strings(channels)
+ 
+ 	if len(errs) > 0 {
+-		return channels, ErrList(errs)
++		return channels, sortedErrList(errs)
+ 	}
+ 	return channels, nil
+ }
+ 
+ // GetLookupdProducers returns Producers of all the nsqd connected to the given lookupds
+ func (c *ClusterInfo) GetLookupdProducers(lookupdHTTPAddrs []string) (Producers, error) {
+-	var producers []*Producer
+ 	var lock sync.Mutex
+ 	var wg sync.WaitGroup
+ 	var errs []error
+-
+-	producersByAddr := make(map[string]*Producer)
+ 	maxVersion, _ := semver.Parse("0.0.0")
+ 
++	candidatesByAddr := make(map[string][]lookupdProducerCandidate)
++
+ 	type respType struct {
+ 		Producers []*Producer `json:"producers"`
+ 	}
+@@ -192,7 +271,7 @@ func (c *ClusterInfo) GetLookupdProducers(lookupdHTTPAddrs []string) (Producers,
+ 			err := c.client.GETV1(endpoint, &resp)
+ 			if err != nil {
+ 				lock.Lock()
+-				errs = append(errs, err)
++				errs = append(errs, NodeErr{Addr: addr, Err: err})
+ 				lock.Unlock()
+ 				return
+ 			}
+@@ -201,28 +280,32 @@ func (c *ClusterInfo) GetLookupdProducers(lookupdHTTPAddrs []string) (Producers,
+ 			defer lock.Unlock()
+ 			for _, producer := range resp.Producers {
+ 				key := producer.TCPAddress()
+-				p, ok := producersByAddr[key]
+-				if !ok {
+-					producersByAddr[key] = producer
+-					producers = append(producers, producer)
+-					if maxVersion.LT(producer.VersionObj) {
+-						maxVersion = producer.VersionObj
+-					}
+-					sort.Sort(producer.Topics)
+-					p = producer
+-				}
+-				p.RemoteAddresses = append(p.RemoteAddresses,
+-					fmt.Sprintf("%s/%s", addr, producer.Address()))
++				candidatesByAddr[key] = append(candidatesByAddr[key],
++					lookupdProducerCandidate{lookupdAddr: addr, producer: producer})
+ 			}
+ 		}(addr)
+ 	}
+ 	wg.Wait()
+ 
+ 	if len(errs) == len(lookupdHTTPAddrs) {
+-		return nil, fmt.Errorf("failed to query any nsqlookupd: %s", ErrList(errs))
++		return nil, fmt.Errorf("failed to query any nsqlookupd: %w", sortedErrList(errs))
+ 	}
+ 
+-	for _, producer := range producersByAddr {
++	producers := mergeLookupdProducerCandidates(candidatesByAddr)
++	for _, p := range producers {
++		candidates := candidatesByAddr[p.TCPAddress()]
++		remoteAddrs := make([]string, 0, len(candidates))
++		for _, cand := range candidates {
++			remoteAddrs = append(remoteAddrs, fmt.Sprintf("%s/%s", cand.lookupdAddr, cand.producer.Address()))
++		}
++		sort.Strings(remoteAddrs)
++		p.RemoteAddresses = remoteAddrs
++		sort.Sort(p.Topics)
++		if maxVersion.LT(p.VersionObj) {
++			maxVersion = p.VersionObj
++		}
++	}
++	for _, producer := range producers {
+ 		if producer.VersionObj.LT(maxVersion) {
+ 			producer.OutOfDate = true
+ 		}
+@@ -230,7 +313,7 @@ func (c *ClusterInfo) GetLookupdProducers(lookupdHTTPAddrs []string) (Producers,
+ 	sort.Sort(ProducersByHost{producers})
+ 
+ 	if len(errs) > 0 {
+-		return producers, ErrList(errs)
++		return producers, sortedErrList(errs)
+ 	}
+ 	return producers, nil
+ }
+@@ -238,10 +321,15 @@ func (c *ClusterInfo) GetLookupdProducers(lookupdHTTPAddrs []string) (Producers,
+ // GetLookupdTopicProducers returns Producers of all the nsqd for a given topic by
+ // unioning the nodes returned from the given lookupd
+ func (c *ClusterInfo) GetLookupdTopicProducers(topic string, lookupdHTTPAddrs []string) (Producers, error) {
+-	var producers Producers
+ 	var lock sync.Mutex
+ 	var wg sync.WaitGroup
+ 	var errs []error
++	// absent counts the nsqlookupds that confirmed they have no such topic.
++	var absent int
++	// candidatesByAddr collects every lookupd's report of a producer,
++	// keyed by that producer's HTTP address, so a tie between differing
++	// reports can be broken deterministically instead of by arrival order.
++	candidatesByAddr := make(map[string][]lookupdProducerCandidate)
+ 
+ 	type respType struct {
+ 		Producers Producers `json:"producers"`
+@@ -259,7 +347,11 @@ func (c *ClusterInfo) GetLookupdTopicProducers(topic string, lookupdHTTPAddrs []
+ 			err := c.client.GETV1(endpoint, &resp)
+ 			if err != nil {
+ 				lock.Lock()
+-				errs = append(errs, err)
++				if http_api.IsNotFound(err) {
++					absent++
++				} else {
++					errs = append(errs, NodeErr{Addr: addr, Err: err})
++				}
+ 				lock.Unlock()
+ 				return
+ 			}
+@@ -267,27 +359,49 @@ func (c *ClusterInfo) GetLookupdTopicProducers(topic string, lookupdHTTPAddrs []
+ 			lock.Lock()
+ 			defer lock.Unlock()
+ 			for _, p := range resp.Producers {
+-				for _, pp := range producers {
+-					if p.HTTPAddress() == pp.HTTPAddress() {
+-						goto skip
+-					}
+-				}
+-				producers = append(producers, p)
+-			skip:
++				key := p.HTTPAddress()
++				candidatesByAddr[key] = append(candidatesByAddr[key],
++					lookupdProducerCandidate{lookupdAddr: addr, producer: p})
+ 			}
+ 		}(addr)
+ 	}
+ 	wg.Wait()
+ 
+-	if len(errs) == len(lookupdHTTPAddrs) {
+-		return nil, fmt.Errorf("failed to query any nsqlookupd: %s", ErrList(errs))
++	producers := mergeLookupdProducerCandidates(candidatesByAddr)
++
++	if len(errs) > 0 && len(errs)+absent == len(lookupdHTTPAddrs) && len(producers) == 0 {
++		return nil, fmt.Errorf("failed to query any nsqlookupd: %w", sortedErrList(errs))
+ 	}
++
++	sort.Sort(ProducersByHost{producers})
++
+ 	if len(errs) > 0 {
+-		return producers, ErrList(errs)
++		return producers, sortedErrList(errs)
+ 	}
+ 	return producers, nil
+ }
+ 
++// lookupdProducerCandidate is one lookupd's report of one producer.
++type lookupdProducerCandidate struct {
++	lookupdAddr string
++	producer    *Producer
++}
++
++// mergeLookupdProducerCandidates picks one producer record per HTTP address.
++// When lookupds disagree on a producer's metadata, the record from the
++// lexicographically smallest lookupd address wins, so the result does not
++// depend on which lookupd answered first.
++func mergeLookupdProducerCandidates(candidatesByAddr map[string][]lookupdProducerCandidate) Producers {
++	var producers Producers
++	for _, candidates := range candidatesByAddr {
++		sort.Slice(candidates, func(i, j int) bool {
++			return candidates[i].lookupdAddr < candidates[j].lookupdAddr
++		})
++		producers = append(producers, candidates[0].producer)
++	}
++	return producers
++}
++
+ // GetNSQDTopics returns a []string containing all the topics produced by the given nsqd
+ func (c *ClusterInfo) GetNSQDTopics(nsqdHTTPAddrs []string) ([]string, error) {
+ 	var topics []string
+@@ -313,7 +427,7 @@ func (c *ClusterInfo) GetNSQDTopics(nsqdHTTPAddrs []string) ([]string, error) {
+ 			err := c.client.GETV1(endpoint, &resp)
+ 			if err != nil {
+ 				lock.Lock()
+-				errs = append(errs, err)
++				errs = append(errs, NodeErr{Addr: addr, Err: err})
+ 				lock.Unlock()
+ 				return
+ 			}
+@@ -328,13 +442,13 @@ func (c *ClusterInfo) GetNSQDTopics(nsqdHTTPAddrs []string) ([]string, error) {
+ 	wg.Wait()
+ 
+ 	if len(errs) == len(nsqdHTTPAddrs) {
+-		return nil, fmt.Errorf("failed to query any nsqd: %s", ErrList(errs))
++		return nil, fmt.Errorf("failed to query any nsqd: %w", sortedErrList(errs))
+ 	}
+ 
+ 	sort.Strings(topics)
+ 
+ 	if len(errs) > 0 {
+-		return topics, ErrList(errs)
++		return topics, sortedErrList(errs)
+ 	}
+ 	return topics, nil
+ }
+@@ -374,7 +488,7 @@ func (c *ClusterInfo) GetNSQDProducers(nsqdHTTPAddrs []string) (Producers, error
+ 			err := c.client.GETV1(endpoint, &infoResp)
+ 			if err != nil {
+ 				lock.Lock()
+-				errs = append(errs, err)
++				errs = append(errs, NodeErr{Addr: addr, Err: err})
+ 				lock.Unlock()
+ 				return
+ 			}
+@@ -386,7 +500,7 @@ func (c *ClusterInfo) GetNSQDProducers(nsqdHTTPAddrs []string) (Producers, error
+ 			err = c.client.GETV1(endpoint, &statsResp)
+ 			if err != nil {
+ 				lock.Lock()
+-				errs = append(errs, err)
++				errs = append(errs, NodeErr{Addr: addr, Err: err})
+ 				lock.Unlock()
+ 				return
+ 			}
+@@ -419,10 +533,13 @@ func (c *ClusterInfo) GetNSQDProducers(nsqdHTTPAddrs []string) (Producers, error
+ 	wg.Wait()
+ 
+ 	if len(errs) == len(nsqdHTTPAddrs) {
+-		return nil, fmt.Errorf("failed to query any nsqd: %s", ErrList(errs))
++		return nil, fmt.Errorf("failed to query any nsqd: %w", sortedErrList(errs))
+ 	}
++
++	sort.Sort(ProducersByHost{producers})
++
+ 	if len(errs) > 0 {
+-		return producers, ErrList(errs)
++		return producers, sortedErrList(errs)
+ 	}
+ 	return producers, nil
+ }
+@@ -464,7 +581,7 @@ func (c *ClusterInfo) GetNSQDTopicProducers(topic string, nsqdHTTPAddrs []string
+ 			err := c.client.GETV1(endpoint, &statsResp)
+ 			if err != nil {
+ 				lock.Lock()
+-				errs = append(errs, err)
++				errs = append(errs, NodeErr{Addr: addr, Err: err})
+ 				lock.Unlock()
+ 				return
+ 			}
+@@ -483,7 +600,7 @@ func (c *ClusterInfo) GetNSQDTopicProducers(topic string, nsqdHTTPAddrs []string
+ 					err := c.client.GETV1(endpoint, &infoResp)
+ 					if err != nil {
+ 						lock.Lock()
+-						errs = append(errs, err)
++						errs = append(errs, NodeErr{Addr: addr, Err: err})
+ 						lock.Unlock()
+ 						return
+ 					}
+@@ -527,10 +644,13 @@ func (c *ClusterInfo) GetNSQDTopicProducers(topic string, nsqdHTTPAddrs []string
+ 	wg.Wait()
+ 
+ 	if len(errs) == len(nsqdHTTPAddrs) {
+-		return nil, fmt.Errorf("failed to query any nsqd: %s", ErrList(errs))
++		return nil, fmt.Errorf("failed to query any nsqd: %w", sortedErrList(errs))
+ 	}
++
++	sort.Sort(ProducersByHost{producers})
++
+ 	if len(errs) > 0 {
+-		return producers, ErrList(errs)
++		return producers, sortedErrList(errs)
+ 	}
+ 	return producers, nil
+ }
+@@ -550,6 +670,10 @@ func (c *ClusterInfo) GetNSQDStats(producers Producers,
+ 	var errs []error
+ 
+ 	channelStatsMap := make(map[string]*ChannelStats)
++	// pendingChannelMerges holds each node's channel report until every
++	// node has answered, so the merge order depends on node address
++	// rather than on which nsqd's response arrived first.
++	pendingChannelMerges := make(map[string][]pendingChannelMerge)
+ 
+ 	type respType struct {
+ 		Topics []*TopicStats `json:"topics"`
+@@ -579,7 +703,7 @@ func (c *ClusterInfo) GetNSQDStats(producers Producers,
+ 			err := c.client.GETV1(endpoint, &resp)
+ 			if err != nil {
+ 				lock.Lock()
+-				errs = append(errs, err)
++				errs = append(errs, NodeErr{Addr: addr, Err: err})
+ 				lock.Unlock()
+ 				return
+ 			}
+@@ -596,6 +720,10 @@ func (c *ClusterInfo) GetNSQDStats(producers Producers,
+ 				}
+ 				topicStatsList = append(topicStatsList, topic)
+ 
++				sort.Slice(topic.Channels, func(x, y int) bool {
++					return topic.Channels[x].ChannelName < topic.Channels[y].ChannelName
++				})
++
+ 				for _, channel := range topic.Channels {
+ 					channel.Node = addr
+ 					channel.Hostname = p.Hostname
+@@ -606,35 +734,45 @@ func (c *ClusterInfo) GetNSQDStats(producers Producers,
+ 					if selectedTopic == "" {
+ 						key = fmt.Sprintf("%s:%s", topic.TopicName, channel.ChannelName)
+ 					}
+-					channelStats, ok := channelStatsMap[key]
+-					if !ok {
+-						channelStats = &ChannelStats{
+-							Node:        addr,
+-							TopicName:   topic.TopicName,
+-							ChannelName: channel.ChannelName,
+-						}
+-						channelStatsMap[key] = channelStats
+-					}
+ 					for _, c := range channel.Clients {
+ 						c.Node = addr
+ 						c.NodeTopologyRegion = p.TopologyRegion
+ 						c.NodeTopologyZone = p.TopologyZone
+ 					}
+-					channelStats.Add(channel)
++					sort.Sort(ClientsByHost{ClientStatsList: channel.Clients})
++					pendingChannelMerges[key] = append(pendingChannelMerges[key],
++						pendingChannelMerge{addr: addr, channel: channel})
+ 				}
+ 			}
+ 		}(p)
+ 	}
+ 	wg.Wait()
+ 
+-	if len(errs) == len(producers) {
+-		return nil, nil, fmt.Errorf("failed to query any nsqd: %s", ErrList(errs))
++	if len(producers) > 0 && len(errs) == len(producers) {
++		return nil, nil, fmt.Errorf("failed to query any nsqd: %w", sortedErrList(errs))
++	}
++
++	// Merge each channel's per-node reports in node-address order, not in
++	// the order responses happened to arrive.
++	for key, entries := range pendingChannelMerges {
++		sort.Slice(entries, func(i, j int) bool {
++			return entries[i].addr < entries[j].addr
++		})
++		channelStats := &ChannelStats{
++			Node:        entries[0].addr,
++			TopicName:   entries[0].channel.TopicName,
++			ChannelName: entries[0].channel.ChannelName,
++		}
++		for _, e := range entries {
++			channelStats.Add(e.channel)
++		}
++		channelStatsMap[key] = channelStats
+ 	}
+ 
+ 	sort.Sort(TopicStatsByHost{topicStatsList})
+ 
+ 	if len(errs) > 0 {
+-		return topicStatsList, channelStatsMap, ErrList(errs)
++		return topicStatsList, channelStatsMap, sortedErrList(errs)
+ 	}
+ 	return topicStatsList, channelStatsMap, nil
+ }
+@@ -676,7 +814,7 @@ func (c *ClusterInfo) TombstoneNodeForTopic(topic string, node string, lookupdHT
+ 	}
+ 
+ 	if len(errs) > 0 {
+-		return ErrList(errs)
++		return sortedErrList(errs)
+ 	}
+ 	return nil
+ }
+@@ -728,7 +866,7 @@ func (c *ClusterInfo) CreateTopicChannel(topicName string, channelName string, l
+ 	}
+ 
+ 	if len(errs) > 0 {
+-		return ErrList(errs)
++		return sortedErrList(errs)
+ 	}
+ 	return nil
+ }
+@@ -769,7 +907,7 @@ func (c *ClusterInfo) DeleteTopic(topicName string, lookupdHTTPAddrs []string, n
+ 	}
+ 
+ 	if len(errs) > 0 {
+-		return ErrList(errs)
++		return sortedErrList(errs)
+ 	}
+ 	return nil
+ }
+@@ -809,7 +947,7 @@ func (c *ClusterInfo) DeleteChannel(topicName string, channelName string, lookup
+ 	}
+ 
+ 	if len(errs) > 0 {
+-		return ErrList(errs)
++		return sortedErrList(errs)
+ 	}
+ 	return nil
+ }
+@@ -866,7 +1004,7 @@ func (c *ClusterInfo) actionHelper(topicName string, lookupdHTTPAddrs []string,
+ 	}
+ 
+ 	if len(errs) > 0 {
+-		return ErrList(errs)
++		return sortedErrList(errs)
+ 	}
+ 	return nil
+ }
+@@ -892,11 +1030,11 @@ func (c *ClusterInfo) nsqlookupdPOST(addrs []string, uri string, qs string) erro
+ 		c.logf("CI: querying nsqlookupd %s", endpoint)
+ 		err := c.client.POSTV1(endpoint, nil, nil)
+ 		if err != nil {
+-			errs = append(errs, err)
++			errs = append(errs, NodeErr{Addr: addr, Err: err})
+ 		}
+ 	}
+ 	if len(errs) > 0 {
+-		return ErrList(errs)
++		return sortedErrList(errs)
+ 	}
+ 	return nil
+ }
+@@ -908,11 +1046,11 @@ func (c *ClusterInfo) producersPOST(pl Producers, uri string, qs string) error {
+ 		c.logf("CI: querying nsqd %s", endpoint)
+ 		err := c.client.POSTV1(endpoint, nil, nil)
+ 		if err != nil {
+-			errs = append(errs, err)
++			errs = append(errs, NodeErr{Addr: p.HTTPAddress(), Err: err})
+ 		}
+ 	}
+ 	if len(errs) > 0 {
+-		return ErrList(errs)
++		return sortedErrList(errs)
+ 	}
+ 	return nil
+ }
+diff --git a/internal/clusterinfo/types.go b/internal/clusterinfo/types.go
+index f915658..8ac0a3f 100644
+--- a/internal/clusterinfo/types.go
++++ b/internal/clusterinfo/types.go
+@@ -135,12 +135,25 @@ func (t *TopicStats) Add(a *TopicStats) {
+ 			if aChannelStats.ChannelName == channelStats.ChannelName {
+ 				found = true
+ 				channelStats.Add(aChannelStats)
++				break
+ 			}
+ 		}
+ 		if !found {
+-			t.Channels = append(t.Channels, aChannelStats)
++			agg := &ChannelStats{
++				TopicName:   aChannelStats.TopicName,
++				ChannelName: aChannelStats.ChannelName,
++			}
++			agg.Add(aChannelStats)
++			t.Channels = append(t.Channels, agg)
+ 		}
+ 	}
++	// Keep the merged channel list in a fixed order regardless of which node
++	// was merged first.
++	sort.Slice(t.Channels, func(x, y int) bool {
++		return t.Channels[x].ChannelName < t.Channels[y].ChannelName
++	})
++
++	a.E2eProcessingLatency.SortPercentiles()
+ 	t.NodeStats = append(t.NodeStats, a)
+ 	sort.Sort(TopicStatsByHost{t.NodeStats})
+ 	if t.E2eProcessingLatency == nil {
+@@ -196,6 +209,7 @@ func (c *ChannelStats) Add(a *ChannelStats) {
+ 	if a.Paused {
+ 		c.Paused = a.Paused
+ 	}
++	a.E2eProcessingLatency.SortPercentiles()
+ 	c.NodeStats = append(c.NodeStats, a)
+ 	sort.Sort(ChannelStatsByHost{c.NodeStats})
+ 	if c.E2eProcessingLatency == nil {
+@@ -272,7 +286,11 @@ type ChannelStatsByHost struct {
+ }
+ 
+ func (c ChannelStatsByHost) Less(i, j int) bool {
+-	return c.ChannelStatsList[i].Hostname < c.ChannelStatsList[j].Hostname
++	a, b := c.ChannelStatsList[i], c.ChannelStatsList[j]
++	if a.Hostname != b.Hostname {
++		return a.Hostname < b.Hostname
++	}
++	return a.Node < b.Node
+ }
+ 
+ type ClientStatsList []*ClientStats
+@@ -285,36 +303,56 @@ type ClientsByHost struct {
+ }
+ 
+ func (c ClientsByHost) Less(i, j int) bool {
+-	return c.ClientStatsList[i].Hostname < c.ClientStatsList[j].Hostname
++	a, b := c.ClientStatsList[i], c.ClientStatsList[j]
++	if a.Hostname != b.Hostname {
++		return a.Hostname < b.Hostname
++	}
++	if a.ClientID != b.ClientID {
++		return a.ClientID < b.ClientID
++	}
++	// Two connections may report the same hostname and client ID, so fall back
++	// to the one field that distinguishes concurrent connections.
++	return a.RemoteAddress < b.RemoteAddress
+ }
+ 
+ type ClientStatsByNodeTopology struct {
+ 	ClientStatsList
+ }
+ 
++// topologyRank places a client relative to the nsqd it is connected to: 0 when
++// it shares that node's zone, 1 when it shares only the region, 2 otherwise.
++func topologyRank(c *ClientStats) int {
++	switch {
++	case c.TopologyRegion == c.NodeTopologyRegion && c.TopologyZone == c.NodeTopologyZone:
++		return 0
++	case c.TopologyRegion == c.NodeTopologyRegion:
++		return 1
++	default:
++		return 2
++	}
++}
++
+ func (c ClientStatsByNodeTopology) Less(i, j int) bool {
+-	// if its the same node, sort by topology
+-	if c.ClientStatsList[i].Node == c.ClientStatsList[j].Node {
+-		region := c.ClientStatsList[i].NodeTopologyRegion
+-		zone := c.ClientStatsList[i].NodeTopologyZone
+-
+-		switch {
+-		case c.ClientStatsList[i].TopologyRegion == region && c.ClientStatsList[i].TopologyZone == zone:
+-			return true
+-		case c.ClientStatsList[j].TopologyRegion == region && c.ClientStatsList[j].TopologyZone == zone:
+-			return false
+-		case c.ClientStatsList[i].TopologyRegion == region:
+-			return true
+-		case c.ClientStatsList[j].TopologyRegion == region:
+-			return false
+-		default:
+-			if c.ClientStatsList[i].TopologyRegion == c.ClientStatsList[j].TopologyRegion {
+-				return c.ClientStatsList[i].TopologyZone < c.ClientStatsList[j].TopologyZone
+-			}
+-			return c.ClientStatsList[i].TopologyRegion < c.ClientStatsList[j].TopologyRegion
+-		}
++	a, b := c.ClientStatsList[i], c.ClientStatsList[j]
++	if a.Node != b.Node {
++		return a.Node < b.Node
++	}
++	if ra, rb := topologyRank(a), topologyRank(b); ra != rb {
++		return ra < rb
++	}
++	if a.TopologyRegion != b.TopologyRegion {
++		return a.TopologyRegion < b.TopologyRegion
++	}
++	if a.TopologyZone != b.TopologyZone {
++		return a.TopologyZone < b.TopologyZone
++	}
++	if a.Hostname != b.Hostname {
++		return a.Hostname < b.Hostname
+ 	}
+-	return c.ClientStatsList[i].Node < c.ClientStatsList[j].Node
++	if a.ClientID != b.ClientID {
++		return a.ClientID < b.ClientID
++	}
++	return a.RemoteAddress < b.RemoteAddress
+ }
+ 
+ type TopicStatsList []*TopicStats
+@@ -327,7 +365,14 @@ type TopicStatsByHost struct {
+ }
+ 
+ func (c TopicStatsByHost) Less(i, j int) bool {
+-	return c.TopicStatsList[i].Hostname < c.TopicStatsList[j].Hostname
++	a, b := c.TopicStatsList[i], c.TopicStatsList[j]
++	if a.Hostname != b.Hostname {
++		return a.Hostname < b.Hostname
++	}
++	if a.Node != b.Node {
++		return a.Node < b.Node
++	}
++	return a.TopicName < b.TopicName
+ }
+ 
+ type Producers []*Producer
+@@ -357,5 +402,9 @@ type ProducersByHost struct {
+ }
+ 
+ func (c ProducersByHost) Less(i, j int) bool {
+-	return c.Producers[i].Hostname < c.Producers[j].Hostname
++	a, b := c.Producers[i], c.Producers[j]
++	if a.Hostname != b.Hostname {
++		return a.Hostname < b.Hostname
++	}
++	return a.HTTPAddress() < b.HTTPAddress()
+ }
+diff --git a/internal/http_api/api_request.go b/internal/http_api/api_request.go
+index 9aebc6b..5c9a4a0 100644
+--- a/internal/http_api/api_request.go
++++ b/internal/http_api/api_request.go
+@@ -4,6 +4,7 @@ import (
+ 	"bytes"
+ 	"crypto/tls"
+ 	"encoding/json"
++	"errors"
+ 	"fmt"
+ 	"io"
+ 	"net"
+@@ -46,6 +47,26 @@ func NewClient(tlsConfig *tls.Config, connectTimeout time.Duration, requestTimeo
+ 	}
+ }
+ 
++// ErrHTTPStatus is a non-200 answer from a peer that was reached.
++type ErrHTTPStatus struct {
++	Code   int
++	Status string
++	Body   string
++}
++
++func (e ErrHTTPStatus) Error() string {
++	return fmt.Sprintf("got response %s %q", e.Status, e.Body)
++}
++
++// IsNotFound reports whether err is a peer's definitive "not found" answer.
++func IsNotFound(err error) bool {
++	var status ErrHTTPStatus
++	if errors.As(err, &status) {
++		return status.Code == http.StatusNotFound
++	}
++	return false
++}
++
+ // GETV1 is a helper function to perform a V1 HTTP request
+ // and parse our NSQ daemon's expected response format, with deadlines.
+ func (c *Client) GETV1(endpoint string, v interface{}) error {
+@@ -78,7 +99,7 @@ retry:
+ 			}
+ 			goto retry
+ 		}
+-		return fmt.Errorf("got response %s %q", resp.Status, body)
++		return ErrHTTPStatus{Code: resp.StatusCode, Status: resp.Status, Body: string(body)}
+ 	}
+ 	err = json.Unmarshal(body, &v)
+ 	if err != nil {
+@@ -132,7 +153,7 @@ retry:
+ 			}
+ 			goto retry
+ 		}
+-		return fmt.Errorf("got response %s %q", resp.Status, body)
++		return ErrHTTPStatus{Code: resp.StatusCode, Status: resp.Status, Body: string(body)}
+ 	}
+ 
+ 	if v != nil {
+diff --git a/internal/http_api/api_response.go b/internal/http_api/api_response.go
+index 6ac3da8..d75e4fb 100644
+--- a/internal/http_api/api_response.go
++++ b/internal/http_api/api_response.go
+@@ -16,8 +16,9 @@ type Decorator func(APIHandler) APIHandler
+ type APIHandler func(http.ResponseWriter, *http.Request, httprouter.Params) (interface{}, error)
+ 
+ type Err struct {
+-	Code int
+-	Text string
++	Code        int
++	Text        string
++	FailedNodes []string
+ }
+ 
+ func (e Err) Error() string {
+@@ -89,9 +90,14 @@ func RespondV1(w http.ResponseWriter, code int, data interface{}) {
+ 
+ 	if code != 200 {
+ 		isJSON = true
++		var failedNodes []string
++		if e, ok := data.(Err); ok {
++			failedNodes = e.FailedNodes
++		}
+ 		response, _ = json.Marshal(struct {
+-			Message string `json:"message"`
+-		}{fmt.Sprintf("%s", data)})
++			Message     string   `json:"message"`
++			FailedNodes []string `json:"failed_nodes,omitempty"`
++		}{fmt.Sprintf("%s", data), failedNodes})
+ 	}
+ 
+ 	if isJSON {
+@@ -133,7 +139,7 @@ func LogPanicHandler(logf lg.AppLogFunc) func(w http.ResponseWriter, req *http.R
+ 	return func(w http.ResponseWriter, req *http.Request, p interface{}) {
+ 		logf(lg.ERROR, "panic in HTTP handler - %s", p)
+ 		Decorate(func(w http.ResponseWriter, req *http.Request, ps httprouter.Params) (interface{}, error) {
+-			return nil, Err{500, "INTERNAL_ERROR"}
++			return nil, Err{Code: 500, Text: "INTERNAL_ERROR"}
+ 		}, Log(logf), V1)(w, req, nil)
+ 	}
+ }
+@@ -141,7 +147,7 @@ func LogPanicHandler(logf lg.AppLogFunc) func(w http.ResponseWriter, req *http.R
+ func LogNotFoundHandler(logf lg.AppLogFunc) http.Handler {
+ 	return http.HandlerFunc(func(w http.ResponseWriter, req *http.Request) {
+ 		Decorate(func(w http.ResponseWriter, req *http.Request, ps httprouter.Params) (interface{}, error) {
+-			return nil, Err{404, "NOT_FOUND"}
++			return nil, Err{Code: 404, Text: "NOT_FOUND"}
+ 		}, Log(logf), V1)(w, req, nil)
+ 	})
+ }
+@@ -149,7 +155,7 @@ func LogNotFoundHandler(logf lg.AppLogFunc) http.Handler {
+ func LogMethodNotAllowedHandler(logf lg.AppLogFunc) http.Handler {
+ 	return http.HandlerFunc(func(w http.ResponseWriter, req *http.Request) {
+ 		Decorate(func(w http.ResponseWriter, req *http.Request, ps httprouter.Params) (interface{}, error) {
+-			return nil, Err{405, "METHOD_NOT_ALLOWED"}
++			return nil, Err{Code: 405, Text: "METHOD_NOT_ALLOWED"}
+ 		}, Log(logf), V1)(w, req, nil)
+ 	})
+ }
+diff --git a/internal/quantile/aggregate.go b/internal/quantile/aggregate.go
+index 4930aa7..753866d 100644
+--- a/internal/quantile/aggregate.go
++++ b/internal/quantile/aggregate.go
+@@ -40,6 +40,8 @@ func (e *E2eProcessingLatencyAggregate) UnmarshalJSON(b []byte) error {
+ 	e.Channel = resp.Channel
+ 	e.Addr = resp.Addr
+ 
++	sortPercentilesDesc(e.Percentiles)
++
+ 	return nil
+ }
+ 
+@@ -48,11 +50,32 @@ func (e *E2eProcessingLatencyAggregate) Swap(i, j int) {
+ 	e.Percentiles[i], e.Percentiles[j] = e.Percentiles[j], e.Percentiles[i]
+ }
+ func (e *E2eProcessingLatencyAggregate) Less(i, j int) bool {
+-	return e.Percentiles[i]["percentile"] > e.Percentiles[j]["percentile"]
++	return e.Percentiles[i]["quantile"] > e.Percentiles[j]["quantile"]
++}
++
++// sortPercentilesDesc orders a percentile list highest quantile first. nsqd
++// reports percentiles in the order they were configured, so every list is
++// ordered before it is presented or merged.
++func sortPercentilesDesc(percentiles []map[string]float64) {
++	sort.Slice(percentiles, func(i, j int) bool {
++		return percentiles[i]["quantile"] > percentiles[j]["quantile"]
++	})
++}
++
++// SortPercentiles orders e's percentiles highest quantile first. It does
++// nothing on a nil aggregate.
++func (e *E2eProcessingLatencyAggregate) SortPercentiles() {
++	if e == nil {
++		return
++	}
++	sortPercentilesDesc(e.Percentiles)
+ }
+ 
+ // Add merges e2 into e by averaging the percentiles
+ func (e *E2eProcessingLatencyAggregate) Add(e2 *E2eProcessingLatencyAggregate) {
++	if e2 == nil {
++		return
++	}
+ 	e.Addr = "*"
+ 	p := e.Percentiles
+ 	e.Count += e2.Count
+@@ -69,9 +92,12 @@ func (e *E2eProcessingLatencyAggregate) Add(e2 *E2eProcessingLatencyAggregate) {
+ 			e.Percentiles = append(p, make(map[string]float64))
+ 			p = e.Percentiles
+ 			p[i]["quantile"] = value["quantile"]
++			p[i]["min"] = value["min"]
++			p[i]["max"] = value["max"]
++		} else {
++			p[i]["min"] = math.Min(value["min"], p[i]["min"])
++			p[i]["max"] = math.Max(value["max"], p[i]["max"])
+ 		}
+-		p[i]["max"] = math.Max(value["max"], p[i]["max"])
+-		p[i]["min"] = math.Min(value["max"], p[i]["max"])
+ 		p[i]["count"] += value["count"]
+ 		if p[i]["count"] == 0 {
+ 			p[i]["average"] = 0
+@@ -81,5 +107,5 @@ func (e *E2eProcessingLatencyAggregate) Add(e2 *E2eProcessingLatencyAggregate) {
+ 		R := delta * value["count"] / p[i]["count"]
+ 		p[i]["average"] = p[i]["average"] + R
+ 	}
+-	sort.Sort(e)
++	sortPercentilesDesc(e.Percentiles)
+ }
+diff --git a/internal/quantile/quantile.go b/internal/quantile/quantile.go
+index 4aa01be..b431cf8 100644
+--- a/internal/quantile/quantile.go
++++ b/internal/quantile/quantile.go
+@@ -60,6 +60,7 @@ func (q *Quantile) Result() *Result {
+ 		value := queryHandler.Query(p)
+ 		result.Percentiles[i] = map[string]float64{"quantile": p, "value": value}
+ 	}
++	sortPercentilesDesc(result.Percentiles)
+ 	return &result
+ }
+ 
+diff --git a/nsqadmin/http.go b/nsqadmin/http.go
+index 121b4b7..484ebb9 100644
+--- a/nsqadmin/http.go
++++ b/nsqadmin/http.go
+@@ -214,6 +214,7 @@ func (s *httpServer) staticAssetHandler(w http.ResponseWriter, req *http.Request
+ 
+ func (s *httpServer) topicsHandler(w http.ResponseWriter, req *http.Request, ps httprouter.Params) (interface{}, error) {
+ 	var messages []string
++	var failedNodes []string
+ 
+ 	reqParams, err := http_api.NewReqParams(req)
+ 	if err != nil {
+@@ -230,66 +231,91 @@ func (s *httpServer) topicsHandler(w http.ResponseWriter, req *http.Request, ps
+ 		pe, ok := err.(clusterinfo.PartialErr)
+ 		if !ok {
+ 			s.nsqadmin.logf(LOG_ERROR, "failed to get topics - %s", err)
+-			return nil, http_api.Err{Code: 502, Text: fmt.Sprintf("UPSTREAM_ERROR: %s", err)}
++			return nil, http_api.Err{Code: 502, Text: fmt.Sprintf("UPSTREAM_ERROR: %s", err), FailedNodes: clusterinfo.FailedNodes(err)}
+ 		}
+ 		s.nsqadmin.logf(LOG_WARN, "%s", err)
+ 		messages = append(messages, pe.Error())
++		failedNodes = clusterinfo.FailedNodes(pe)
+ 	}
+ 
+ 	inactive, _ := reqParams.Get("inactive")
+ 	if inactive == "true" {
+ 		topicChannelMap := make(map[string][]string)
++		var lookupErrs []error
+ 		if len(s.nsqadmin.getOpts().NSQLookupdHTTPAddresses) == 0 {
+ 			goto respond
+ 		}
+ 		for _, topicName := range topics {
+-			producers, _ := s.ci.GetLookupdTopicProducers(
++			producers, err := s.ci.GetLookupdTopicProducers(
+ 				topicName, s.nsqadmin.getOpts().NSQLookupdHTTPAddresses)
++			if err != nil {
++				lookupErrs = append(lookupErrs, err)
++			}
+ 			if len(producers) == 0 {
+-				topicChannels, _ := s.ci.GetLookupdTopicChannels(
++				topicChannels, err := s.ci.GetLookupdTopicChannels(
+ 					topicName, s.nsqadmin.getOpts().NSQLookupdHTTPAddresses)
++				if err != nil {
++					lookupErrs = append(lookupErrs, err)
++				}
+ 				topicChannelMap[topicName] = topicChannels
+ 			}
+ 		}
++		for _, err := range lookupErrs {
++			s.nsqadmin.logf(LOG_WARN, "%s", err)
++			messages = append(messages, err.Error())
++		}
++		failedNodes = clusterinfo.FailedNodes(append([]error{err}, lookupErrs...)...)
+ 	respond:
+ 		return struct {
+-			Topics  map[string][]string `json:"topics"`
+-			Message string              `json:"message"`
+-		}{topicChannelMap, maybeWarnMsg(messages)}, nil
++			Topics      map[string][]string `json:"topics"`
++			FailedNodes []string            `json:"failed_nodes,omitempty"`
++			Message     string              `json:"message"`
++		}{topicChannelMap, failedNodes, maybeWarnMsg(messages)}, nil
+ 	}
+ 
+ 	return struct {
+-		Topics  []string `json:"topics"`
+-		Message string   `json:"message"`
+-	}{topics, maybeWarnMsg(messages)}, nil
++		Topics      []string `json:"topics"`
++		FailedNodes []string `json:"failed_nodes,omitempty"`
++		Message     string   `json:"message"`
++	}{topics, failedNodes, maybeWarnMsg(messages)}, nil
+ }
+ 
+ func (s *httpServer) topicHandler(w http.ResponseWriter, req *http.Request, ps httprouter.Params) (interface{}, error) {
+ 	var messages []string
++	var failedNodes []string
+ 
+ 	topicName := ps.ByName("topic")
+ 
+ 	producers, err := s.ci.GetTopicProducers(topicName,
+ 		s.nsqadmin.getOpts().NSQLookupdHTTPAddresses,
+ 		s.nsqadmin.getOpts().NSQDHTTPAddresses)
++	incomplete := err != nil
+ 	if err != nil {
+ 		pe, ok := err.(clusterinfo.PartialErr)
+ 		if !ok {
+ 			s.nsqadmin.logf(LOG_ERROR, "failed to get topic producers - %s", err)
+-			return nil, http_api.Err{Code: 502, Text: fmt.Sprintf("UPSTREAM_ERROR: %s", err)}
++			return nil, http_api.Err{Code: 502, Text: fmt.Sprintf("UPSTREAM_ERROR: %s", err), FailedNodes: clusterinfo.FailedNodes(err)}
+ 		}
+ 		s.nsqadmin.logf(LOG_WARN, "%s", err)
+ 		messages = append(messages, pe.Error())
++		failedNodes = append(failedNodes, clusterinfo.FailedNodes(pe)...)
+ 	}
+ 	topicStats, _, err := s.ci.GetNSQDStats(producers, topicName, "", false)
+ 	if err != nil {
+ 		pe, ok := err.(clusterinfo.PartialErr)
+ 		if !ok {
+ 			s.nsqadmin.logf(LOG_ERROR, "failed to get topic metadata - %s", err)
+-			return nil, http_api.Err{Code: 502, Text: fmt.Sprintf("UPSTREAM_ERROR: %s", err)}
++			return nil, http_api.Err{Code: 502, Text: fmt.Sprintf("UPSTREAM_ERROR: %s", err),
++				FailedNodes: clusterinfo.UnionFailedNodes(failedNodes, clusterinfo.FailedNodes(err))}
+ 		}
+ 		s.nsqadmin.logf(LOG_WARN, "%s", err)
+ 		messages = append(messages, pe.Error())
++		failedNodes = append(failedNodes, clusterinfo.FailedNodes(pe)...)
++		incomplete = true
++	}
++
++	if len(topicStats) == 0 {
++		return nil, s.notFoundUnlessIncomplete("TOPIC_NOT_FOUND", incomplete, messages, failedNodes)
+ 	}
+ 
+ 	allNodesTopicStats := &clusterinfo.TopicStats{TopicName: topicName}
+@@ -299,12 +325,14 @@ func (s *httpServer) topicHandler(w http.ResponseWriter, req *http.Request, ps h
+ 
+ 	return struct {
+ 		*clusterinfo.TopicStats
+-		Message string `json:"message"`
+-	}{allNodesTopicStats, maybeWarnMsg(messages)}, nil
++		FailedNodes []string `json:"failed_nodes,omitempty"`
++		Message     string   `json:"message"`
++	}{allNodesTopicStats, failedNodes, maybeWarnMsg(messages)}, nil
+ }
+ 
+ func (s *httpServer) channelHandler(w http.ResponseWriter, req *http.Request, ps httprouter.Params) (interface{}, error) {
+ 	var messages []string
++	var failedNodes []string
+ 
+ 	topicName := ps.ByName("topic")
+ 	channelName := ps.ByName("channel")
+@@ -312,56 +340,81 @@ func (s *httpServer) channelHandler(w http.ResponseWriter, req *http.Request, ps
+ 	producers, err := s.ci.GetTopicProducers(topicName,
+ 		s.nsqadmin.getOpts().NSQLookupdHTTPAddresses,
+ 		s.nsqadmin.getOpts().NSQDHTTPAddresses)
++	incomplete := err != nil
+ 	if err != nil {
+ 		pe, ok := err.(clusterinfo.PartialErr)
+ 		if !ok {
+ 			s.nsqadmin.logf(LOG_ERROR, "failed to get topic producers - %s", err)
+-			return nil, http_api.Err{Code: 502, Text: fmt.Sprintf("UPSTREAM_ERROR: %s", err)}
++			return nil, http_api.Err{Code: 502, Text: fmt.Sprintf("UPSTREAM_ERROR: %s", err), FailedNodes: clusterinfo.FailedNodes(err)}
+ 		}
+ 		s.nsqadmin.logf(LOG_WARN, "%s", err)
+ 		messages = append(messages, pe.Error())
++		failedNodes = append(failedNodes, clusterinfo.FailedNodes(pe)...)
+ 	}
+ 	_, channelStats, err := s.ci.GetNSQDStats(producers, topicName, channelName, true)
+ 	if err != nil {
+ 		pe, ok := err.(clusterinfo.PartialErr)
+ 		if !ok {
+ 			s.nsqadmin.logf(LOG_ERROR, "failed to get channel metadata - %s", err)
+-			return nil, http_api.Err{Code: 502, Text: fmt.Sprintf("UPSTREAM_ERROR: %s", err)}
++			return nil, http_api.Err{Code: 502, Text: fmt.Sprintf("UPSTREAM_ERROR: %s", err),
++				FailedNodes: clusterinfo.UnionFailedNodes(failedNodes, clusterinfo.FailedNodes(err))}
+ 		}
+ 		s.nsqadmin.logf(LOG_WARN, "%s", err)
+ 		messages = append(messages, pe.Error())
++		failedNodes = append(failedNodes, clusterinfo.FailedNodes(pe)...)
++		incomplete = true
+ 	}
+ 
+-	sort.Sort(clusterinfo.ClientStatsByNodeTopology{ClientStatsList: channelStats[channelName].Clients})
++	cs, ok := channelStats[channelName]
++	if !ok {
++		return nil, s.notFoundUnlessIncomplete("CHANNEL_NOT_FOUND", incomplete, messages, failedNodes)
++	}
++
++	sort.Sort(clusterinfo.ClientStatsByNodeTopology{ClientStatsList: cs.Clients})
+ 
+ 	return struct {
+ 		*clusterinfo.ChannelStats
+-		Message string `json:"message"`
+-	}{channelStats[channelName], maybeWarnMsg(messages)}, nil
++		FailedNodes []string `json:"failed_nodes,omitempty"`
++		Message     string   `json:"message"`
++	}{cs, failedNodes, maybeWarnMsg(messages)}, nil
++}
++
++// notFoundUnlessIncomplete is the error for a topic, channel or node that was
++// not found. Absence is only established when every node answered.
++func (s *httpServer) notFoundUnlessIncomplete(notFound string, incomplete bool, messages []string, failedNodes []string) error {
++	if incomplete {
++		s.nsqadmin.logf(LOG_ERROR, "%s, but some nodes could not be queried", notFound)
++		return http_api.Err{Code: 502, Text: fmt.Sprintf("UPSTREAM_ERROR: %s", maybeWarnMsg(messages)), FailedNodes: failedNodes}
++	}
++	return http_api.Err{Code: 404, Text: notFound}
+ }
+ 
+ func (s *httpServer) nodesHandler(w http.ResponseWriter, req *http.Request, ps httprouter.Params) (interface{}, error) {
+ 	var messages []string
++	var failedNodes []string
+ 
+ 	producers, err := s.ci.GetProducers(s.nsqadmin.getOpts().NSQLookupdHTTPAddresses, s.nsqadmin.getOpts().NSQDHTTPAddresses)
+ 	if err != nil {
+ 		pe, ok := err.(clusterinfo.PartialErr)
+ 		if !ok {
+ 			s.nsqadmin.logf(LOG_ERROR, "failed to get nodes - %s", err)
+-			return nil, http_api.Err{Code: 502, Text: fmt.Sprintf("UPSTREAM_ERROR: %s", err)}
++			return nil, http_api.Err{Code: 502, Text: fmt.Sprintf("UPSTREAM_ERROR: %s", err), FailedNodes: clusterinfo.FailedNodes(err)}
+ 		}
+ 		s.nsqadmin.logf(LOG_WARN, "%s", err)
+ 		messages = append(messages, pe.Error())
++		failedNodes = clusterinfo.FailedNodes(pe)
+ 	}
+ 
+ 	return struct {
+-		Nodes   clusterinfo.Producers `json:"nodes"`
+-		Message string                `json:"message"`
+-	}{producers, maybeWarnMsg(messages)}, nil
++		Nodes       clusterinfo.Producers `json:"nodes"`
++		FailedNodes []string              `json:"failed_nodes,omitempty"`
++		Message     string                `json:"message"`
++	}{producers, failedNodes, maybeWarnMsg(messages)}, nil
+ }
+ 
+ func (s *httpServer) nodeHandler(w http.ResponseWriter, req *http.Request, ps httprouter.Params) (interface{}, error) {
+ 	var messages []string
++	var failedNodes []string
+ 
+ 	node := ps.ByName("node")
+ 
+@@ -370,21 +423,23 @@ func (s *httpServer) nodeHandler(w http.ResponseWriter, req *http.Request, ps ht
+ 		pe, ok := err.(clusterinfo.PartialErr)
+ 		if !ok {
+ 			s.nsqadmin.logf(LOG_ERROR, "failed to get producers - %s", err)
+-			return nil, http_api.Err{Code: 502, Text: fmt.Sprintf("UPSTREAM_ERROR: %s", err)}
++			return nil, http_api.Err{Code: 502, Text: fmt.Sprintf("UPSTREAM_ERROR: %s", err), FailedNodes: clusterinfo.FailedNodes(err)}
+ 		}
+ 		s.nsqadmin.logf(LOG_WARN, "%s", err)
+ 		messages = append(messages, pe.Error())
++		failedNodes = clusterinfo.FailedNodes(pe)
+ 	}
+ 
+ 	producer := producers.Search(node)
+ 	if producer == nil {
+-		return nil, http_api.Err{Code: 404, Text: "NODE_NOT_FOUND"}
++		return nil, s.notFoundUnlessIncomplete("NODE_NOT_FOUND", err != nil, messages, failedNodes)
+ 	}
+ 
+ 	topicStats, _, err := s.ci.GetNSQDStats(clusterinfo.Producers{producer}, "", "", true)
+ 	if err != nil {
+ 		s.nsqadmin.logf(LOG_ERROR, "failed to get nsqd stats - %s", err)
+-		return nil, http_api.Err{Code: 502, Text: fmt.Sprintf("UPSTREAM_ERROR: %s", err)}
++		return nil, http_api.Err{Code: 502, Text: fmt.Sprintf("UPSTREAM_ERROR: %s", err),
++			FailedNodes: clusterinfo.UnionFailedNodes(failedNodes, clusterinfo.FailedNodes(err))}
+ 	}
+ 
+ 	var totalClients int64
+@@ -401,18 +456,21 @@ func (s *httpServer) nodeHandler(w http.ResponseWriter, req *http.Request, ps ht
+ 		TopicStats    []*clusterinfo.TopicStats `json:"topics"`
+ 		TotalMessages int64                     `json:"total_messages"`
+ 		TotalClients  int64                     `json:"total_clients"`
++		FailedNodes   []string                  `json:"failed_nodes,omitempty"`
+ 		Message       string                    `json:"message"`
+ 	}{
+ 		Node:          node,
+ 		TopicStats:    topicStats,
+ 		TotalMessages: totalMessages,
+ 		TotalClients:  totalClients,
++		FailedNodes:   failedNodes,
+ 		Message:       maybeWarnMsg(messages),
+ 	}, nil
+ }
+ 
+ func (s *httpServer) tombstoneNodeForTopicHandler(w http.ResponseWriter, req *http.Request, ps httprouter.Params) (interface{}, error) {
+ 	var messages []string
++	var failedNodes []string
+ 
+ 	if !s.isAuthorizedAdminRequest(req) {
+ 		return nil, http_api.Err{Code: 403, Text: "FORBIDDEN"}
+@@ -438,21 +496,24 @@ func (s *httpServer) tombstoneNodeForTopicHandler(w http.ResponseWriter, req *ht
+ 		pe, ok := err.(clusterinfo.PartialErr)
+ 		if !ok {
+ 			s.nsqadmin.logf(LOG_ERROR, "failed to tombstone node for topic - %s", err)
+-			return nil, http_api.Err{Code: 502, Text: fmt.Sprintf("UPSTREAM_ERROR: %s", err)}
++			return nil, http_api.Err{Code: 502, Text: fmt.Sprintf("UPSTREAM_ERROR: %s", err), FailedNodes: clusterinfo.FailedNodes(err)}
+ 		}
+ 		s.nsqadmin.logf(LOG_WARN, "%s", err)
+ 		messages = append(messages, pe.Error())
++		failedNodes = clusterinfo.FailedNodes(pe)
+ 	}
+ 
+ 	s.notifyAdminAction("tombstone_topic_producer", body.Topic, "", node, req)
+ 
+ 	return struct {
+-		Message string `json:"message"`
+-	}{maybeWarnMsg(messages)}, nil
++		FailedNodes []string `json:"failed_nodes,omitempty"`
++		Message     string   `json:"message"`
++	}{failedNodes, maybeWarnMsg(messages)}, nil
+ }
+ 
+ func (s *httpServer) createTopicChannelHandler(w http.ResponseWriter, req *http.Request, ps httprouter.Params) (interface{}, error) {
+ 	var messages []string
++	var failedNodes []string
+ 
+ 	var body struct {
+ 		Topic   string `json:"topic"`
+@@ -482,10 +543,11 @@ func (s *httpServer) createTopicChannelHandler(w http.ResponseWriter, req *http.
+ 		pe, ok := err.(clusterinfo.PartialErr)
+ 		if !ok {
+ 			s.nsqadmin.logf(LOG_ERROR, "failed to create topic/channel - %s", err)
+-			return nil, http_api.Err{Code: 502, Text: fmt.Sprintf("UPSTREAM_ERROR: %s", err)}
++			return nil, http_api.Err{Code: 502, Text: fmt.Sprintf("UPSTREAM_ERROR: %s", err), FailedNodes: clusterinfo.FailedNodes(err)}
+ 		}
+ 		s.nsqadmin.logf(LOG_WARN, "%s", err)
+ 		messages = append(messages, pe.Error())
++		failedNodes = clusterinfo.FailedNodes(pe)
+ 	}
+ 
+ 	s.notifyAdminAction("create_topic", body.Topic, "", "", req)
+@@ -494,12 +556,14 @@ func (s *httpServer) createTopicChannelHandler(w http.ResponseWriter, req *http.
+ 	}
+ 
+ 	return struct {
+-		Message string `json:"message"`
+-	}{maybeWarnMsg(messages)}, nil
++		FailedNodes []string `json:"failed_nodes,omitempty"`
++		Message     string   `json:"message"`
++	}{failedNodes, maybeWarnMsg(messages)}, nil
+ }
+ 
+ func (s *httpServer) deleteTopicHandler(w http.ResponseWriter, req *http.Request, ps httprouter.Params) (interface{}, error) {
+ 	var messages []string
++	var failedNodes []string
+ 
+ 	if !s.isAuthorizedAdminRequest(req) {
+ 		return nil, http_api.Err{Code: 403, Text: "FORBIDDEN"}
+@@ -514,21 +578,24 @@ func (s *httpServer) deleteTopicHandler(w http.ResponseWriter, req *http.Request
+ 		pe, ok := err.(clusterinfo.PartialErr)
+ 		if !ok {
+ 			s.nsqadmin.logf(LOG_ERROR, "failed to delete topic - %s", err)
+-			return nil, http_api.Err{Code: 502, Text: fmt.Sprintf("UPSTREAM_ERROR: %s", err)}
++			return nil, http_api.Err{Code: 502, Text: fmt.Sprintf("UPSTREAM_ERROR: %s", err), FailedNodes: clusterinfo.FailedNodes(err)}
+ 		}
+ 		s.nsqadmin.logf(LOG_WARN, "%s", err)
+ 		messages = append(messages, pe.Error())
++		failedNodes = clusterinfo.FailedNodes(pe)
+ 	}
+ 
+ 	s.notifyAdminAction("delete_topic", topicName, "", "", req)
+ 
+ 	return struct {
+-		Message string `json:"message"`
+-	}{maybeWarnMsg(messages)}, nil
++		FailedNodes []string `json:"failed_nodes,omitempty"`
++		Message     string   `json:"message"`
++	}{failedNodes, maybeWarnMsg(messages)}, nil
+ }
+ 
+ func (s *httpServer) deleteChannelHandler(w http.ResponseWriter, req *http.Request, ps httprouter.Params) (interface{}, error) {
+ 	var messages []string
++	var failedNodes []string
+ 
+ 	if !s.isAuthorizedAdminRequest(req) {
+ 		return nil, http_api.Err{Code: 403, Text: "FORBIDDEN"}
+@@ -544,17 +611,19 @@ func (s *httpServer) deleteChannelHandler(w http.ResponseWriter, req *http.Reque
+ 		pe, ok := err.(clusterinfo.PartialErr)
+ 		if !ok {
+ 			s.nsqadmin.logf(LOG_ERROR, "failed to delete channel - %s", err)
+-			return nil, http_api.Err{Code: 502, Text: fmt.Sprintf("UPSTREAM_ERROR: %s", err)}
++			return nil, http_api.Err{Code: 502, Text: fmt.Sprintf("UPSTREAM_ERROR: %s", err), FailedNodes: clusterinfo.FailedNodes(err)}
+ 		}
+ 		s.nsqadmin.logf(LOG_WARN, "%s", err)
+ 		messages = append(messages, pe.Error())
++		failedNodes = clusterinfo.FailedNodes(pe)
+ 	}
+ 
+ 	s.notifyAdminAction("delete_channel", topicName, channelName, "", req)
+ 
+ 	return struct {
+-		Message string `json:"message"`
+-	}{maybeWarnMsg(messages)}, nil
++		FailedNodes []string `json:"failed_nodes,omitempty"`
++		Message     string   `json:"message"`
++	}{failedNodes, maybeWarnMsg(messages)}, nil
+ }
+ 
+ func (s *httpServer) topicActionHandler(w http.ResponseWriter, req *http.Request, ps httprouter.Params) (interface{}, error) {
+@@ -570,6 +639,7 @@ func (s *httpServer) channelActionHandler(w http.ResponseWriter, req *http.Reque
+ 
+ func (s *httpServer) topicChannelAction(req *http.Request, topicName string, channelName string) (interface{}, error) {
+ 	var messages []string
++	var failedNodes []string
+ 
+ 	var body struct {
+ 		Action string `json:"action"`
+@@ -635,15 +705,17 @@ func (s *httpServer) topicChannelAction(req *http.Request, topicName string, cha
+ 		pe, ok := err.(clusterinfo.PartialErr)
+ 		if !ok {
+ 			s.nsqadmin.logf(LOG_ERROR, "failed to %s topic/channel - %s", body.Action, err)
+-			return nil, http_api.Err{Code: 502, Text: fmt.Sprintf("UPSTREAM_ERROR: %s", err)}
++			return nil, http_api.Err{Code: 502, Text: fmt.Sprintf("UPSTREAM_ERROR: %s", err), FailedNodes: clusterinfo.FailedNodes(err)}
+ 		}
+ 		s.nsqadmin.logf(LOG_WARN, "%s", err)
+ 		messages = append(messages, pe.Error())
++		failedNodes = clusterinfo.FailedNodes(pe)
+ 	}
+ 
+ 	return struct {
+-		Message string `json:"message"`
+-	}{maybeWarnMsg(messages)}, nil
++		FailedNodes []string `json:"failed_nodes,omitempty"`
++		Message     string   `json:"message"`
++	}{failedNodes, maybeWarnMsg(messages)}, nil
+ }
+ 
+ type counterStats struct {
+@@ -655,6 +727,7 @@ type counterStats struct {
+ 
+ func (s *httpServer) counterHandler(w http.ResponseWriter, req *http.Request, ps httprouter.Params) (interface{}, error) {
+ 	var messages []string
++	var failedNodes []string
+ 	stats := make(map[string]*counterStats)
+ 
+ 	producers, err := s.ci.GetProducers(s.nsqadmin.getOpts().NSQLookupdHTTPAddresses, s.nsqadmin.getOpts().NSQDHTTPAddresses)
+@@ -662,20 +735,22 @@ func (s *httpServer) counterHandler(w http.ResponseWriter, req *http.Request, ps
+ 		pe, ok := err.(clusterinfo.PartialErr)
+ 		if !ok {
+ 			s.nsqadmin.logf(LOG_ERROR, "failed to get counter producer list - %s", err)
+-			return nil, http_api.Err{Code: 502, Text: fmt.Sprintf("UPSTREAM_ERROR: %s", err)}
++			return nil, http_api.Err{Code: 502, Text: fmt.Sprintf("UPSTREAM_ERROR: %s", err), FailedNodes: clusterinfo.FailedNodes(err)}
+ 		}
+ 		s.nsqadmin.logf(LOG_WARN, "%s", err)
+ 		messages = append(messages, pe.Error())
++		failedNodes = append(failedNodes, clusterinfo.FailedNodes(pe)...)
+ 	}
+ 	_, channelStats, err := s.ci.GetNSQDStats(producers, "", "", false)
+ 	if err != nil {
+ 		pe, ok := err.(clusterinfo.PartialErr)
+ 		if !ok {
+ 			s.nsqadmin.logf(LOG_ERROR, "failed to get nsqd stats - %s", err)
+-			return nil, http_api.Err{Code: 502, Text: fmt.Sprintf("UPSTREAM_ERROR: %s", err)}
++			return nil, http_api.Err{Code: 502, Text: fmt.Sprintf("UPSTREAM_ERROR: %s", err), FailedNodes: clusterinfo.FailedNodes(err)}
+ 		}
+ 		s.nsqadmin.logf(LOG_WARN, "%s", err)
+ 		messages = append(messages, pe.Error())
++		failedNodes = append(failedNodes, clusterinfo.FailedNodes(pe)...)
+ 	}
+ 
+ 	for _, channelStats := range channelStats {
+@@ -695,9 +770,10 @@ func (s *httpServer) counterHandler(w http.ResponseWriter, req *http.Request, ps
+ 	}
+ 
+ 	return struct {
+-		Stats   map[string]*counterStats `json:"stats"`
+-		Message string                   `json:"message"`
+-	}{stats, maybeWarnMsg(messages)}, nil
++		Stats       map[string]*counterStats `json:"stats"`
++		FailedNodes []string                 `json:"failed_nodes,omitempty"`
++		Message     string                   `json:"message"`
++	}{stats, failedNodes, maybeWarnMsg(messages)}, nil
+ }
+ 
+ func (s *httpServer) graphiteHandler(w http.ResponseWriter, req *http.Request, ps httprouter.Params) (interface{}, error) {
+diff --git a/nsqd/stats.go b/nsqd/stats.go
+index fd995dd..0537799 100644
+--- a/nsqd/stats.go
++++ b/nsqd/stats.go
+@@ -1,6 +1,7 @@
+ package nsqd
+ 
+ import (
++	"net"
+ 	"runtime"
+ 	"sort"
+ 	"sync/atomic"
+@@ -155,9 +156,14 @@ func (n *NSQD) GetStats(topic string, channel string, includeClients bool) Stats
+ 			var clientCount int
+ 			c.RLock()
+ 			if includeClients {
+-				clients = make([]ClientStats, 0, len(c.clients))
+-				for _, client := range c.clients {
+-					clients = append(clients, client.Stats(topic))
++				ids := make([]int64, 0, len(c.clients))
++				for id := range c.clients {
++					ids = append(ids, id)
++				}
++				sort.Slice(ids, func(i, j int) bool { return ids[i] < ids[j] })
++				clients = make([]ClientStats, 0, len(ids))
++				for _, id := range ids {
++					clients = append(clients, c.clients[id].Stats(topic))
+ 				}
+ 			}
+ 			clientCount = len(c.clients)
+@@ -169,14 +175,23 @@ func (n *NSQD) GetStats(topic string, channel string, includeClients bool) Stats
+ 	stats.Topics = topics
+ 
+ 	if includeClients {
+-		var producerStats []ClientStats
++		type producer struct {
++			addr   string
++			client Client
++		}
++		var producers []producer
+ 		n.tcpServer.conns.Range(func(k, v interface{}) bool {
+ 			c := v.(Client)
+ 			if c.Type() == typeProducer {
+-				producerStats = append(producerStats, c.Stats(topic))
++				producers = append(producers, producer{k.(net.Addr).String(), c})
+ 			}
+ 			return true
+ 		})
++		sort.Slice(producers, func(i, j int) bool { return producers[i].addr < producers[j].addr })
++		var producerStats []ClientStats
++		for _, p := range producers {
++			producerStats = append(producerStats, p.client.Stats(topic))
++		}
+ 		stats.Producers = producerStats
+ 	}
+ 
+diff --git a/nsqd/topic.go b/nsqd/topic.go
+index db61c3b..8957f68 100644
+--- a/nsqd/topic.go
++++ b/nsqd/topic.go
+@@ -2,6 +2,7 @@ package nsqd
+ 
+ import (
+ 	"errors"
++	"sort"
+ 	"strings"
+ 	"sync"
+ 	"sync/atomic"
+@@ -456,6 +457,10 @@ func (t *Topic) AggregateChannelE2eProcessingLatency() *quantile.Quantile {
+ 		realChannels = append(realChannels, c)
+ 	}
+ 	t.RUnlock()
++	// Merging quantile streams is order dependent, so merge in name order.
++	sort.Slice(realChannels, func(i, j int) bool {
++		return realChannels[i].name < realChannels[j].name
++	})
+ 	for _, c := range realChannels {
+ 		if c.e2eProcessingLatencyStream == nil {
+ 			continue

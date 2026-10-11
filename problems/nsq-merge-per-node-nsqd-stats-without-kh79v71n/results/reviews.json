@@ -1,0 +1,147 @@
+[
+ {
+  "feedback": "Tests: T3/T4: Strengthen coverage for these demonstrated gaps:\n- Unequal channel membership: current fixtures give both nodes the same single channel. A mutant that merges differently named channels into one accumulator passes both the submitted new tests and selected baseline suite. Exercise shared channels alongside channels present on only one node.\n- Weighted latency averages: all current inputs have equal sample counts. Counts of 1 and 3 with values 10 and 100 should produce 77.5, not the unweighted 55. The incorrect averaging variant passes the submitted tests.\n- Topic-level latency ownership: the preservation test checks a node\u2019s channel latency, not its topic latency. A variant that mutates the first node\u2019s topic latency into cluster totals still passes. Verify returned node-local counts and values alongside aggregate results.\n- Late-arriving minimum: [100, 50, 10] distinguishes a solution that stops updating the minimum after two contributors. Current examples do not.\n- Public ordering: cover direct-nsqd and lookupd configurations, same-host nodes, and clients sharing hostname/client ID but having different remote addresses. Ordering mutants pass the current suite while HTTP output changes between calls.\n- HTTP absence/error classification and percentile alignment: the suite misses the reference failures described below.\nT5: Two tests require particular internal repair locations:\n- TestChannelClientOrderIsStableCl7f3a requires the topology comparator itself to change.\n- TestNodeListOrderIsStableCl7f3a requires GetTopicProducers itself to return presentation order.\nA verified alternative preserves those internal behaviors while producing stable topic, channel and nodes HTTP responses. It passes native baseline tests, the other added tests and relevant public probes, but these two assertions reject it. Test observable responses instead.\nAttribution correction: all six reported failures land on the getter-order assertion. Their logs establish that assertion failed, not that public node ordering was incorrect. Do not treat them as proven skill failures or use the current cohort as clean difficulty evidence without re-evaluation.\nThe FP clearance also needs revisiting. All four reported passing implementations fail both newly tested error branches below. Three additionally mask partial lookupd failure as 404. Strengthen the verifier, refresh affected verdicts, and repeat the FP audit.\n\nSolution & Code: S1/S2: Four observable reference failures remain:\n- Percentile values are mislabeled. Valid [0.50, 0.99] configuration produces descending aggregate headers but ascending node and first-channel rows. Median values appear beneath the 99th-percentile heading. Align values with their quantile labels.\n- Successful empty discovery returns 502. When every configured nsqd successfully reports no topic/channel, the channel request becomes \u201cfailed to query any nsqd\u201d instead of not-found.\n- Real lookupd absence also returns 502. A real pinned lookupd returns TOPIC_NOT_FOUND for an absent topic; nsqadmin converts that confirmed absence into an upstream server error.\n- Partial stats failure becomes false absence. With two discovered owners, one lacks the channel and the other owns it but fails its filtered stats request. The reference returns 404 CHANNEL_NOT_FOUND. The clean pin retains an error response. Failed inspection is not proof that the channel is absent everywhere.\n\nOther notes: Both effective LOC floors still fail:\n- Reference: 111 production LOC.\n- Reported passing patches: 103, 124, 239 and 111 LOC, median 117.5.\nBoth required floors are 200. These counts include ordinary code, imports and braces, but exclude tests, documentation, blanks and comment-only lines. Request substantive scope expansion, not padding.",
+  "fieldBands": {
+   "description": {
+    "band": 3
+   },
+   "solution": {
+    "band": 1,
+    "reasoning": "S1/S2: Four observable reference failures remain:\n- Percentile values are mislabeled. Valid [0.50, 0.99] configuration produces descending aggregate headers but ascending node and first-channel rows. Median values appear beneath the 99th-percentile heading. Align values with their quantile labels.\n- Successful empty discovery returns 502. When every configured nsqd successfully reports no topic/channel, the channel request becomes \u201cfailed to query any nsqd\u201d instead of not-found.\n- Real lookupd absence also returns 502. A real pinned lookupd returns TOPIC_NOT_FOUND for an absent topic; nsqadmin converts that confirmed absence into an upstream server error.\n- Partial stats failure becomes false absence. With two discovered owners, one lacks the channel and the other owns it but fails its filtered stats request. The reference returns 404 CHANNEL_NOT_FOUND. The clean pin retains an error response. Failed inspection is not proof that the channel is absent everywhere."
+   },
+   "tests": {
+    "band": 1,
+    "reasoning": "T3/T4: Strengthen coverage for these demonstrated gaps:\n- Unequal channel membership: current fixtures give both nodes the same single channel. A mutant that merges differently named channels into one accumulator passes both the submitted new tests and selected baseline suite. Exercise shared channels alongside channels present on only one node.\n- Weighted latency averages: all current inputs have equal sample counts. Counts of 1 and 3 with values 10 and 100 should produce 77.5, not the unweighted 55. The incorrect averaging variant passes the submitted tests.\n- Topic-level latency ownership: the preservation test checks a node\u2019s channel latency, not its topic latency. A variant that mutates the first node\u2019s topic latency into cluster totals still passes. Verify returned node-local counts and values alongside aggregate results.\n- Late-arriving minimum: [100, 50, 10] distinguishes a solution that stops updating the minimum after two contributors. Current examples do not.\n- Public ordering: cover direct-nsqd and lookupd configurations, same-host nodes, and clients sharing hostname/client ID but having different remote addresses. Ordering mutants pass the current suite while HTTP output changes between calls.\n- HTTP absence/error classification and percentile alignment: the suite misses the reference failures described below.\nT5: Two tests require particular internal repair locations:\n- TestChannelClientOrderIsStableCl7f3a requires the topology comparator itself to change.\n- TestNodeListOrderIsStableCl7f3a requires GetTopicProducers itself to return presentation order.\nA verified alternative preserves those internal behaviors while producing stable topic, channel and nodes HTTP responses. It passes native baseline tests, the other added tests and relevant public probes, but these two assertions reject it. Test observable responses instead.\nAttribution correction: all six reported failures land on the getter-order assertion. Their logs establish that assertion failed, not that public node ordering was incorrect. Do not treat them as proven skill failures or use the current cohort as clean difficulty evidence without re-evaluation.\nThe FP clearance also needs revisiting. All four reported passing implementations fail both newly tested error branches below. Three additionally mask partial lookupd failure as 404. Strengthen the verifier, refresh affected verdicts, and repeat the FP audit."
+   }
+  },
+  "internalNotes": null,
+  "otherNotes": "Both effective LOC floors still fail:\n- Reference: 111 production LOC.\n- Reported passing patches: 103, 124, 239 and 111 LOC, median 117.5.\nBoth required floors are 200. These counts include ordinary code, imports and braces, but exclude tests, documentation, blanks and comment-only lines. Request substantive scope expansion, not padding.",
+  "otherNotesTags": null,
+  "outcome": "revision_requested",
+  "overallQuality": 1.6666666666666665,
+  "qualityScore": 4,
+  "reasoning": null,
+  "reviewFormatVersion": 2,
+  "reviewId": "m573txc9c4npb1jpy59z41jq1n8fqrq8",
+  "reviewerName": "tg 1239",
+  "submittedAt": 1791202593685,
+  "versionNumber": 1,
+  "submittedAtIST": "2026-10-05T17:46:33.685000+05:30"
+ },
+ {
+  "feedback": "Tests: T3/T4 \u2014 A reported passing solution regresses existing public behavior. A run drops same-region client precedence. Through the channel API, it places a remote-region client first; both the pinned checkout and reference preserve same-region priority. Add public compatibility coverage and refresh the affected verdicts and false-positive audit.\nT3/T4 \u2014 Topic scalar totals remain unverified. Removing all eight topic-counter additions still passes the submitted test selection. A public response then reports depth and message count as 0, instead of the expected 12 and 120. Assert nonzero aggregate topic totals and unchanged per-node counters.\nT5 \u2014 The new unequal-membership test requires unspecified metadata repair. Its nested channel NodeStats counts reject a clone-based implementation that preserves node isolation, channel totals, and every tested public HTTP behavior. Drop those extra assertions or explicitly add the contributor-breakdown requirement to the description.\nT1/T6 \u2014 Remove test-design narration and banners, particularly \u201cThis holds on the unmodified tree\u201d and the harness commentary explaining test placement. Also reject trailing harness arguments instead of silently ignoring them.\n\nSolution & Code: - Reference: 137 effective production LOC across six files, 63 below the 200-line floor.\n\nS4 \u2014 Trim repeated sorting/normalization commentary. Correct the comment claiming every lookupd answered or confirmed absence above a branch that explicitly handles recorded errors. The earlier demonstrated reference defects are resolved; no additional reference correctness failure was established.\n\nOther notes: Both independent LOC gates still fail:\n- Reference: 137 effective production LOC across six files, 63 below the 200-line floor.\n- Reported passing agents: 212, 157, and 184 effective production LOC; median 184. Excluding the disproved pass leaves a median of 184.5, still below 200.",
+  "fieldBands": {
+   "description": {
+    "band": 3
+   },
+   "solution": {
+    "band": 0,
+    "reasoning": "- Reference: 137 effective production LOC across six files, 63 below the 200-line floor.\n\nS4 \u2014 Trim repeated sorting/normalization commentary. Correct the comment claiming every lookupd answered or confirmed absence above a branch that explicitly handles recorded errors. The earlier demonstrated reference defects are resolved; no additional reference correctness failure was established.\n"
+   },
+   "tests": {
+    "band": 1,
+    "reasoning": "T3/T4 \u2014 A reported passing solution regresses existing public behavior. A run drops same-region client precedence. Through the channel API, it places a remote-region client first; both the pinned checkout and reference preserve same-region priority. Add public compatibility coverage and refresh the affected verdicts and false-positive audit.\nT3/T4 \u2014 Topic scalar totals remain unverified. Removing all eight topic-counter additions still passes the submitted test selection. A public response then reports depth and message count as 0, instead of the expected 12 and 120. Assert nonzero aggregate topic totals and unchanged per-node counters.\nT5 \u2014 The new unequal-membership test requires unspecified metadata repair. Its nested channel NodeStats counts reject a clone-based implementation that preserves node isolation, channel totals, and every tested public HTTP behavior. Drop those extra assertions or explicitly add the contributor-breakdown requirement to the description.\nT1/T6 \u2014 Remove test-design narration and banners, particularly \u201cThis holds on the unmodified tree\u201d and the harness commentary explaining test placement. Also reject trailing harness arguments instead of silently ignoring them."
+   }
+  },
+  "internalNotes": null,
+  "otherNotes": "Both independent LOC gates still fail:\n- Reference: 137 effective production LOC across six files, 63 below the 200-line floor.\n- Reported passing agents: 212, 157, and 184 effective production LOC; median 184. Excluding the disproved pass leaves a median of 184.5, still below 200.",
+  "otherNotesTags": null,
+  "outcome": "revision_requested",
+  "overallQuality": 1.3333333333333333,
+  "qualityScore": 4,
+  "reasoning": null,
+  "reviewFormatVersion": 2,
+  "reviewId": "m57bt7bsz8ssypfka8f7rmpn3d8fxnnr",
+  "reviewerName": "tg 1239",
+  "submittedAt": 1791471701767,
+  "versionNumber": 2,
+  "submittedAtIST": "2026-10-08T20:31:41.767000+05:30"
+ },
+ {
+  "feedback": "Tests: T4: Add a public channel-API case with two lookupd addresses: one returns TOPIC_NOT_FOUND and the other is unreachable. The current tests cover lookupd absence and incomplete direct-nsqd discovery separately, but do not prove that a lookupd transport failure cannot be mistaken for confirmed absence. Trim the remaining comments that merely narrate test expectations.\n\nSolution & Code: S4: Remove redundant explanatory comments in the reference, particularly the repeated absence/error explanations.\n\nThe reference adds 157 effective production LOC, below the required 200.\n\nOther notes: The two current passing-agent patches add 212 and 157, giving a 184.5 median, also below 200. Both floors are independent; tests, blank lines, and comments were excluded. This needs substantive additional scope, not padding.",
+  "fieldBands": {
+   "description": {
+    "band": 3
+   },
+   "solution": {
+    "band": 0,
+    "reasoning": "S4: Remove redundant explanatory comments in the reference, particularly the repeated absence/error explanations.\n\nThe reference adds 157 effective production LOC, below the required 200."
+   },
+   "tests": {
+    "band": 2,
+    "reasoning": "T4: Add a public channel-API case with two lookupd addresses: one returns TOPIC_NOT_FOUND and the other is unreachable. The current tests cover lookupd absence and incomplete direct-nsqd discovery separately, but do not prove that a lookupd transport failure cannot be mistaken for confirmed absence. Trim the remaining comments that merely narrate test expectations."
+   }
+  },
+  "internalNotes": null,
+  "otherNotes": "The two current passing-agent patches add 212 and 157, giving a 184.5 median, also below 200. Both floors are independent; tests, blank lines, and comments were excluded. This needs substantive additional scope, not padding.",
+  "otherNotesTags": null,
+  "outcome": "revision_requested",
+  "overallQuality": 1.6666666666666665,
+  "qualityScore": 4,
+  "reasoning": null,
+  "reviewFormatVersion": 2,
+  "reviewId": "m57dey09aszwtjsta6rbvzdcbh8fz059",
+  "reviewerName": "tg 1239",
+  "submittedAt": 1791530093058,
+  "versionNumber": 3,
+  "submittedAtIST": "2026-10-09T12:44:53.058000+05:30"
+ },
+ {
+  "feedback": "Tests: The 33 new tests cover the main paths, but miss several ways a response can change when the peer data has not. Strengthen the public-API tests before relying on the passing run.\n\nSolution & Code: The reference still produces different responses for fixed inputs. I reproduced four distinct timing-dependent outcomes:\n- ErrList.Error() retains concurrent completion order. With two lookupds returning fixed, different errors, reversing their response timing reverses /api/topics\u2019s message.\n- /api/nodes sorts producers but not each producer\u2019s remote_addresses. Reversing lookupd timing changes that array\u2019s order.\n- When two lookupds report the same producer with different, fixed metadata, GetLookupdTopicProducers keeps whichever record arrives first. The per-node hostname changed from registry-1 to registry-0 between otherwise identical /api/topics/events requests.\n- Channel latency is merged as nsqd responses arrive. The public channel API returned averages of 0.13333333333333333 and 0.13333333333333336 for the same three fixed node values. Sort before merging; sorting the final node list cannot repair an order-dependent aggregate. The counted Orion patch does avoid this particular defect.\n\nThe verifier also misses a false positive in the counted Orion pass: on /api/topics?inactive=true, both lookupds successfully list the topic, but one fails the subsequent lookup and channel requests. That patch discards those errors and returns no failed_nodes entry. This is a topic response missing information from a node\u2014the case the description asks to report. The reference passes the same probe. Add this path and the four stability cases above. Also cover raw nsqd /stats producer ordering: the reference sorts producers collected from a map, but the submitted nsqd tests check channel clients and latency, not that producer list. The mixed 404/unreachable lookupd test added since the prior review checks error status, but should also assert the unreachable address where failed_nodes is promised.\n\nThe ordering gate\u2019s 150 ms sleep does not acknowledge that nsqadmin has consumed the leader\u2019s response. Replace that timing assumption with a synchronization point so an incorrect completion-order implementation cannot pass merely because of scheduling. Trim the remaining comments that only narrate helper names or an adjacent sort.",
+  "fieldBands": {
+   "description": {
+    "band": 3
+   },
+   "solution": {
+    "band": 1,
+    "reasoning": "The reference still produces different responses for fixed inputs. I reproduced four distinct timing-dependent outcomes:\n- ErrList.Error() retains concurrent completion order. With two lookupds returning fixed, different errors, reversing their response timing reverses /api/topics\u2019s message.\n- /api/nodes sorts producers but not each producer\u2019s remote_addresses. Reversing lookupd timing changes that array\u2019s order.\n- When two lookupds report the same producer with different, fixed metadata, GetLookupdTopicProducers keeps whichever record arrives first. The per-node hostname changed from registry-1 to registry-0 between otherwise identical /api/topics/events requests.\n- Channel latency is merged as nsqd responses arrive. The public channel API returned averages of 0.13333333333333333 and 0.13333333333333336 for the same three fixed node values. Sort before merging; sorting the final node list cannot repair an order-dependent aggregate. The counted Orion patch does avoid this particular defect.\n\nThe verifier also misses a false positive in the counted Orion pass: on /api/topics?inactive=true, both lookupds successfully list the topic, but one fails the subsequent lookup and channel requests. That patch discards those errors and returns no failed_nodes entry. This is a topic response missing information from a node\u2014the case the description asks to report. The reference passes the same probe. Add this path and the four stability cases above. Also cover raw nsqd /stats producer ordering: the reference sorts producers collected from a map, but the submitted nsqd tests check channel clients and latency, not that producer list. The mixed 404/unreachable lookupd test added since the prior review checks error status, but should also assert the unreachable address where failed_nodes is promised.\n\nThe ordering gate\u2019s 150 ms sleep does not acknowledge that nsqadmin has consumed the leader\u2019s response. Replace that timing assumption with a synchronization point so an incorrect completion-order implementation cannot pass merely because of scheduling. Trim the remaining comments that only narrate helper names or an adjacent sort."
+   },
+   "tests": {
+    "band": 1,
+    "reasoning": "The 33 new tests cover the main paths, but miss several ways a response can change when the peer data has not. Strengthen the public-API tests before relying on the passing run."
+   }
+  },
+  "internalNotes": null,
+  "otherNotes": null,
+  "otherNotesTags": null,
+  "outcome": "revision_requested",
+  "overallQuality": 1.6666666666666665,
+  "qualityScore": 4,
+  "reasoning": null,
+  "reviewFormatVersion": 2,
+  "reviewId": "m5702mdyjnk929jehcqjmcfrkd8g1y36",
+  "reviewerName": "tg 1239",
+  "submittedAt": 1791661186343,
+  "versionNumber": 8,
+  "submittedAtIST": "2026-10-11T01:09:46.343000+05:30"
+ },
+ {
+  "feedback": "Tests: Both are localized coverage gaps, not demonstrated implementation failures. Producer ordering is implemented in the reference, and the unreachable-node test already verifies failure classification; it simply omits the failed_nodes assertion. It is approvable.\n\nSolution & Code: This is pre-existing behavior in untouched code, so it is not a regression introduced by the solution. That supports lowering its severity.",
+  "fieldBands": {
+   "description": {
+    "band": 3
+   },
+   "solution": {
+    "band": 2,
+    "reasoning": "This is pre-existing behavior in untouched code, so it is not a regression introduced by the solution. That supports lowering its severity."
+   },
+   "tests": {
+    "band": 2,
+    "reasoning": "Both are localized coverage gaps, not demonstrated implementation failures. Producer ordering is implemented in the reference, and the unreachable-node test already verifies failure classification; it simply omits the failed_nodes assertion. It is approvable."
+   }
+  },
+  "internalNotes": null,
+  "otherNotes": null,
+  "otherNotesTags": null,
+  "outcome": "approved",
+  "overallQuality": 2.333333333333333,
+  "qualityScore": 6,
+  "reasoning": null,
+  "reviewFormatVersion": 2,
+  "reviewId": "m57czvpkrjfk581pm9wy7catds8g3crv",
+  "reviewerName": "tg 1239",
+  "submittedAt": 1791720103466,
+  "versionNumber": 12,
+  "submittedAtIST": "2026-10-11T17:31:43.466000+05:30"
+ }
+]

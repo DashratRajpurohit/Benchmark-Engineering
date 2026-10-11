@@ -1,0 +1,17 @@
+{
+  "problemId": "kh79v71ndbxt7613t22wgy76hh8fpvam",
+  "title": "Merge per-node nsqd stats without corrupting each node's own entry",
+  "status": "accepted",
+  "version": 12,
+  "versionId": "kd72hn11kn8zkgbpnxyenp1sbh8g1xs0",
+  "isLocked": true,
+  "language": "go",
+  "difficulty": null,
+  "category": "bugfix",
+  "repoUrl": "https://github.com/nsqio/nsq",
+  "commitHash": "85cf10c09c6c3c86160d6f0eb156f62d0efc1648",
+  "githubIssueUrl": null,
+  "estimatedLOC": null,
+  "testOutputMode": null,
+  "downloadedAt": "2026-10-24T17:10:01.676Z"
+}
