@@ -1,0 +1,171 @@
+[
+ {
+  "feedback": "Tests: T3/T4: Two incorrect implementations independently pass all 27 new tests. TestAcceptedUpdateWithFullWriteBufferChargesItsCost permits dropping updates to already-stored keys, despite the repository\u2019s guaranteed-update contract; a mutant dropping these updates passes. TestClearReportsEachEntryWithItsOwnItem uses keys in different shards, so reusing one callback Item per shard also passes. Require existing-key updates to survive buffer saturation, and verify retained callback objects using multiple keys in the same shard.\n\nSolution & Code: S1/S2: Five independently reproduced defects require correction:\n\n1. In store.go, updateOrQueue can pass an already-released value to ShouldUpdate. A rejected admission remains queued while OnExit runs. If OnExit releases that value and sets the same key again, ShouldUpdate receives the released predecessor. This breaks documented support for manual memory deallocation. Retire rejected values from update comparisons before invoking disposal callbacks.\n\n2. In cache.go, Clear leaves deferred updates intact. When processing restarts, chargeDeferredUpdates calls Cost before checking whether the value remains stored. A full-buffer update followed by Clear therefore invokes Cost on a value already released through OnExit. Clear must discard deferred work before releasing its values.\n\n3. Queue-ticket substitution breaks Wait\u2019s visibility guarantee. If a full-buffer Del queues its operation and pauses before publishing its ticket, a later Set\u2019s ticket can execute that Del. Wait then returns while the completed Set remains unapplied; Get reports the key missing. Make the barrier cover every write accepted before it.\n\n4. In store.go, updateOrQueue compares queued values without checking their Conflict hashes. Different keys sharing a primary hash therefore reach ShouldUpdate as though they were the same key. With supported heterogeneous values, this reproduces a type-assertion panic absent on BASE. Preserve secondary-hash identity before invoking ShouldUpdate.\n\n5. An existing key with another update pending takes updateOrQueue\u2019s droppable admission path. When the buffer fills, a subsequent update returns false and leaves the older value, violating the repository\u2019s update guarantee. A reproduction storing 10, queuing 20, and then updating to 30 retains 20; BASE retains 30. Preserve guaranteed updates while maintaining their required ordering.\n\nOther notes: Check the auto review feedback as well.",
+  "fieldBands": {
+   "description": {
+    "band": 3
+   },
+   "solution": {
+    "band": 1,
+    "reasoning": "S1/S2: Five independently reproduced defects require correction:\n\n1. In store.go, updateOrQueue can pass an already-released value to ShouldUpdate. A rejected admission remains queued while OnExit runs. If OnExit releases that value and sets the same key again, ShouldUpdate receives the released predecessor. This breaks documented support for manual memory deallocation. Retire rejected values from update comparisons before invoking disposal callbacks.\n\n2. In cache.go, Clear leaves deferred updates intact. When processing restarts, chargeDeferredUpdates calls Cost before checking whether the value remains stored. A full-buffer update followed by Clear therefore invokes Cost on a value already released through OnExit. Clear must discard deferred work before releasing its values.\n\n3. Queue-ticket substitution breaks Wait\u2019s visibility guarantee. If a full-buffer Del queues its operation and pauses before publishing its ticket, a later Set\u2019s ticket can execute that Del. Wait then returns while the completed Set remains unapplied; Get reports the key missing. Make the barrier cover every write accepted before it.\n\n4. In store.go, updateOrQueue compares queued values without checking their Conflict hashes. Different keys sharing a primary hash therefore reach ShouldUpdate as though they were the same key. With supported heterogeneous values, this reproduces a type-assertion panic absent on BASE. Preserve secondary-hash identity before invoking ShouldUpdate.\n\n5. An existing key with another update pending takes updateOrQueue\u2019s droppable admission path. When the buffer fills, a subsequent update returns false and leaves the older value, violating the repository\u2019s update guarantee. A reproduction storing 10, queuing 20, and then updating to 30 retains 20; BASE retains 30. Preserve guaranteed updates while maintaining their required ordering."
+   },
+   "tests": {
+    "band": 1,
+    "reasoning": "T3/T4: Two incorrect implementations independently pass all 27 new tests. TestAcceptedUpdateWithFullWriteBufferChargesItsCost permits dropping updates to already-stored keys, despite the repository\u2019s guaranteed-update contract; a mutant dropping these updates passes. TestClearReportsEachEntryWithItsOwnItem uses keys in different shards, so reusing one callback Item per shard also passes. Require existing-key updates to survive buffer saturation, and verify retained callback objects using multiple keys in the same shard."
+   }
+  },
+  "internalNotes": null,
+  "otherNotes": "Check the auto review feedback as well.",
+  "otherNotesTags": null,
+  "outcome": "revision_requested",
+  "overallQuality": 1.6666666666666665,
+  "qualityScore": 4,
+  "reasoning": null,
+  "reviewFormatVersion": 2,
+  "reviewId": "m570ksnggs1b544wjs0jfmkpxs8fhc47",
+  "reviewerName": "Ali Hashir",
+  "submittedAt": 1790952343892,
+  "versionNumber": 1,
+  "submittedAtIST": "2026-10-02T20:15:43.892000+05:30"
+ },
+ {
+  "feedback": "Problem Description: Description needs to be vastly improved. Do not use bullet points. Format it into a paragraph structure.\n\nTests: - T3/T4: The suite never exercises a key collision at the hash level. KeyToHash exposes a two-part identity (primary hash plus conflict hash), and the store already treats two keys with the same primary hash but different conflict hash as distinct (see TestStoreCollision and the Conflict checks in store.go's get/Set/Del/Update). An implementation of the new pending-value tracking that keys its internal map solely by the primary hash, and treats any queued value sharing that hash as the predecessor for ShouldUpdate, would pass every test in this patch, since no test configures a custom KeyToHash that produces a collision. Add a test that configures KeyToHash to map two distinct keys to the same primary hash with different conflict values, parks the worker, issues Sets for both keys while pending, and asserts ShouldUpdate/OnReject/OnExit are never invoked across the two keys. TestStoreCollision does not cover this because it drives the store directly and cannot observe a Cache.Set-level pending-queue bug.\n- T2: Several tests (TestAcceptedUpdateWithFullWriteBufferChargesItsCost, TestDelWithFullWriteBufferReportsEachValueOnce) are explicitly run multiple times (\"rounds\") because a deadlocking implementation could still pass on a lucky interleaving, and waitForGoroutineBlockedIn/waitForGoroutinesWaitingIn synchronize by pattern-matching substrings in runtime.Stack output (e.g. \"[chan send\", \"[sync.Mutex.Lock\"). Both the repeated-rounds workaround and the reliance on the exact text of goroutine stack dumps make these tests more sensitive to Go runtime/version changes and scheduling luck than the rest of the suite. Consider a synchronization primitive that does not depend on parsing stack traces, or at least note the Go version range this text format is verified against.",
+  "fieldBands": {
+   "description": {
+    "band": 1,
+    "reasoning": "Description needs to be vastly improved. Do not use bullet points. Format it into a paragraph structure. "
+   },
+   "solution": {
+    "band": 3
+   },
+   "tests": {
+    "band": 1,
+    "reasoning": "- T3/T4: The suite never exercises a key collision at the hash level. KeyToHash exposes a two-part identity (primary hash plus conflict hash), and the store already treats two keys with the same primary hash but different conflict hash as distinct (see TestStoreCollision and the Conflict checks in store.go's get/Set/Del/Update). An implementation of the new pending-value tracking that keys its internal map solely by the primary hash, and treats any queued value sharing that hash as the predecessor for ShouldUpdate, would pass every test in this patch, since no test configures a custom KeyToHash that produces a collision. Add a test that configures KeyToHash to map two distinct keys to the same primary hash with different conflict values, parks the worker, issues Sets for both keys while pending, and asserts ShouldUpdate/OnReject/OnExit are never invoked across the two keys. TestStoreCollision does not cover this because it drives the store directly and cannot observe a Cache.Set-level pending-queue bug.\n- T2: Several tests (TestAcceptedUpdateWithFullWriteBufferChargesItsCost, TestDelWithFullWriteBufferReportsEachValueOnce) are explicitly run multiple times (\"rounds\") because a deadlocking implementation could still pass on a lucky interleaving, and waitForGoroutineBlockedIn/waitForGoroutinesWaitingIn synchronize by pattern-matching substrings in runtime.Stack output (e.g. \"[chan send\", \"[sync.Mutex.Lock\"). Both the repeated-rounds workaround and the reliance on the exact text of goroutine stack dumps make these tests more sensitive to Go runtime/version changes and scheduling luck than the rest of the suite. Consider a synchronization primitive that does not depend on parsing stack traces, or at least note the Go version range this text format is verified against.\n"
+   }
+  },
+  "internalNotes": null,
+  "otherNotes": null,
+  "otherNotesTags": null,
+  "outcome": "revision_requested",
+  "overallQuality": 1.6666666666666665,
+  "qualityScore": 4,
+  "reasoning": null,
+  "reviewFormatVersion": 2,
+  "reviewId": "m578ay3xagz5xfbhcwxja4trss8fkm5m",
+  "reviewerName": "Neeraj B",
+  "submittedAt": 1791062220193,
+  "versionNumber": 2,
+  "submittedAtIST": "2026-10-04T02:47:00.193000+05:30"
+ },
+ {
+  "feedback": "Tests: Auto-review suggestion is good to have, but not blocking.",
+  "fieldBands": {
+   "description": {
+    "band": 3
+   },
+   "solution": {
+    "band": 3
+   },
+   "tests": {
+    "band": 2,
+    "reasoning": "Auto-review suggestion is good to have, but not blocking. "
+   }
+  },
+  "internalNotes": null,
+  "otherNotes": null,
+  "otherNotesTags": null,
+  "outcome": "approved",
+  "overallQuality": 2.6666666666666665,
+  "qualityScore": 6,
+  "reasoning": null,
+  "reviewFormatVersion": 2,
+  "reviewId": "m57ap9rh6cvw06dn1rr7kqjy3d8fp8vs",
+  "reviewerName": "Neeraj B",
+  "submittedAt": 1791178539306,
+  "versionNumber": 3,
+  "submittedAtIST": "2026-10-05T11:05:39.306000+05:30"
+ },
+ {
+  "feedback": "Other notes: Address manager's comments.",
+  "fieldBands": {
+   "description": {
+    "band": 3
+   },
+   "solution": {
+    "band": 3
+   },
+   "tests": {
+    "band": 3
+   }
+  },
+  "internalNotes": null,
+  "otherNotes": "Address manager's comments.",
+  "otherNotesTags": null,
+  "outcome": "revision_requested",
+  "overallQuality": 3,
+  "qualityScore": 7,
+  "reasoning": null,
+  "reviewFormatVersion": 2,
+  "reviewId": "m57779ykkwa1ehpkm8padth1p58fyfgt",
+  "reviewerName": "Neeraj B",
+  "submittedAt": 1791577544385,
+  "versionNumber": 4,
+  "submittedAtIST": "2026-10-10T01:55:44.385000+05:30"
+ },
+ {
+  "feedback": "Tests: - T3/T4 : No test drives Clear() while an accepted update to an already-stored key is sitting in the deferred-cost path (the case where setBuf is full, so the value is already written to the store but its cost charge and OnExit-ordering are deferred until processItems catches up). The solution's Clear() calls takeDeferred() specifically to discard that work before reporting entries, but nothing in the suite would fail if that call were missing or came after the drain: existing full-buffer tests (TestAcceptedUpdateWithFullWriteBufferChargesItsCost, TestUpdateBehindPendingSetWithFullWriteBufferIsKept) only call Wait(), and the Clear tests (TestClearReportsBufferedSetsToOnEvict, TestDelDuringClearReportsOnce, TestRejectedUpdateBesidePendingSetOfCollidingKeyIsNotReported) never fill the write buffer with an update to a stored key. Add a test that fills setBuf behind an accepted Cost-bearing update to a stored key, calls Clear(), and then asserts (with the same released-value tracking pattern as TestCostIsNotAskedForAReleasedValue) that Cost is never asked about that value again after Clear reports it.\n- T2/T3 : TestValueIsNotReleasedWhileCostIsAskedAboutIt still decides whether the competing Set overlapped Cost by racing a channel receive against a fixed 100 ms timer and sampling released[20] right after. If the competing goroutine is simply slow to be scheduled, the timer fires, Cost(20) returns, and the Set runs afterward; the test then passes without ever creating the overlap it means to check, and the assertions that follow confirm final state but not that the overlap was exercised. Replace the timeout race with an explicit signal that the competing Set has reached the point where it would release the value (or is blocked trying to), so the test's outcome does not depend on how quickly the scheduler runs the second goroutine.\n\nOther notes: Address these, as these are legit blockers.",
+  "fieldBands": {
+   "description": {
+    "band": 3
+   },
+   "solution": {
+    "band": 3
+   },
+   "tests": {
+    "band": 1,
+    "reasoning": "- T3/T4 : No test drives Clear() while an accepted update to an already-stored key is sitting in the deferred-cost path (the case where setBuf is full, so the value is already written to the store but its cost charge and OnExit-ordering are deferred until processItems catches up). The solution's Clear() calls takeDeferred() specifically to discard that work before reporting entries, but nothing in the suite would fail if that call were missing or came after the drain: existing full-buffer tests (TestAcceptedUpdateWithFullWriteBufferChargesItsCost, TestUpdateBehindPendingSetWithFullWriteBufferIsKept) only call Wait(), and the Clear tests (TestClearReportsBufferedSetsToOnEvict, TestDelDuringClearReportsOnce, TestRejectedUpdateBesidePendingSetOfCollidingKeyIsNotReported) never fill the write buffer with an update to a stored key. Add a test that fills setBuf behind an accepted Cost-bearing update to a stored key, calls Clear(), and then asserts (with the same released-value tracking pattern as TestCostIsNotAskedForAReleasedValue) that Cost is never asked about that value again after Clear reports it.\n- T2/T3 : TestValueIsNotReleasedWhileCostIsAskedAboutIt still decides whether the competing Set overlapped Cost by racing a channel receive against a fixed 100 ms timer and sampling released[20] right after. If the competing goroutine is simply slow to be scheduled, the timer fires, Cost(20) returns, and the Set runs afterward; the test then passes without ever creating the overlap it means to check, and the assertions that follow confirm final state but not that the overlap was exercised. Replace the timeout race with an explicit signal that the competing Set has reached the point where it would release the value (or is blocked trying to), so the test's outcome does not depend on how quickly the scheduler runs the second goroutine.\n"
+   }
+  },
+  "internalNotes": null,
+  "otherNotes": "Address these, as these are legit blockers.",
+  "otherNotesTags": null,
+  "outcome": "revision_requested",
+  "overallQuality": 2.333333333333333,
+  "qualityScore": 6,
+  "reasoning": null,
+  "reviewFormatVersion": 2,
+  "reviewId": "m5753z258nwst3fwcvjbm8m9ax8g4fn3",
+  "reviewerName": "Neeraj B",
+  "submittedAt": 1791804308862,
+  "versionNumber": 5,
+  "submittedAtIST": "2026-10-12T16:55:08.862000+05:30"
+ },
+ {
+  "feedback": "Tests: Auto-review suggestion is good to have, but not blocking.",
+  "fieldBands": {
+   "description": {
+    "band": 3
+   },
+   "solution": {
+    "band": 3
+   },
+   "tests": {
+    "band": 2,
+    "reasoning": "Auto-review suggestion is good to have, but not blocking. "
+   }
+  },
+  "internalNotes": null,
+  "otherNotes": null,
+  "otherNotesTags": null,
+  "outcome": "approved",
+  "overallQuality": 2.6666666666666665,
+  "qualityScore": 6,
+  "reasoning": null,
+  "reviewFormatVersion": 2,
+  "reviewId": "m5756b0qbaq9kk0f8pxk3dkkad8g40dm",
+  "reviewerName": "Neeraj B",
+  "submittedAt": 1791817413591,
+  "versionNumber": 6,
+  "submittedAtIST": "2026-10-12T20:33:33.591000+05:30"
+ }
+]

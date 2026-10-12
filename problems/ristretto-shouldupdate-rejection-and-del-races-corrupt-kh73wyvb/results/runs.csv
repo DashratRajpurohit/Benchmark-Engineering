@@ -1,0 +1,180 @@
+label,agent,agentType,verdict,stale,reEvalRound,fault,filesModified,solutionLOC,agentMessages,sequenceLength,executionTimeSeconds,environmentBlocker,createdIST,id
+Nova #2,Nova,codex_cli,PASS_LEGITIMATE,True,,pass,4,165,43,68608,596.69939,False,2026-09-28T01:57:59.776000+05:30,rd7fqpq39dg48565ew30jh2fwd8f7m4r
+Nova #1,Nova,codex_cli,PASS_LEGITIMATE,True,,pass,4,109,37,59938,843.717629,False,2026-09-28T01:57:59.776000+05:30,rd714dht7tjhppe4d3d6kghj1n8f77dv
+Nova #3,Nova,codex_cli,PASS_LEGITIMATE,True,,pass,5,407,146,127067,1339.512841,False,2026-09-28T13:10:11.855000+05:30,rd70b38b79345jk4t896xp7khn8f933a
+Nova #2,Nova,codex_cli,FAIL_MISSED_REQUIREMENT,True,,agent,4,350,62,93927,968.6441,False,2026-09-28T13:10:11.855000+05:30,rd74m8kzn5vr5shfepdcgaz11d8f9sbm
+Nova #1,Nova,codex_cli,FAIL_MISSED_REQUIREMENT,True,,agent,4,365,64,86730,1316.380678,False,2026-09-28T13:10:11.855000+05:30,rd7efhg3p9kw9jvw4971b9rctd8f8d6w
+Nova #7,Nova,codex_cli,FAIL_MISSED_REQUIREMENT,True,,agent,4,482,92,116434,1158.139776,False,2026-09-28T13:32:56.566000+05:30,rd76c51a5erk6w5jrsvmfgbn558f83ed
+Nova #6,Nova,codex_cli,PASS_LEGITIMATE,True,,pass,5,342,89,92863,870.14979,False,2026-09-28T13:32:56.566000+05:30,rd72fnk8h6csx5y7c8th05nhxs8f8d6h
+Nova #5,Nova,codex_cli,PASS_LEGITIMATE,True,,pass,4,364,57,84787,658.919192,False,2026-09-28T13:32:56.566000+05:30,rd787a56cd3jm89dxtdcgrdj3h8f9hzk
+Nova #4,Nova,codex_cli,FAIL_REGRESSION,True,,agent,4,343,23,76299,535.064323,False,2026-09-28T13:32:56.566000+05:30,rd70rry5412yrg5s9vc5h177td8f93yx
+Nova #3,Nova,codex_cli,PASS_LEGITIMATE,True,,pass,5,423,69,88805,811.347354,False,2026-09-28T13:32:56.566000+05:30,rd7848c96na3c8k017kd86hsfn8f8n8k
+Nova #2,Nova,codex_cli,FAIL_MISSED_REQUIREMENT,True,,agent,4,530,107,126018,1511.784469,True,2026-09-28T13:32:56.566000+05:30,rd712xhdp98s0da7knq5m6kjpn8f9fqe
+Nova #1,Nova,codex_cli,FAIL_MISSED_REQUIREMENT,True,,agent,4,460,65,91370,1350.220742,False,2026-09-28T13:32:56.566000+05:30,rd79t7vjf4bytw9t9ybfjkxxad8f9t0h
+Nova #3 · re-eval 1,Nova,codex_cli,FAIL_MISSED_REQUIREMENT,True,1,agent,5,407,146,127067,341.088056,False,2026-09-28T19:05:11.216000+05:30,rd74ybw3fgew1x3trcxh99y6jn8f8cam
+Nova #2 · re-eval 1,Nova,codex_cli,FAIL_MISSED_REQUIREMENT,True,1,agent,4,350,62,93927,199.922919,False,2026-09-28T19:05:11.216000+05:30,rd735mmznfrpnmaq4na37z04m98f8x72
+Nova #1 · re-eval 1,Nova,codex_cli,FAIL_MISSED_REQUIREMENT,True,1,agent,4,365,64,86730,877.646874,True,2026-09-28T19:05:11.216000+05:30,rd7etz22zg8gkp4412axbjtfd18f8sqk
+Nova #7 · re-eval 1,Nova,codex_cli,FAIL_MISSED_REQUIREMENT,True,1,agent,4,482,92,116434,212.666205,False,2026-09-28T19:05:11.216000+05:30,rd722fh58sfk8j4fam3pmnbn0d8f8710
+Nova #6 · re-eval 1,Nova,codex_cli,PASS_LEGITIMATE,True,1,pass,5,342,89,92863,259.956032,False,2026-09-28T19:05:11.216000+05:30,rd71607gj233d3vn89h2ner53d8f8m9b
+Nova #5 · re-eval 1,Nova,codex_cli,PASS_LEGITIMATE,True,1,pass,4,364,57,84787,214.620672,False,2026-09-28T19:05:11.216000+05:30,rd795m0ebycfzk621w33tgcqqn8f8c16
+Nova #4 · re-eval 1,Nova,codex_cli,FAIL_REGRESSION,True,1,agent,4,343,23,76299,218.052345,False,2026-09-28T19:05:11.216000+05:30,rd73dy6rb3c5ybmap0sa6gw6v58f9j95
+Nova #3 · re-eval 1,Nova,codex_cli,PASS_LEGITIMATE,True,1,pass,5,423,69,88805,227.818089,False,2026-09-28T19:05:11.216000+05:30,rd7b6r1efmgrzzm8x1dsp0kdh18f87hz
+Nova #2 · re-eval 1,Nova,codex_cli,FAIL_MISSED_REQUIREMENT,True,1,agent,4,530,107,126018,959.027753,False,2026-09-28T19:05:11.216000+05:30,rd741sc83v0s28kebrfsdr9mk58f9gwz
+Nova #1 · re-eval 1,Nova,codex_cli,FAIL_MISSED_REQUIREMENT,True,1,agent,4,460,65,91370,893.145978,True,2026-09-28T19:05:11.216000+05:30,rd7er9xa4dq4k94tv09pvnza0d8f8hk8
+Nova #5,Nova,codex_cli,FAIL_MISSED_REQUIREMENT,True,,agent,5,391,86,100328,966.082201,False,2026-09-30T18:06:33.448000+05:30,rd76pgk5yc89hg9j354wddn8c18fdq9j
+Nova #4,Nova,codex_cli,FAIL_MISSED_REQUIREMENT,True,,agent,4,470,61,109441,1655.492169,False,2026-09-30T18:06:33.448000+05:30,rd74xvn1p2g7zqt476wsbh6s4d8fcv8f
+Nova #3,Nova,codex_cli,FAIL_MISSED_REQUIREMENT,True,,agent,4,464,90,118460,1519.460828,False,2026-09-30T18:06:33.448000+05:30,rd7dsd97dpvr89ezxwbr2q14js8fcp26
+Nova #2,Nova,codex_cli,FAIL_MISSED_REQUIREMENT,True,,agent,4,428,98,105867,1742.96579,False,2026-09-30T18:06:33.448000+05:30,rd7cjyyxjncvynhtf5g3zg4sx58fc3ve
+Nova #1,Nova,codex_cli,FAIL_MISSED_REQUIREMENT,True,,agent,5,570,83,125025,1646.536532,False,2026-09-30T18:06:33.448000+05:30,rd72rsb6fk760n0z5re0qq20v98fddkw
+Nova #5,Nova,codex_cli,FAIL_MISSED_REQUIREMENT,True,,agent,5,499,96,114860,1091.709084,False,2026-09-30T19:33:55.301000+05:30,rd790yh7gr1zrdhg5sm0d7n92d8fctdk
+Nova #4,Nova,codex_cli,FAIL_MISSED_REQUIREMENT,True,,agent,4,477,77,103202,1512.361813,False,2026-09-30T19:33:55.301000+05:30,rd77shytpn2tkg1fy5rexs04bn8fd6kd
+Nova #3,Nova,codex_cli,FAIL_MISSED_REQUIREMENT,True,,agent,4,487,69,88104,1577.901294,True,2026-09-30T19:33:55.301000+05:30,rd75x3qzqvgvvwbkbchy1h1brn8fc520
+Nova #2,Nova,codex_cli,FAIL_MISSED_REQUIREMENT,True,,agent,4,421,96,106029,1629.120121,False,2026-09-30T19:33:55.301000+05:30,rd7155r80xtv6cangpzeka05918fdqjp
+Nova #1,Nova,codex_cli,FAIL_MISSED_REQUIREMENT,True,,agent,4,405,68,112767,1687.880404,False,2026-09-30T19:33:55.301000+05:30,rd7cjdxga8gpbw1c2e6v2khd0h8fdjxv
+Nova #3,Nova,codex_cli,FAIL_REGRESSION,True,,agent,4,624,72,118058,2453.140238,True,2026-09-30T23:13:07.092000+05:30,rd7e5bzp2wf2wd3md2mm218ya98fdc74
+Nova #2,Nova,codex_cli,FAIL_MISSED_REQUIREMENT,True,,agent,4,569,84,125121,1920.674711,False,2026-09-30T23:13:07.092000+05:30,rd7bkvrk59yw96v9dd2bcdb87s8fdg8s
+Nova #1,Nova,codex_cli,FAIL_MISSED_REQUIREMENT,True,,agent,4,567,55,107563,1524.514842,True,2026-09-30T23:13:07.092000+05:30,rd75dq3y19sy930zg822ky6b498fd9vf
+Nova #1,Nova,codex_cli,,True,,infra,,,2,7905,129.358788,,2026-10-01T04:13:55.327000+05:30,rd73zv705zjxt68h8ek7xzj42d8fcec4
+Nova #1,Nova,codex_cli,FAIL_MISSED_REQUIREMENT,True,,agent,4,429,116,126056,2340.472639,False,2026-10-01T08:29:50.432000+05:30,rd7aanec62kjys7ehgjjnq7v418fej3m
+Nova #2,Nova,codex_cli,FAIL_MISSED_REQUIREMENT,True,,agent,4,482,62,99433,1025.35398,False,2026-10-01T17:10:06.428000+05:30,rd73k7mkkz9fvw5qtfbeb9x1k18fehaf
+Nova #1,Nova,codex_cli,PASS_LEGITIMATE,True,,pass,3,298,45,87954,889.442802,False,2026-10-01T17:10:06.428000+05:30,rd76jd6297pxwtpyan8y4h6f6h8ffrjq
+Nova #1,Nova,codex_cli,FAIL_MISSED_REQUIREMENT,True,,agent,4,543,103,110954,1374.497541,False,2026-10-01T17:38:15.901000+05:30,rd70gfjdpxnw7r5krpqgds0v4n8fe0fj
+Nova #7,Nova,codex_cli,PASS_LEGITIMATE,True,,pass,4,567,64,103811,988.190494,False,2026-10-01T18:01:48.652000+05:30,rd793xb1hfp85kskhds87yj4p58ffaaq
+Nova #6,Nova,codex_cli,FAIL_MISSED_REQUIREMENT,True,,agent,4,417,52,94367,963.257168,False,2026-10-01T18:01:48.652000+05:30,rd79re5tq7rtym4wtk8ktyfd9d8fffhr
+Nova #5,Nova,codex_cli,FAIL_MISSED_REQUIREMENT,True,,agent,4,329,89,103254,1143.355501,False,2026-10-01T18:01:48.652000+05:30,rd77gb97ac24n6bxaft9qsx2t58fe5rr
+Nova #4,Nova,codex_cli,FAIL_MISSED_REQUIREMENT,True,,agent,4,541,84,120554,1218.012146,False,2026-10-01T18:01:48.652000+05:30,rd7fzm4284ecje48frnztv7skn8fedyh
+Nova #3,Nova,codex_cli,FAIL_MISSED_REQUIREMENT,True,,agent,4,352,80,113487,1042.738852,False,2026-10-01T18:01:48.652000+05:30,rd73eydfb8wgqn043kxx5naxyh8fef6s
+Nova #2,Nova,codex_cli,FAIL_MISSED_REQUIREMENT,True,,agent,4,430,114,138277,1409.690871,False,2026-10-01T18:01:48.652000+05:30,rd77ng6mpe7wbn0792khxyqp198fekrs
+Nova #1,Nova,codex_cli,FAIL_REGRESSION,True,,agent,5,440,59,99738,1180.386469,False,2026-10-01T18:01:48.652000+05:30,rd70epmwv2s1yhnej6dqvc6rfd8ff7hc
+Nova #5,Nova,codex_cli,FAIL_MISSED_REQUIREMENT,True,,agent,4,439,86,105950,1005.958772,False,2026-10-02T12:01:34.528000+05:30,rd7fdvn6q4w43q4nm2kakmtw918fhv3e
+Nova #4,Nova,codex_cli,PASS_LEGITIMATE,True,,pass,4,521,88,117686,1056.000986,False,2026-10-02T12:01:34.528000+05:30,rd76zaafpbbqq7cjx7k29hm4es8fh9ga
+Nova #3,Nova,codex_cli,FAIL_REGRESSION,True,,agent,4,454,73,102565,1122.736551,False,2026-10-02T12:01:34.528000+05:30,rd7bhrfc1jwyth2exkvcfk86wh8fh0ks
+Nova #2,Nova,codex_cli,PASS_LEGITIMATE,True,,pass,4,345,63,88937,1038.111033,False,2026-10-02T12:01:34.528000+05:30,rd77a626hqt7jrgwc5t5ny3v7d8fh0b9
+Nova #1,Nova,codex_cli,PASS_LEGITIMATE,True,,pass,3,296,77,107040,1053.536828,False,2026-10-02T12:01:34.528000+05:30,rd7at2e9s1a1dp5kh3e98yp6dh8fge8g
+Nova #5 · re-eval 1,Nova,codex_cli,FAIL_MISSED_REQUIREMENT,True,1,agent,4,439,86,105950,198.162656,False,2026-10-02T14:17:17.699000+05:30,rd754wfwgn6s70jye7npfmrn518fgc2x
+Nova #4 · re-eval 1,Nova,codex_cli,FAIL_MISSED_REQUIREMENT,True,1,agent,4,521,88,117686,237.604528,False,2026-10-02T14:17:17.699000+05:30,rd7fpwgppka34r8w25k7ezdbpx8fhr3c
+Nova #3 · re-eval 1,Nova,codex_cli,FAIL_REGRESSION,True,1,agent,4,454,73,102565,220.592437,False,2026-10-02T14:17:17.699000+05:30,rd7dz6r7y7rb78svrv954yys8s8fhm7s
+Nova #2 · re-eval 1,Nova,codex_cli,FAIL_MISSED_REQUIREMENT,True,1,agent,4,345,63,88937,191.275016,False,2026-10-02T14:17:17.699000+05:30,rd73hznzegapz2x84v0qrrpx918fgrz0
+Nova #1 · re-eval 1,Nova,codex_cli,FAIL_MISSED_REQUIREMENT,True,1,agent,3,296,77,107040,202.336682,False,2026-10-02T14:17:17.699000+05:30,rd72y8wjxk26h71st6grnvrh7d8fgrfx
+Nova #2,Nova,codex_cli,PASS_LEGITIMATE,True,,pass,4,285,42,99322,1016.654066,False,2026-10-02T14:31:31.290000+05:30,rd791e5xd8sw3295a14412y6nn8fgg10
+Nova #1,Nova,codex_cli,PASS_LEGITIMATE,True,,pass,4,527,111,128947,1628.564967,False,2026-10-02T14:31:31.290000+05:30,rd71ccyp74kaxxphcd6kf45ec18fhmee
+Nova #3,Nova,codex_cli,PASS_LEGITIMATE,True,,pass,4,503,74,108734,1081.121482,False,2026-10-02T15:02:49.881000+05:30,rd71y4hh9g301a5j1k6v4dycq58fhbnk
+Nova #2,Nova,codex_cli,FAIL_MISSED_REQUIREMENT,True,,agent,4,534,86,106823,1196.048913,False,2026-10-02T15:02:49.881000+05:30,rd796mqrqptk8qg4hf4bsq9mn18fg1kw
+Nova #1,Nova,codex_cli,FAIL_MISSED_REQUIREMENT,True,,agent,4,469,92,103435,1347.44539,False,2026-10-02T15:02:49.881000+05:30,rd7e0vytrrwck5g6q64x34kh2d8fg3mg
+Nova #5 · re-eval 2,Nova,codex_cli,FAIL_MISSED_REQUIREMENT,True,2,agent,4,439,86,105950,218.645795,False,2026-10-02T17:41:14.436000+05:30,rd7an44zwr5d6xbvfgjc71hm7h8fgfqa
+Nova #4 · re-eval 2,Nova,codex_cli,FAIL_MISSED_REQUIREMENT,True,2,agent,4,521,88,117686,287.752326,False,2026-10-02T17:41:14.436000+05:30,rd79n6srz8fv9pd2se9hhxn86s8fgp2c
+Nova #3 · re-eval 2,Nova,codex_cli,FAIL_REGRESSION,True,2,agent,4,454,73,102565,192.197655,False,2026-10-02T17:41:14.436000+05:30,rd77e1ak7trc7pq9pn28ewt8s18fh7x2
+Nova #2 · re-eval 2,Nova,codex_cli,FAIL_MISSED_REQUIREMENT,True,2,agent,4,345,63,88937,277.430243,False,2026-10-02T17:41:14.436000+05:30,rd7catyferee4ak78qm8n6z2h98fg6wk
+Nova #1 · re-eval 2,Nova,codex_cli,FAIL_MISSED_REQUIREMENT,True,2,agent,3,296,77,107040,218.81271,False,2026-10-02T17:41:14.436000+05:30,rd74c5jjvtgsqek7rjggqswvk58fhkc3
+Nova #2 · re-eval 1,Nova,codex_cli,FAIL_MISSED_REQUIREMENT,True,1,agent,4,285,42,99322,278.487437,False,2026-10-02T17:41:14.436000+05:30,rd78jvv4h65abvgm22ah352n5n8fget1
+Nova #1 · re-eval 1,Nova,codex_cli,PASS_LEGITIMATE,True,1,pass,4,527,111,128947,171.94985,False,2026-10-02T17:41:14.436000+05:30,rd7f209nhq2w4qryececbmgcxx8fgcgh
+Nova #3 · re-eval 1,Nova,codex_cli,PASS_LEGITIMATE,True,1,pass,4,503,74,108734,261.690455,False,2026-10-02T17:41:14.436000+05:30,rd74nq3sgv8nj8f47ct93j4r058fg3je
+Nova #2 · re-eval 1,Nova,codex_cli,FAIL_MISSED_REQUIREMENT,True,1,agent,4,534,86,106823,233.986633,False,2026-10-02T17:41:14.436000+05:30,rd7brv15b2827tkz8yx5veqamn8fhgcz
+Nova #1 · re-eval 1,Nova,codex_cli,FAIL_MISSED_REQUIREMENT,True,1,agent,4,469,92,103435,433.289916,False,2026-10-02T17:41:14.436000+05:30,rd72ch49v0dsm0njvfmbsn66fx8fg9eq
+Nova #5 · re-eval 3,Nova,codex_cli,FAIL_MISSED_REQUIREMENT,True,3,agent,4,439,86,105950,284.167241,False,2026-10-02T22:16:01.567000+05:30,rd72n7k1p20fve909d4jba1bns8fhgg8
+Nova #4 · re-eval 3,Nova,codex_cli,FAIL_MISSED_REQUIREMENT,True,3,agent,4,521,88,117686,225.750533,False,2026-10-02T22:16:01.567000+05:30,rd778hn9nx7pt3wqhq5q6hfdp18fgyg3
+Nova #3 · re-eval 3,Nova,codex_cli,FAIL_REGRESSION,True,3,agent,4,454,73,102565,260.952504,False,2026-10-02T22:16:01.567000+05:30,rd74770s12dw4xhvj51wg74pfx8fgd2d
+Nova #2 · re-eval 3,Nova,codex_cli,FAIL_MISSED_REQUIREMENT,True,3,agent,4,345,63,88937,261.587796,False,2026-10-02T22:16:01.567000+05:30,rd708qy9mwjpjb5ftn18ab0c798fh8sj
+Nova #1 · re-eval 3,Nova,codex_cli,FAIL_MISSED_REQUIREMENT,True,3,agent,3,296,77,107040,281.061577,False,2026-10-02T22:16:01.567000+05:30,rd7e4w13032626srj054bwq8vd8fhpp6
+Nova #2 · re-eval 2,Nova,codex_cli,FAIL_MISSED_REQUIREMENT,True,2,agent,4,285,42,99322,255.505483,False,2026-10-02T22:16:01.567000+05:30,rd7cksbwewb00kgj9yqfjhsapd8fh2hm
+Nova #1 · re-eval 2,Nova,codex_cli,PASS_LEGITIMATE,True,2,pass,4,527,111,128947,254.518378,False,2026-10-02T22:16:01.567000+05:30,rd78d3x1t93arx4byk4t7w5xmx8fh1jp
+Nova #3 · re-eval 2,Nova,codex_cli,PASS_LEGITIMATE,True,2,pass,4,503,74,108734,275.164833,False,2026-10-02T22:16:01.567000+05:30,rd73qb9b6e8s89yqwr9d1ssmpd8fgp3q
+Nova #2 · re-eval 2,Nova,codex_cli,FAIL_MISSED_REQUIREMENT,True,2,agent,4,534,86,106823,219.812661,False,2026-10-02T22:16:01.567000+05:30,rd7319j2gwktp332nrw1vyb6rx8fgr9m
+Nova #1 · re-eval 2,Nova,codex_cli,FAIL_MISSED_REQUIREMENT,True,2,agent,4,469,92,103435,490.189521,False,2026-10-02T22:16:01.567000+05:30,rd7262z7znrz4m5qahnwnrekwd8fhxdg
+Nova #5 · re-eval 4,Nova,codex_cli,FAIL_MISSED_REQUIREMENT,True,4,agent,4,439,86,105950,288.011134,False,2026-10-03T00:11:28.149000+05:30,rd772x7y92js04zq42jxn4hcjn8fhd95
+Nova #4 · re-eval 4,Nova,codex_cli,FAIL_MISSED_REQUIREMENT,True,4,agent,4,521,88,117686,257.658186,False,2026-10-03T00:11:28.149000+05:30,rd7fpdj1wg55rtxzbd29v6r9pd8fhmkf
+Nova #3 · re-eval 4,Nova,codex_cli,FAIL_REGRESSION,True,4,agent,4,454,73,102565,291.409542,False,2026-10-03T00:11:28.149000+05:30,rd75n72dcr63pv51vcry3179xx8fh7rr
+Nova #2 · re-eval 4,Nova,codex_cli,FAIL_MISSED_REQUIREMENT,True,4,agent,4,345,63,88937,234.211055,False,2026-10-03T00:11:28.149000+05:30,rd7fhp7bz6vggecke5dgh7dj4s8fhrfm
+Nova #1 · re-eval 4,Nova,codex_cli,FAIL_MISSED_REQUIREMENT,True,4,agent,3,296,77,107040,251.383164,False,2026-10-03T00:11:28.149000+05:30,rd72yhx9syzka1y14chgrppbf18fhwjb
+Nova #2 · re-eval 3,Nova,codex_cli,FAIL_MISSED_REQUIREMENT,True,3,agent,4,285,42,99322,230.424645,False,2026-10-03T00:11:28.149000+05:30,rd750435pdwqfebs5w92xe53f18fgdf3
+Nova #1 · re-eval 3,Nova,codex_cli,PASS_LEGITIMATE,True,3,pass,4,527,111,128947,227.224445,False,2026-10-03T00:11:28.149000+05:30,rd74h3pet61hznpkyqwhwc2ben8fg58n
+Nova #3 · re-eval 3,Nova,codex_cli,PASS_LEGITIMATE,True,3,pass,4,503,74,108734,230.264918,False,2026-10-03T00:11:28.149000+05:30,rd7bf96sxvg15xcvvf6ge9tg4d8fghpg
+Nova #2 · re-eval 3,Nova,codex_cli,FAIL_MISSED_REQUIREMENT,True,3,agent,4,534,86,106823,251.641538,False,2026-10-03T00:11:28.149000+05:30,rd72a1m80kvth1y7m4qyap02cn8fgwbs
+Nova #1 · re-eval 3,Nova,codex_cli,FAIL_MISSED_REQUIREMENT,True,3,agent,4,469,92,103435,538.301854,False,2026-10-03T00:11:28.149000+05:30,rd70t2383f7z3t832mxhxv17a58fgvsv
+Nova #5,Nova,codex_cli,PASS_LEGITIMATE,True,,pass,4,562,70,136666,1045.834641,False,2026-10-04T04:52:11.331000+05:30,rd751y2jk5pfy9sm542t3ym5ts8fjxte
+Nova #4,Nova,codex_cli,PASS_LEGITIMATE,True,,pass,4,492,99,124056,986.648312,False,2026-10-04T04:52:11.331000+05:30,rd7asm3rmasxa252gb3c9yaz4s8fkb51
+Nova #3,Nova,codex_cli,FAIL_WRONG_LOGIC,True,,agent,4,531,78,110581,1031.848403,False,2026-10-04T04:52:11.331000+05:30,rd77b0tf1m7p318knvxp9c2n318fkr72
+Nova #2,Nova,codex_cli,FAIL_REGRESSION,True,,agent,4,532,61,108668,1014.098118,False,2026-10-04T04:52:11.331000+05:30,rd74h2nxe2r2nws9eat56jtk0x8fjvaw
+Nova #1,Nova,codex_cli,PASS_LEGITIMATE,True,,pass,4,613,59,101951,926.88642,False,2026-10-04T04:52:11.331000+05:30,rd704frat9kyz4k5ewjp90mj1h8fks77
+Nova #5,Nova,codex_cli,FAIL_MISSED_REQUIREMENT,True,,agent,4,653,73,111143,1149.507275,False,2026-10-04T08:02:54.851000+05:30,rd771ry6jkvd6rkjyyh14aezvx8fmdra
+Nova #4,Nova,codex_cli,PASS_LEGITIMATE,True,,pass,3,612,120,133053,1936.973354,False,2026-10-04T08:02:54.851000+05:30,rd76wxa312nc3g0ke2fqhc1xph8fnvz2
+Nova #3,Nova,codex_cli,PASS_LEGITIMATE,True,,pass,4,597,99,136651,1140.837408,False,2026-10-04T08:02:54.851000+05:30,rd789f2b4eam51w1akw28mcwjx8fnq2e
+Nova #2,Nova,codex_cli,PASS_LEGITIMATE,True,,pass,4,582,54,122380,915.883575,False,2026-10-04T08:02:54.851000+05:30,rd7eswc1cxxjma8th7e06qah898fmr7n
+Nova #1,Nova,codex_cli,FAIL_REGRESSION,True,,agent,4,487,47,106722,1828.793815,False,2026-10-04T08:02:54.851000+05:30,rd73j5aj1st19s3gv6r6wdtrg98fnve4
+Nova #5 · re-eval 1,Nova,codex_cli,FAIL_REGRESSION,True,1,agent,4,562,70,136666,216.050136,False,2026-10-04T14:57:14.517000+05:30,rd73m372sx25s9gz14edhb1tas8fnw6a
+Nova #4 · re-eval 1,Nova,codex_cli,PASS_LEGITIMATE,True,1,pass,4,492,99,124056,228.973609,False,2026-10-04T14:57:14.517000+05:30,rd79wdbdcfans5skyqspxr0qtd8fm69d
+Nova #3 · re-eval 1,Nova,codex_cli,FAIL_MISSED_REQUIREMENT,True,1,agent,4,531,78,110581,269.744646,False,2026-10-04T14:57:14.517000+05:30,rd704j5e009jdcp7txysa83n7d8fnfms
+Nova #2 · re-eval 1,Nova,codex_cli,FAIL_REGRESSION,True,1,agent,4,532,61,108668,183.775627,False,2026-10-04T14:57:14.517000+05:30,rd7cngy1qercg777w7qd880g518fnpm1
+Nova #1 · re-eval 1,Nova,codex_cli,PASS_LEGITIMATE,True,1,pass,4,613,59,101951,209.545303,False,2026-10-04T14:57:14.517000+05:30,rd7487c92py5v0nqqqgkzamrqx8fn2pa
+Nova #5 · re-eval 1,Nova,codex_cli,FAIL_MISSED_REQUIREMENT,True,1,agent,4,653,73,111143,191.64032,False,2026-10-04T14:57:14.517000+05:30,rd74g6m3k92wdd55jhyqq5jkt58fn15d
+Nova #4 · re-eval 1,Nova,codex_cli,PASS_LEGITIMATE,True,1,pass,3,612,120,133053,168.066029,False,2026-10-04T14:57:14.517000+05:30,rd7bkqv5jx5beg9w3a27haer3n8fm8cb
+Nova #3 · re-eval 1,Nova,codex_cli,PASS_LEGITIMATE,True,1,pass,4,597,99,136651,260.206256,False,2026-10-04T14:57:14.517000+05:30,rd70vttw673840y5cpmgre72wn8fm2ez
+Nova #2 · re-eval 1,Nova,codex_cli,PASS_LEGITIMATE,True,1,pass,4,582,54,122380,193.061773,False,2026-10-04T14:57:14.517000+05:30,rd71byjqsns26xq17z6jpym3g98fmc46
+Nova #1 · re-eval 1,Nova,codex_cli,FAIL_REGRESSION,True,1,agent,4,487,47,106722,1096.457065,False,2026-10-04T14:57:14.517000+05:30,rd7d5zncgfw7kg2a74108ebs4h8fntpq
+Nova #5 · re-eval 2,Nova,codex_cli,FAIL_REGRESSION,True,2,agent,4,562,70,136666,208.790689,False,2026-10-04T20:33:17.984000+05:30,rd76dbnxqbd5p5kathq2k0qm318fn569
+Nova #4 · re-eval 2,Nova,codex_cli,PASS_LEGITIMATE,True,2,pass,4,492,99,124056,184.66199,False,2026-10-04T20:33:17.984000+05:30,rd7b71dce29q6m1b5q9neygnsd8fnraq
+Nova #3 · re-eval 2,Nova,codex_cli,FAIL_WRONG_LOGIC,True,2,agent,4,531,78,110581,251.783351,False,2026-10-04T20:33:17.984000+05:30,rd70jqtrmw1hczgjsz4h77jwf58fn2f8
+Nova #2 · re-eval 2,Nova,codex_cli,FAIL_REGRESSION,True,2,agent,4,532,61,108668,185.453415,False,2026-10-04T20:33:17.984000+05:30,rd77zkzcsqzae3d30ykdtd8d118fn2vq
+Nova #1 · re-eval 2,Nova,codex_cli,FAIL_MISSED_REQUIREMENT,True,2,agent,4,613,59,101951,202.307828,False,2026-10-04T20:33:17.984000+05:30,rd77wemdwrg6tedtv1kzn38fqs8fn6dz
+Nova #5 · re-eval 2,Nova,codex_cli,FAIL_MISSED_REQUIREMENT,True,2,agent,4,653,73,111143,214.167419,False,2026-10-04T20:33:17.984000+05:30,rd7c9mmrjhqvkf3mtzfnh1h6218fmfxt
+Nova #4 · re-eval 2,Nova,codex_cli,FAIL_MISSED_REQUIREMENT,True,2,agent,3,612,120,133053,214.242611,False,2026-10-04T20:33:17.984000+05:30,rd7677ssy4g68vsykxbvsbq02s8fm3mk
+Nova #3 · re-eval 2,Nova,codex_cli,FAIL_MISSED_REQUIREMENT,True,2,agent,4,597,99,136651,212.235294,False,2026-10-04T20:33:17.984000+05:30,rd767ypm5b8x6s2dewgavhcjgx8fmbf4
+Nova #2 · re-eval 2,Nova,codex_cli,PASS_LEGITIMATE,True,2,pass,4,582,54,122380,214.784909,False,2026-10-04T20:33:17.984000+05:30,rd79p5v4nma06hd4kpemq050558fnv5z
+Nova #1 · re-eval 2,Nova,codex_cli,FAIL_REGRESSION,True,2,agent,4,487,47,106722,1065.805951,False,2026-10-04T20:33:17.984000+05:30,rd79rsyg00yr2gajn3nnrqk1mh8fnmcn
+Nova #5 · re-eval 3,Nova,codex_cli,FAIL_REGRESSION,True,3,agent,4,562,70,136666,216.501286,False,2026-10-04T23:30:24.211000+05:30,rd705c4yw91tbprg1rh5p444rd8fmgme
+Nova #4 · re-eval 3,Nova,codex_cli,PASS_LEGITIMATE,True,3,pass,4,492,99,124056,230.513123,False,2026-10-04T23:30:24.211000+05:30,rd7drhvgc1sjrwtchfwwp7n6an8fm57f
+Nova #3 · re-eval 3,Nova,codex_cli,FAIL_MISSED_REQUIREMENT,True,3,agent,4,531,78,110581,215.676404,False,2026-10-04T23:30:24.211000+05:30,rd7dqzx0s7kdabsmj554stdxjn8fm7j3
+Nova #2 · re-eval 3,Nova,codex_cli,FAIL_REGRESSION,True,3,agent,4,532,61,108668,193.842672,False,2026-10-04T23:30:24.211000+05:30,rd778xfjr7jw7h08bmhe37sw498fnj1w
+Nova #1 · re-eval 3,Nova,codex_cli,FAIL_MISSED_REQUIREMENT,True,3,agent,4,613,59,101951,201.882335,False,2026-10-04T23:30:24.211000+05:30,rd7012m2qtywp2s7atpbrxcep18fmm0n
+Nova #5 · re-eval 3,Nova,codex_cli,FAIL_MISSED_REQUIREMENT,True,3,agent,4,653,73,111143,237.151524,False,2026-10-04T23:30:24.211000+05:30,rd7crsk0x0j5m34e0w4px840898fnk9n
+Nova #4 · re-eval 3,Nova,codex_cli,FAIL_MISSED_REQUIREMENT,True,3,agent,3,612,120,133053,218.74744,False,2026-10-04T23:30:24.211000+05:30,rd732hzazg5z5yyxme0ykcb71d8fnfgk
+Nova #3 · re-eval 3,Nova,codex_cli,FAIL_MISSED_REQUIREMENT,True,3,agent,4,597,99,136651,181.526042,False,2026-10-04T23:30:24.211000+05:30,rd7brwsffp47tbphp2kxn9kvrd8fmkva
+Nova #2 · re-eval 3,Nova,codex_cli,PASS_LEGITIMATE,True,3,pass,4,582,54,122380,223.481375,False,2026-10-04T23:30:24.211000+05:30,rd73n7hce773a5yw10rwhmwk958fmxn3
+Nova #1 · re-eval 3,Nova,codex_cli,FAIL_REGRESSION,True,3,agent,4,487,47,106722,1077.771626,False,2026-10-04T23:30:24.211000+05:30,rd7dbgzjdm2pytevgvm3ksyka58fnf3e
+Nova #5 · re-eval 4,Nova,codex_cli,FAIL_MISSED_REQUIREMENT,True,4,agent,4,562,70,136666,583.755526,False,2026-10-09T16:35:28.108000+05:30,rd77c96n8t1wpt6sdj0z3xdtjn8fzhny
+Nova #4 · re-eval 4,Nova,codex_cli,PASS_LEGITIMATE,True,4,pass,4,492,99,124056,276.360655,False,2026-10-09T16:35:28.108000+05:30,rd7afy62t42qzg5cy668ctrtgh8fz3kw
+Nova #3 · re-eval 4,Nova,codex_cli,FAIL_WRONG_LOGIC,True,4,agent,4,531,78,110581,467.650144,False,2026-10-09T16:35:28.108000+05:30,rd7ffa584b5tjyt922s2y9x07d8fzx27
+Nova #2 · re-eval 4,Nova,codex_cli,FAIL_REGRESSION,True,4,agent,4,532,61,108668,422.032175,False,2026-10-09T16:35:28.108000+05:30,rd722n41awexmrw4ptd7s3dpsd8fysfw
+Nova #1 · re-eval 4,Nova,codex_cli,FAIL_MISSED_REQUIREMENT,True,4,agent,4,613,59,101951,321.846042,False,2026-10-09T16:35:28.108000+05:30,rd7edwbt960kjyg05fn1cva2h98fz4nf
+Nova #5 · re-eval 4,Nova,codex_cli,FAIL_MISSED_REQUIREMENT,True,4,agent,4,653,73,111143,331.01776,False,2026-10-09T16:35:28.108000+05:30,rd72whk3c6xk4szfrj1csf07td8fz0z2
+Nova #4 · re-eval 4,Nova,codex_cli,FAIL_MISSED_REQUIREMENT,True,4,agent,3,612,120,133053,436.234673,False,2026-10-09T16:35:28.108000+05:30,rd757h0jrzeqx5q7g31mhbv4k98fyr6n
+Nova #3 · re-eval 4,Nova,codex_cli,FAIL_MISSED_REQUIREMENT,True,4,agent,4,597,99,136651,465.519206,False,2026-10-09T16:35:28.108000+05:30,rd740xheka1hzxvhhkw0zsxrfd8fz59h
+Nova #2 · re-eval 4,Nova,codex_cli,PASS_LEGITIMATE,True,4,pass,4,582,54,122380,272.309924,False,2026-10-09T16:35:28.108000+05:30,rd7a74fxbck6yjvypc5tjz1ghd8fzt1r
+Nova #1 · re-eval 4,Nova,codex_cli,,True,4,infra,,,47,106722,1019.029199,,2026-10-09T16:35:28.108000+05:30,rd77gszsq4rz45sjs5z0w444358fyqs2
+Nova #1 · re-eval 4,Nova,codex_cli,,True,4,infra,,,47,106722,1032.782488,,2026-10-09T16:58:57.444000+05:30,rd73h3jwez1rrapqrkyrwt9tys8fycfs
+Orion #12,Orion,codex_cli,FAIL_REGRESSION,True,,agent,5,540,37,74268,2197.686769,True,2026-10-09T17:28:41.910000+05:30,rd73ztzykt5znatd0fc83vp3nd8fypw0
+Orion #11,Orion,codex_cli,FAIL_MISSED_REQUIREMENT,True,,agent,4,735,53,88197,1517.013736,False,2026-10-09T17:28:41.910000+05:30,rd791t14dc43k6a75ctpct1x4d8fy5k2
+Orion #10,Orion,codex_cli,FAIL_MISSED_REQUIREMENT,True,,agent,7,636,31,69784,961.502258,False,2026-10-09T17:28:41.910000+05:30,rd7cqqy5cr9b272tvmfstxyrrx8fy7b4
+Orion #9,Orion,codex_cli,PASS_LEGITIMATE,True,,pass,4,773,52,88269,1379.752646,True,2026-10-09T17:28:41.910000+05:30,rd791k9fn26fd7c9fkff2s6bxd8fz89e
+Nova #8,Nova,antigravity,,True,,infra,,,391,452814,1824.406994,,2026-10-09T17:28:41.910000+05:30,rd745eek3dyymtvtypm1kxqaw18fy2xh
+Nova #7,Nova,antigravity,FAIL_MISSED_REQUIREMENT,True,,agent,5,711,436,331166,2967.340219,False,2026-10-09T17:28:41.910000+05:30,rd76np3yemepjrwj1e2grhaxts8fy90h
+Nova #6,Nova,antigravity,FAIL_REGRESSION,True,,agent,4,618,455,338271,2622.724933,False,2026-10-09T17:28:41.910000+05:30,rd7en4r1cb9mghmctryc8rrgpx8fybdc
+Nova #5,Nova,antigravity,,True,,infra,,,5,14465,132.193677,,2026-10-09T17:28:41.910000+05:30,rd705zwm4j6mexdpzjky3w056x8fzj21
+Nova #4,Nova,antigravity,FAIL_MISSED_REQUIREMENT,True,,agent,5,730,428,371352,2370.154174,False,2026-10-09T17:28:41.910000+05:30,rd705snj0ywa27238shn2xknrd8fyrb8
+Nova #3,Nova,antigravity,FAIL_MISSED_REQUIREMENT,True,,agent,4,836,402,398961,2603.756632,False,2026-10-09T17:28:41.910000+05:30,rd7cqxthe2xaenp3gxyfvgxy258fzvva
+Nova #2,Nova,antigravity,FAIL_EARLY_TERMINATION,True,,infra,0,0,44,41019,502.685044,True,2026-10-09T17:28:41.910000+05:30,rd7211w58zt6mhx9trq72bt3n98fzcmf
+Nova #1,Nova,antigravity,,True,,infra,,,274,229439,1632.184718,,2026-10-09T17:28:41.910000+05:30,rd75j5a3pw06gg1has7te1bsas8fzgdp
+Nova #4,Nova,antigravity,FAIL_EARLY_TERMINATION,True,,infra,0,0,51,83488,574.81334,False,2026-10-09T19:30:28.390000+05:30,rd78phdgwz97gy0qn7djrskk0n8fybhy
+Nova #3,Nova,antigravity,FAIL_MISSED_REQUIREMENT,True,,agent,4,644,478,371169,2689.73321,False,2026-10-09T19:30:28.390000+05:30,rd77jrw6mfma2j3a3f4bkadz4h8fzj1b
+Nova #2,Nova,antigravity,FAIL_MISSED_REQUIREMENT,True,,agent,5,696,371,292726,2529.866423,False,2026-10-09T19:30:28.390000+05:30,rd7551d1fpaebyj3032rw6zm2h8fz0e5
+Nova #1,Nova,antigravity,FAIL_MISSED_REQUIREMENT,True,,agent,4,855,490,328122,2773.592707,False,2026-10-09T19:30:28.390000+05:30,rd793hep488vxhe25jk04sdpkd8fz3my
+Nova #1,Nova,antigravity,,True,,infra,,,329,671980,3333.825267,,2026-10-09T20:20:20.734000+05:30,rd78fnrs95te1jta3j12qhrpeh8fz8sy
+Nova #1,Nova,antigravity,FAIL_MISSED_REQUIREMENT,True,,agent,4,944,233,315508,3305.953915,False,2026-10-09T21:16:50.619000+05:30,rd7b448pfrfsj7kb2fxs5h00418fyz27
+Orion #12 · re-eval 1,Orion,codex_cli,FAIL_REGRESSION,False,1,agent,5,540,37,74268,1437.755629,True,2026-10-12T18:44:32.539000+05:30,rd794b8851mnhhv73rq9mggf158g50jb
+Orion #11 · re-eval 1,Orion,codex_cli,FAIL_MISSED_REQUIREMENT,False,1,agent,4,735,53,88197,515.665686,False,2026-10-12T18:44:32.539000+05:30,rd7fgg4vehf8v3j6vz670z9vdn8g5akf
+Orion #10 · re-eval 1,Orion,codex_cli,FAIL_MISSED_REQUIREMENT,False,1,agent,7,636,31,69784,496.363816,False,2026-10-12T18:44:32.539000+05:30,rd71sam3fxk2x69azes69r1r398g5hnd
+Orion #9 · re-eval 1,Orion,codex_cli,,False,1,infra,,,52,88269,239.309282,,2026-10-12T18:44:32.539000+05:30,rd7ars0bkcqvzat30mqxyh01v18g49mt
+Nova #7 · re-eval 1,Nova,antigravity,FAIL_MISSED_REQUIREMENT,False,1,agent,5,711,436,331166,617.67843,False,2026-10-12T18:44:32.539000+05:30,rd7fxghpgm7tafdy4x5t2fwee98g5r1a
+Nova #6 · re-eval 1,Nova,antigravity,FAIL_REGRESSION,False,1,agent,4,618,455,338271,594.707521,False,2026-10-12T18:44:32.539000+05:30,rd767cwc10ztqqt07qpvrdyd998g4jvr
+Nova #4 · re-eval 1,Nova,antigravity,,False,1,infra,,,428,371352,336.864461,,2026-10-12T18:44:32.539000+05:30,rd7exs2tr120y5ez6mzr8vte7h8g523y
+Nova #3 · re-eval 1,Nova,antigravity,FAIL_MISSED_REQUIREMENT,False,1,agent,4,836,402,398961,478.539234,False,2026-10-12T18:44:32.539000+05:30,rd7apx2y8d03d4maxb46jyt88s8g5pg6
+Nova #2 · re-eval 1,Nova,antigravity,FAIL_EXECUTION_ERROR_EXTERNAL,False,1,problem,0,0,44,41019,506.044795,True,2026-10-12T18:44:32.539000+05:30,rd72ps9vrhb73fzq9swps73z7x8g5zb5
+Nova #4 · re-eval 1,Nova,antigravity,FAIL_EARLY_TERMINATION,False,1,infra,0,0,51,83488,406.957938,True,2026-10-12T18:44:32.539000+05:30,rd7ae0mhjfwt5736g34mg9kmk98g54tp
+Nova #3 · re-eval 1,Nova,antigravity,FAIL_MISSED_REQUIREMENT,False,1,agent,4,644,478,371169,529.985653,False,2026-10-12T18:44:32.539000+05:30,rd73nfvytkq8jxwvqbx3tat88h8g5r7w
+Nova #2 · re-eval 1,Nova,antigravity,FAIL_MISSED_REQUIREMENT,False,1,agent,5,696,371,292726,635.90446,False,2026-10-12T18:44:32.539000+05:30,rd77efx3kw23kqvd54vwpskh5s8g45db
+Nova #1 · re-eval 1,Nova,antigravity,,False,1,infra,,,490,328122,319.945326,,2026-10-12T18:44:32.539000+05:30,rd79je2h8jyq8g7ccc1srzw90d8g4d33
+Nova #1 · re-eval 1,Nova,antigravity,FAIL_REGRESSION,False,1,agent,4,944,233,315508,1466.712978,False,2026-10-12T18:44:32.539000+05:30,rd71zw6m47agncw0bg972t0d2h8g5rhh
+Orion #9 · re-eval 1,Orion,codex_cli,PASS_LEGITIMATE,False,1,pass,4,773,52,88269,437.8364,True,2026-10-12T18:56:09.219000+05:30,rd78px84nmxfs5t2qxgabjpxmh8g4cx0
+Nova #4 · re-eval 1,Nova,antigravity,,False,1,infra,,,428,371352,262.842485,,2026-10-12T18:56:09.219000+05:30,rd79tq4gsanxw4hxy34s46gyzh8g43my
+Nova #1 · re-eval 1,Nova,antigravity,FAIL_MISSED_REQUIREMENT,False,1,agent,4,855,490,328122,578.835582,False,2026-10-12T18:56:09.219000+05:30,rd7e4ndfnxaqhfp0wyz7zzg45h8g55jp
+Nova #4 · re-eval 1,Nova,antigravity,FAIL_MISSED_REQUIREMENT,False,1,agent,5,730,428,371352,629.235034,False,2026-10-12T19:13:15.754000+05:30,rd7dek0cfyps7ht3aatcypxt698g4y5g

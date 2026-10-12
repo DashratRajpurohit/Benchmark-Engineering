@@ -1,0 +1,2157 @@
+diff --git a/cache_exit_697813_test.go b/cache_exit_697813_test.go
+new file mode 100644
+index 0000000..5c6af95
+--- /dev/null
++++ b/cache_exit_697813_test.go
+@@ -0,0 +1,1850 @@
++//go:build exitcallbacks
++
++/*
++ * SPDX-FileCopyrightText: © 2017-2025 Istari Digital, Inc.
++ * SPDX-License-Identifier: Apache-2.0
++ */
++
++package ristretto
++
++import (
++	"runtime"
++	"strings"
++	"sync"
++	"sync/atomic"
++	"testing"
++	"time"
++
++	"github.com/stretchr/testify/require"
++)
++
++// parkedValue is the value of an item that is deliberately too costly to
++// admit; its rejection is used to hold the cache's background worker still.
++const parkedValue = -1
++
++// exitLog records every value handed to OnExit.
++type exitLog struct {
++	mu     sync.Mutex
++	counts map[int]int
++}
++
++func newExitLog() *exitLog { return &exitLog{counts: map[int]int{}} }
++
++func (l *exitLog) record(v int) {
++	l.mu.Lock()
++	l.counts[v]++
++	l.mu.Unlock()
++}
++
++func (l *exitLog) snapshot() map[int]int {
++	l.mu.Lock()
++	defer l.mu.Unlock()
++	out := make(map[int]int, len(l.counts))
++	for v, n := range l.counts {
++		out[v] = n
++	}
++	return out
++}
++
++// parkOnFirst returns a callback that, on its first invocation, closes parked
++// and then blocks until release is closed. Cache callbacks run on the cache's
++// background worker, so this holds that worker at a known point.
++func parkOnFirst(parked, release chan struct{}) func(*Item[int]) {
++	var once sync.Once
++	return func(*Item[int]) {
++		once.Do(func() {
++			close(parked)
++			select {
++			case <-release:
++			case <-time.After(10 * time.Second):
++			}
++		})
++	}
++}
++
++// holdWorker parks the background worker on each over-capacity item
++// (parkedValue) in turn, like parkInTurn. On every other rejection it lets
++// other goroutines run for a moment before the worker goes on, so calls
++// waiting for room in a full write buffer get to take their next step while
++// the worker is still busy.
++func holdWorker(parked, release []chan struct{}) func(*Item[int]) {
++	park := parkInTurn(parked, release)
++	return func(it *Item[int]) {
++		if it.Value == parkedValue {
++			park(it)
++			return
++		}
++		for i := 0; i < 100; i++ {
++			runtime.Gosched()
++		}
++	}
++}
++
++// holds is how many times the full-buffer tests hold the background worker.
++const holds = 5
++
++func newHolds() (parked, release []chan struct{}) {
++	for i := 0; i < holds; i++ {
++		parked = append(parked, make(chan struct{}))
++		release = append(release, make(chan struct{}))
++	}
++	return parked, release
++}
++
++// releaseHolds lets the worker go one hold at a time, each time only once the
++// calls counted in returned have settled. A cleanup tick is due by the first
++// release (see expiringKey), so whenever the worker picks it up a call is
++// waiting on the cache; a cache that deadlocks then never reaches the next
++// hold, which fails the test.
++func releaseHolds(t *testing.T, c *Cache[uint64, int], parked, release []chan struct{}, returned *int64, total int64) {
++	t.Helper()
++	for i := range release {
++		waitForCallsToSettle(returned, total)
++		if i == 0 {
++			waitExpired(t, c)
++		}
++		close(release[i])
++		if i+1 < len(parked) {
++			waitClosed(t, parked[i+1], "the background worker to reach the next hold")
++		}
++	}
++}
++
++// parkInTurn returns a callback that, on its i-th invocation, closes
++// parked[i] and then blocks until release[i] is closed.
++func parkInTurn(parked, release []chan struct{}) func(*Item[int]) {
++	var n int32
++	return func(*Item[int]) {
++		i := int(atomic.AddInt32(&n, 1)) - 1
++		if i >= len(parked) {
++			return
++		}
++		close(parked[i])
++		select {
++		case <-release[i]:
++		case <-time.After(10 * time.Second):
++		}
++	}
++}
++
++func waitClosed(t *testing.T, ch <-chan struct{}, what string) {
++	t.Helper()
++	select {
++	case <-ch:
++	case <-time.After(10 * time.Second):
++		t.Fatalf("timed out waiting for %s", what)
++	}
++}
++
++// waitForCallsToSettle waits until all total calls counted in returned have
++// returned, or until none has returned for a short while. Calls that are still
++// running by then are waiting on the cache. This only makes the interleaving a
++// test is after likely; the assertions that follow it hold for every
++// interleaving, and a cache that never lets the calls finish fails them.
++func waitForCallsToSettle(returned *int64, total int64) {
++	const quiet = 100 * time.Millisecond
++	tick := time.NewTicker(time.Millisecond)
++	defer tick.Stop()
++	deadline := time.After(5 * time.Second)
++	last, since := atomic.LoadInt64(returned), time.Now()
++	for {
++		n := atomic.LoadInt64(returned)
++		if n == total {
++			return
++		}
++		if n != last {
++			last, since = n, time.Now()
++		} else if time.Since(since) >= quiet {
++			return
++		}
++		select {
++		case <-tick.C:
++		case <-deadline:
++			return
++		}
++	}
++}
++
++func newExitTestCache(t *testing.T, cfg Config[uint64, int]) *Cache[uint64, int] {
++	t.Helper()
++	cfg.NumCounters = 1000
++	cfg.BufferItems = 64
++	cfg.IgnoreInternalCost = true
++	if cfg.MaxCost == 0 {
++		cfg.MaxCost = 100
++	}
++	if cfg.ShouldUpdate == nil {
++		cfg.ShouldUpdate = func(cur, prev int) bool { return false }
++	}
++	c, err := NewCache(&cfg)
++	require.NoError(t, err)
++	return c
++}
++
++func TestRejectedUpdateKeepsRemainingCost(t *testing.T) {
++	c := newExitTestCache(t, Config[uint64, int]{})
++	defer c.Close()
++
++	require.True(t, c.Set(1, 111, 10))
++	c.Wait()
++	require.Equal(t, int64(90), c.RemainingCost())
++
++	c.Set(1, 222, 90)
++	c.Wait()
++	require.Equal(t, int64(90), c.RemainingCost(), "rejected update with a larger cost")
++
++	c.Set(1, 333, 1)
++	c.Wait()
++	require.Equal(t, int64(90), c.RemainingCost(), "rejected update with a smaller cost")
++}
++
++func TestRejectedUpdateKeepsRemainingCostWithCostFunction(t *testing.T) {
++	c := newExitTestCache(t, Config[uint64, int]{
++		Cost: func(v int) int64 { return int64(v) },
++	})
++	defer c.Close()
++
++	require.True(t, c.Set(1, 10, 0))
++	c.Wait()
++	require.Equal(t, int64(90), c.RemainingCost())
++
++	c.Set(1, 60, 0)
++	c.Wait()
++	require.Equal(t, int64(90), c.RemainingCost())
++}
++
++func TestRejectedUpdateFiresNoCallbacks(t *testing.T) {
++	var rejects int64
++	log := newExitLog()
++	c := newExitTestCache(t, Config[uint64, int]{
++		OnReject: func(*Item[int]) { atomic.AddInt64(&rejects, 1) },
++		OnExit:   log.record,
++	})
++	defer c.Close()
++
++	require.True(t, c.Set(1, 111, 10))
++	c.Wait()
++
++	for i := 0; i < 5; i++ {
++		c.Set(1, 200+i, int64(20+i))
++	}
++	c.Wait()
++
++	require.Zero(t, atomic.LoadInt64(&rejects), "OnReject for a value ShouldUpdate declined")
++	require.Empty(t, log.snapshot(), "OnExit for a value ShouldUpdate declined")
++}
++
++func TestShouldUpdateMonotonicSequence(t *testing.T) {
++	var rejects int64
++	log := newExitLog()
++	c := newExitTestCache(t, Config[uint64, int]{
++		ShouldUpdate: func(cur, prev int) bool { return cur > prev },
++		OnReject:     func(*Item[int]) { atomic.AddInt64(&rejects, 1) },
++		OnExit:       log.record,
++	})
++	defer c.Close()
++
++	steps := []struct {
++		value         int
++		cost          int64
++		wantValue     int
++		wantRemaining int64
++	}{
++		{value: 5, cost: 10, wantValue: 5, wantRemaining: 90},
++		{value: 3, cost: 70, wantValue: 5, wantRemaining: 90},
++		{value: 8, cost: 20, wantValue: 8, wantRemaining: 80},
++		{value: 7, cost: 50, wantValue: 8, wantRemaining: 80},
++	}
++	for _, s := range steps {
++		c.Set(1, s.value, s.cost)
++		c.Wait()
++		v, ok := c.Get(1)
++		require.True(t, ok)
++		require.Equal(t, s.wantValue, v, "after Set(%d, cost %d)", s.value, s.cost)
++		require.Equal(t, s.wantRemaining, c.RemainingCost(), "after Set(%d, cost %d)", s.value, s.cost)
++	}
++	require.Zero(t, atomic.LoadInt64(&rejects))
++	require.Equal(t, map[int]int{5: 1}, log.snapshot())
++}
++
++func TestRejectedUpdatesUnderConcurrencyKeepRemainingCost(t *testing.T) {
++	c := newExitTestCache(t, Config[uint64, int]{})
++	defer c.Close()
++
++	require.True(t, c.Set(1, 111, 10))
++	c.Wait()
++
++	var wg sync.WaitGroup
++	for g := 0; g < 8; g++ {
++		wg.Add(1)
++		go func(g int) {
++			defer wg.Done()
++			for i := 0; i < 200; i++ {
++				c.Set(1, 1000+g*1000+i, int64(11+(g+i)%80))
++				c.Get(1)
++			}
++		}(g)
++	}
++	wg.Wait()
++	c.Wait()
++
++	require.Equal(t, int64(90), c.RemainingCost())
++	v, ok := c.Get(1)
++	require.True(t, ok)
++	require.Equal(t, 111, v)
++}
++
++// Sets issued while Sets waiting ahead of them have filled the cache's write
++// buffer may wait for room, but they must all complete once the background
++// worker is free again. An update of a stored key is never dropped: its value
++// is the one that remains, and RemainingCost() must reflect its cost. A Set of
++// a key whose own first Set is still waiting may be dropped (Set returns
++// false), and then nothing changes; otherwise the same holds for it.
++func TestAcceptedUpdateWithFullWriteBufferChargesItsCost(t *testing.T) {
++	const keys = 32
++	const stored = keys / 2
++	parked, release := newHolds()
++	c := newExitTestCache(t, Config[uint64, int]{
++		ShouldUpdate:           alwaysReplace,
++		OnReject:               holdWorker(parked, release),
++		TtlTickerDurationInSec: 1,
++	})
++
++	for k := uint64(1); k <= stored; k++ {
++		require.True(t, c.Set(k, int(k), 1))
++	}
++	require.True(t, c.SetWithTTL(expiringKey, expiringValue, 0, expiringTTL))
++	c.Wait()
++	for i := uint64(0); i < holds; i++ {
++		c.Set(90+i, parkedValue, 101)
++	}
++	waitClosed(t, parked[0], "the background worker to report the over-capacity item")
++	for k := uint64(stored + 1); k <= keys; k++ {
++		require.True(t, c.Set(k, int(k), 1))
++	}
++	fillWriteBuffer(t, c)
++
++	type result struct {
++		key uint64
++		ok  bool
++	}
++	results := make(chan result, keys)
++	var returned int64
++	for k := uint64(1); k <= keys; k++ {
++		go func(k uint64) {
++			ok := c.Set(k, int(k)*10, 3)
++			atomic.AddInt64(&returned, 1)
++			results <- result{k, ok}
++		}(k)
++	}
++	releaseHolds(t, c, parked, release, &returned, keys)
++	accepted := make(map[uint64]bool, keys)
++	for k := 0; k < keys; k++ {
++		select {
++		case r := <-results:
++			accepted[r.key] = r.ok
++			require.True(t, r.ok || r.key > stored, "update of stored key %d was dropped", r.key)
++		case <-time.After(10 * time.Second):
++			t.Fatal("timed out waiting for the Sets to complete")
++		}
++	}
++	waitApplied(t, c)
++
++	var cost int64
++	for k := uint64(1); k <= keys; k++ {
++		want, wantCost := int(k), int64(1)
++		if accepted[k] {
++			want, wantCost = int(k)*10, 3
++		}
++		v, ok := c.Get(k)
++		require.True(t, ok, "key %d", k)
++		require.Equal(t, want, v, "key %d", k)
++		cost += wantCost
++	}
++	require.Equal(t, 100-cost, c.RemainingCost())
++	c.Close()
++}
++
++// An update of a stored key is not dropped when the write buffer is full,
++// also while a later Set of that key is still waiting to be applied, and it
++// still takes effect after that Set.
++func TestUpdateBehindPendingSetWithFullWriteBufferIsKept(t *testing.T) {
++	c, _, log, parked, release := orderTestCache(t, alwaysReplace)
++	defer c.Close()
++
++	c.Set(1, 10, 10)
++	c.Set(97, parkedValue, 101)
++	c.Set(1, 20, 20)
++	close(release[0])
++	// 10 is stored; 20 is still buffered when 30 is issued.
++	waitClosed(t, parked[1], "the background worker to report the second over-capacity item")
++	fillWriteBuffer(t, c)
++	require.True(t, c.Set(1, 30, 30))
++	close(release[1])
++	waitApplied(t, c)
++
++	v, ok := c.Get(1)
++	require.True(t, ok)
++	require.Equal(t, 30, v)
++	require.Equal(t, int64(70), c.RemainingCost())
++	got := log.snapshot()
++	for v := range got {
++		if v >= 1000 {
++			delete(got, v) // the buffer filler
++		}
++	}
++	require.Equal(t, map[int]int{10: 1, 20: 1, parkedValue: 2}, got)
++}
++
++// Dels issued while Sets waiting ahead of them have filled the cache's
++// write buffer may wait for room, but each must still remove its value and
++// report it to OnExit exactly once, whether the value was stored or its Set
++// was still waiting.
++func TestDelWithFullWriteBufferReportsEachValueOnce(t *testing.T) {
++	const keys = 64
++	const stored = keys / 2
++	parked, release := newHolds()
++	log := newExitLog()
++	c := newExitTestCache(t, Config[uint64, int]{
++		OnReject:               holdWorker(parked, release),
++		OnExit:                 log.record,
++		TtlTickerDurationInSec: 1,
++	})
++
++	for k := uint64(1); k <= stored; k++ {
++		require.True(t, c.Set(k, int(k)*10, 1))
++	}
++	require.True(t, c.SetWithTTL(expiringKey, expiringValue, 0, expiringTTL))
++	c.Wait()
++	for i := uint64(0); i < holds; i++ {
++		c.Set(90+i, parkedValue, 101)
++	}
++	waitClosed(t, parked[0], "the background worker to report the over-capacity item")
++	for k := uint64(stored + 1); k <= keys; k++ {
++		require.True(t, c.Set(k, int(k)*10, 1))
++	}
++	fillWriteBuffer(t, c)
++
++	deleted := make(chan struct{}, keys)
++	var returned int64
++	for k := uint64(1); k <= keys; k++ {
++		go func(k uint64) {
++			c.Del(k)
++			atomic.AddInt64(&returned, 1)
++			deleted <- struct{}{}
++		}(k)
++	}
++	releaseHolds(t, c, parked, release, &returned, keys)
++	for k := 0; k < keys; k++ {
++		select {
++		case <-deleted:
++		case <-time.After(10 * time.Second):
++			t.Fatal("timed out waiting for the Dels to complete")
++		}
++	}
++	waitApplied(t, c)
++
++	want := map[int]int{parkedValue: holds}
++	for k := uint64(1); k <= keys; k++ {
++		_, ok := c.Get(k)
++		require.False(t, ok, "key %d", k)
++		want[int(k)*10] = 1
++	}
++	got := log.snapshot()
++	for v := range got {
++		if v >= 1000 || v == expiringValue {
++			delete(got, v) // the buffer filler and the expiring entry
++		}
++	}
++	require.Equal(t, want, got)
++	require.Equal(t, int64(100), c.RemainingCost())
++	c.Close()
++}
++
++// expiringKey is stored with expiringTTL, which is longer than one TTL
++// cleanup tick (TtlTickerDurationInSec: 1 ticks every 500ms). Waiting for it
++// to expire while the worker is held makes sure a cleanup is due as soon as
++// the worker resumes, alongside the operations waiting for it.
++const (
++	expiringKey   = uint64(77)
++	expiringValue = 7
++	expiringTTL   = 600 * time.Millisecond
++)
++
++func waitExpired(t *testing.T, c *Cache[uint64, int]) {
++	t.Helper()
++	tick := time.NewTicker(10 * time.Millisecond)
++	defer tick.Stop()
++	deadline := time.After(10 * time.Second)
++	for {
++		if _, ok := c.Get(expiringKey); !ok {
++			return
++		}
++		select {
++		case <-tick.C:
++		case <-deadline:
++			t.Fatal("timed out waiting for the expiring entry to expire")
++		}
++	}
++}
++
++// fillWriteBuffer keeps adding over-capacity items, which the parked worker
++// will reject, until the cache starts dropping Sets.
++func fillWriteBuffer(t *testing.T, c *Cache[uint64, int]) {
++	t.Helper()
++	filled := make(chan struct{})
++	go func() {
++		defer close(filled)
++		for k := uint64(1000); k < 1000+1<<20 && c.Set(k, int(k), 101); k++ {
++		}
++	}()
++	waitClosed(t, filled, "a Set to be dropped")
++}
++
++// waitApplied is Wait with a deadline, so a cache that stops making progress
++// fails the test instead of hanging it.
++func waitApplied(t *testing.T, c *Cache[uint64, int]) {
++	t.Helper()
++	done := make(chan struct{})
++	go func() { c.Wait(); close(done) }()
++	waitClosed(t, done, "the buffered writes to be applied")
++}
++
++// SQ scenario: a pending Set whose own admission later fails must still be
++// the value the next pending Set is decided against, so ShouldUpdate cannot
++// be bypassed just because an earlier link in the chain never gets stored.
++func TestRejectedPendingValueGatesNextSet(t *testing.T) {
++	parked, release := make(chan struct{}), make(chan struct{})
++	park := parkOnFirst(parked, release)
++	log := newExitLog()
++	c := newExitTestCache(t, Config[uint64, int]{
++		ShouldUpdate: func(cur, prev int) bool { return false },
++		OnReject:     park,
++		OnExit:       log.record,
++	})
++	defer c.Close()
++
++	c.Set(99, parkedValue, 101)
++	waitClosed(t, parked, "the background worker to report the over-capacity item")
++
++	c.Set(1, 10, 101)
++	c.Set(1, 20, 1)
++	close(release)
++	c.Wait()
++
++	_, ok := c.Get(1)
++	require.False(t, ok, "neither pending value should have been admitted")
++	require.Equal(t, int64(100), c.RemainingCost())
++	require.Zero(t, log.snapshot()[20], "20 must never be charged or stored")
++}
++
++// The other direction: when ShouldUpdate accepts a Set of a key whose first
++// Set is still pending and is too costly to admit, the accepted value is the
++// one that remains, also when a Del was issued between the two Sets.
++func TestAcceptedSetAfterRejectedPendingValueIsStored(t *testing.T) {
++	parked, release := make(chan struct{}), make(chan struct{})
++	park := parkOnFirst(parked, release)
++	log := newExitLog()
++	var mu sync.Mutex
++	var rejected []int
++	c := newExitTestCache(t, Config[uint64, int]{
++		ShouldUpdate: alwaysReplace,
++		OnReject: func(it *Item[int]) {
++			mu.Lock()
++			rejected = append(rejected, it.Value)
++			mu.Unlock()
++			park(it)
++		},
++		OnExit: log.record,
++	})
++	defer c.Close()
++
++	c.Set(99, parkedValue, 101)
++	waitClosed(t, parked, "the background worker to report the over-capacity item")
++
++	c.Set(1, 10, 101)
++	c.Set(1, 5, 1)
++	c.Set(2, 20, 101)
++	c.Del(2)
++	c.Set(2, 6, 1)
++	close(release)
++	c.Wait()
++
++	v, ok := c.Get(1)
++	require.True(t, ok)
++	require.Equal(t, 5, v)
++	v, ok = c.Get(2)
++	require.True(t, ok)
++	require.Equal(t, 6, v)
++	require.Equal(t, int64(98), c.RemainingCost())
++	mu.Lock()
++	require.NotContains(t, rejected, 5)
++	require.NotContains(t, rejected, 6)
++	mu.Unlock()
++	require.Equal(t, map[int]int{parkedValue: 1, 10: 1, 20: 1}, log.snapshot())
++}
++
++func TestDelReportsRemovedValueOnce(t *testing.T) {
++	log := newExitLog()
++	c := newExitTestCache(t, Config[uint64, int]{OnExit: log.record})
++	defer c.Close()
++
++	require.True(t, c.Set(1, 42, 10))
++	// A stored zero value is removed and reported like any other value.
++	require.True(t, c.Set(2, 0, 10))
++	c.Wait()
++
++	c.Del(1)
++	c.Del(2)
++	c.Wait()
++
++	_, ok := c.Get(1)
++	require.False(t, ok)
++	_, ok = c.Get(2)
++	require.False(t, ok)
++	require.Equal(t, map[int]int{42: 1, 0: 1}, log.snapshot())
++}
++
++func TestDelOfMissingKeyReportsNothing(t *testing.T) {
++	log := newExitLog()
++	c := newExitTestCache(t, Config[uint64, int]{OnExit: log.record})
++	defer c.Close()
++
++	c.Del(1)
++	c.Wait()
++	require.Empty(t, log.snapshot(), "Del of a key that was never stored")
++
++	require.True(t, c.Set(2, 22, 1))
++	c.Wait()
++	c.Del(2)
++	c.Wait()
++	c.Del(2)
++	c.Wait()
++	require.Equal(t, map[int]int{22: 1}, log.snapshot(), "second Del of an already removed key")
++}
++
++func TestDelWhileSetIsBufferedReportsOnce(t *testing.T) {
++	parked, release := make(chan struct{}), make(chan struct{})
++	log := newExitLog()
++	c := newExitTestCache(t, Config[uint64, int]{
++		OnReject: parkOnFirst(parked, release),
++		OnExit:   log.record,
++	})
++	defer c.Close()
++
++	c.Set(99, parkedValue, 101)
++	waitClosed(t, parked, "the background worker to report the over-capacity item")
++
++	c.Set(1, 7, 1)
++	c.Del(1)
++	// By the time this second Del is applied, the key is no longer stored.
++	c.Del(1)
++	close(release)
++	c.Wait()
++
++	_, ok := c.Get(1)
++	require.False(t, ok)
++	require.Equal(t, map[int]int{7: 1, parkedValue: 1}, log.snapshot())
++}
++
++func TestConcurrentSetDelReportEachValueOnce(t *testing.T) {
++	const goroutines, perGoroutine = 8, 200
++	log := newExitLog()
++	c := newExitTestCache(t, Config[uint64, int]{
++		MaxCost: 1 << 20,
++		OnExit:  log.record,
++	})
++	defer c.Close()
++
++	var wg sync.WaitGroup
++	for g := 0; g < goroutines; g++ {
++		wg.Add(1)
++		go func(g int) {
++			defer wg.Done()
++			for i := 0; i < perGoroutine; i++ {
++				k := uint64(g*perGoroutine + i + 1)
++				c.Set(k, int(k)*10+1, 1)
++				c.Del(k)
++			}
++		}(g)
++	}
++	wg.Wait()
++	c.Wait()
++
++	want := make(map[int]int, goroutines*perGoroutine)
++	for k := 1; k <= goroutines*perGoroutine; k++ {
++		want[k*10+1] = 1
++	}
++	require.Equal(t, want, log.snapshot())
++}
++
++func TestDelDuringEvictionReportsOnce(t *testing.T) {
++	parked, release := make(chan struct{}), make(chan struct{})
++	log := newExitLog()
++	c := newExitTestCache(t, Config[uint64, int]{
++		MaxCost: 10,
++		OnEvict: parkOnFirst(parked, release),
++		OnExit:  log.record,
++	})
++	defer c.Close()
++
++	require.True(t, c.Set(1, 11, 5))
++	require.True(t, c.Set(2, 22, 5))
++	c.Wait()
++
++	// Admitting key 3 needs the whole capacity, so both stored keys are
++	// evicted; the worker parks while reporting the first of them.
++	c.Set(3, 33, 10)
++	waitClosed(t, parked, "the first eviction report")
++
++	c.Del(1)
++	c.Del(2)
++	close(release)
++	c.Wait()
++
++	require.Equal(t, map[int]int{11: 1, 22: 1}, log.snapshot())
++	v, ok := c.Get(3)
++	require.True(t, ok)
++	require.Equal(t, 33, v)
++}
++
++func TestDelDuringExpiryCleanupReportsOnce(t *testing.T) {
++	const numKeys = 8
++	parked, release := make(chan struct{}), make(chan struct{})
++	park := parkOnFirst(parked, release)
++	log := newExitLog()
++	rec := &itemRecorder{}
++	c := newExitTestCache(t, Config[uint64, int]{
++		MaxCost:                1000,
++		TtlTickerDurationInSec: 1,
++		OnEvict: func(it *Item[int]) {
++			rec.record(it)
++			park(it)
++		},
++		OnExit: log.record,
++	})
++	defer c.Close()
++
++	const ttl = time.Millisecond
++	before := time.Now()
++	for k := 1; k <= numKeys; k++ {
++		require.True(t, c.SetWithTTL(uint64(k), k*10+1, int64(k), ttl))
++	}
++	after := time.Now()
++	c.Wait()
++
++	// The worker parks while reporting the first expired key, with the rest
++	// of that expiry batch not yet processed.
++	waitClosed(t, parked, "the first expiry report")
++	for k := 1; k <= numKeys; k++ {
++		c.Del(uint64(k))
++	}
++	close(release)
++	c.Wait()
++
++	want := make(map[int]int, numKeys)
++	for k := 1; k <= numKeys; k++ {
++		want[k*10+1] = 1
++	}
++	require.Equal(t, want, log.snapshot())
++
++	// Whatever expiry reported carries the entry's own Cost and Expiration.
++	var expired []storedEntry
++	for v := range rec.byValue(t) {
++		expired = append(expired, storedEntry{v, int64(v / 10), ttl})
++	}
++	require.NotEmpty(t, expired)
++	requireReported(t, rec.byValue(t), expired, before, after)
++}
++
++func TestDelDuringClearReportsOnce(t *testing.T) {
++	const numKeys = 16
++	parked, release := make(chan struct{}), make(chan struct{})
++	log := newExitLog()
++	c := newExitTestCache(t, Config[uint64, int]{
++		OnReject: parkOnFirst(parked, release),
++		OnExit:   log.record,
++	})
++	defer c.Close()
++
++	for k := 1; k <= numKeys; k++ {
++		require.True(t, c.Set(uint64(k), k*10+1, 1))
++	}
++	c.Wait()
++
++	c.Set(99, parkedValue, 101)
++	waitClosed(t, parked, "the background worker to report the over-capacity item")
++
++	for k := 1; k <= numKeys; k++ {
++		c.Del(uint64(k))
++	}
++	cleared := make(chan struct{})
++	var returned int64
++	go func() {
++		c.Clear()
++		atomic.AddInt64(&returned, 1)
++		close(cleared)
++	}()
++	waitForCallsToSettle(&returned, 1)
++	close(release)
++	waitClosed(t, cleared, "Clear to return")
++	c.Wait()
++
++	want := map[int]int{parkedValue: 1}
++	for k := 1; k <= numKeys; k++ {
++		want[k*10+1] = 1
++	}
++	require.Equal(t, want, log.snapshot())
++}
++
++func TestRepeatSetBeforeApplyIsAnUpdate(t *testing.T) {
++	parked, release := make(chan struct{}), make(chan struct{})
++	var rejects int64
++	park := parkOnFirst(parked, release)
++	log := newExitLog()
++	c := newExitTestCache(t, Config[uint64, int]{
++		ShouldUpdate: func(cur, prev int) bool { return true },
++		OnReject: func(it *Item[int]) {
++			if it.Value != parkedValue {
++				atomic.AddInt64(&rejects, 1)
++			}
++			park(it)
++		},
++		OnExit: log.record,
++	})
++	defer c.Close()
++
++	c.Set(99, parkedValue, 101)
++	waitClosed(t, parked, "the background worker to report the over-capacity item")
++
++	c.Set(1, 10, 10)
++	c.Set(1, 20, 40)
++	close(release)
++	c.Wait()
++
++	v, ok := c.Get(1)
++	require.True(t, ok)
++	require.Equal(t, 20, v)
++	require.Equal(t, int64(60), c.RemainingCost())
++	require.Zero(t, atomic.LoadInt64(&rejects))
++	require.Equal(t, map[int]int{10: 1, parkedValue: 1}, log.snapshot())
++}
++
++func TestRepeatSetBeforeApplyRespectsShouldUpdate(t *testing.T) {
++	parked, release := make(chan struct{}), make(chan struct{})
++	var rejects int64
++	park := parkOnFirst(parked, release)
++	log := newExitLog()
++	c := newExitTestCache(t, Config[uint64, int]{
++		ShouldUpdate: func(cur, prev int) bool { return cur > prev },
++		OnReject: func(it *Item[int]) {
++			if it.Value != parkedValue {
++				atomic.AddInt64(&rejects, 1)
++			}
++			park(it)
++		},
++		OnExit: log.record,
++	})
++	defer c.Close()
++
++	c.Set(99, parkedValue, 101)
++	waitClosed(t, parked, "the background worker to report the over-capacity item")
++
++	c.Set(1, 10, 10)
++	c.Set(1, 5, 40)
++	close(release)
++	c.Wait()
++
++	v, ok := c.Get(1)
++	require.True(t, ok)
++	require.Equal(t, 10, v)
++	require.Equal(t, int64(90), c.RemainingCost())
++	require.Zero(t, atomic.LoadInt64(&rejects))
++	require.Equal(t, map[int]int{parkedValue: 1}, log.snapshot())
++
++	c.Set(1, 30, 20)
++	c.Wait()
++	v, ok = c.Get(1)
++	require.True(t, ok)
++	require.Equal(t, 30, v)
++	require.Equal(t, int64(80), c.RemainingCost())
++	require.Equal(t, map[int]int{10: 1, parkedValue: 1}, log.snapshot())
++}
++
++// An accepted update of a stored key is the value a later Set of that key is
++// decided against, even while the background worker has not caught up with
++// it yet.
++func TestRepeatUpdateOfStoredKeyBeforeApplyIsAnUpdate(t *testing.T) {
++	parked, release := make(chan struct{}), make(chan struct{})
++	var rejects int64
++	park := parkOnFirst(parked, release)
++	log := newExitLog()
++	c := newExitTestCache(t, Config[uint64, int]{
++		ShouldUpdate: func(cur, prev int) bool { return cur > prev },
++		OnReject: func(it *Item[int]) {
++			if it.Value != parkedValue {
++				atomic.AddInt64(&rejects, 1)
++			}
++			park(it)
++		},
++		OnExit: log.record,
++	})
++	defer c.Close()
++
++	require.True(t, c.Set(1, 10, 10))
++	c.Wait()
++	c.Set(99, parkedValue, 101)
++	waitClosed(t, parked, "the background worker to report the over-capacity item")
++
++	c.Set(1, 20, 20)
++	c.Set(1, 15, 5)
++	c.Set(1, 30, 30)
++	close(release)
++	c.Wait()
++
++	v, ok := c.Get(1)
++	require.True(t, ok)
++	require.Equal(t, 30, v)
++	require.Equal(t, int64(70), c.RemainingCost())
++	require.Zero(t, atomic.LoadInt64(&rejects))
++	require.Equal(t, map[int]int{10: 1, 20: 1, parkedValue: 1}, log.snapshot())
++}
++
++// Keys whose primary hashes collide are still different keys: a pending Set
++// of one is never decided by ShouldUpdate against a pending Set of the
++// other, while a pending Set of the same key still is, neither key's values
++// reach OnReject or OnExit because of the other key, and RemainingCost keeps
++// reflecting the value that stays stored.
++func TestPendingSetsOfKeysSharingAHashAreNotCompared(t *testing.T) {
++	parked, release := make(chan struct{}), make(chan struct{})
++	var once sync.Once
++	var mu sync.Mutex
++	var mixed [][2]any
++	var rejected []any
++	exited := map[any]int{}
++	c, err := NewCache(&Config[string, any]{
++		NumCounters:        1000,
++		MaxCost:            100,
++		BufferItems:        64,
++		IgnoreInternalCost: true,
++		// "a" and "bb" share the primary hash 7 and differ in the conflict hash.
++		KeyToHash: func(key string) (uint64, uint64) {
++			if key == "parked" {
++				return 5, 5
++			}
++			return 7, uint64(len(key))
++		},
++		ShouldUpdate: func(cur, prev any) bool {
++			cv, curIsInt := cur.(int)
++			pv, prevIsInt := prev.(int)
++			if !curIsInt || !prevIsInt {
++				mu.Lock()
++				mixed = append(mixed, [2]any{cur, prev})
++				mu.Unlock()
++				return false
++			}
++			return cv > pv
++		},
++		OnExit: func(v any) {
++			mu.Lock()
++			exited[v]++
++			mu.Unlock()
++		},
++		OnReject: func(it *Item[any]) {
++			mu.Lock()
++			rejected = append(rejected, it.Value)
++			mu.Unlock()
++			if it.Value == "parked" {
++				once.Do(func() {
++					close(parked)
++					select {
++					case <-release:
++					case <-time.After(10 * time.Second):
++					}
++				})
++			}
++		},
++	})
++	require.NoError(t, err)
++	defer c.Close()
++
++	c.Set("parked", "parked", 101)
++	waitClosed(t, parked, "the background worker to report the over-capacity item")
++
++	c.Set("a", 1, 1)
++	c.Set("a", 2, 1)
++	c.Set("bb", "x", 50)
++	close(release)
++	c.Wait()
++
++	v, ok := c.Get("a")
++	require.True(t, ok)
++	require.Equal(t, 2, v)
++	require.Equal(t, int64(99), c.RemainingCost(), "only the value stored for \"a\" is charged")
++	mu.Lock()
++	defer mu.Unlock()
++	require.Empty(t, mixed, "ShouldUpdate compared the values of different keys")
++	// "bb" may be turned away, since the cache keeps one key per primary
++	// hash, but only ever as itself; "a" only loses 1, to its own Set of 2.
++	require.NotContains(t, rejected, 1)
++	require.NotContains(t, rejected, 2)
++	require.Equal(t, 1, exited[1], "1 is replaced by the Set of 2 to the same key")
++	require.Zero(t, exited[2], "2 is still stored")
++	require.LessOrEqual(t, exited["x"], 1)
++}
++
++// A key whose primary hash collides with a stored key is still an item of
++// its own. If the cache accepts two Sets of it while the first is pending,
++// the second is an update of the first: ShouldUpdate decides it against the
++// first value, never against the stored key's value, and a rejected value
++// reaches neither OnReject nor OnExit. The cache may also turn such Sets away
++// as long as the stored key is left as it was.
++func TestRepeatSetOfKeyCollidingWithStoredKeyIsAnUpdate(t *testing.T) {
++	parked, release := make(chan struct{}), make(chan struct{})
++	var once sync.Once
++	var mu sync.Mutex
++	var compared [][2]any
++	var rejected []any
++	exited := map[any]int{}
++	c, err := NewCache(&Config[string, any]{
++		NumCounters:        1000,
++		MaxCost:            100,
++		BufferItems:        64,
++		IgnoreInternalCost: true,
++		// "a" and "bb" share the primary hash 7 and differ in the conflict hash.
++		KeyToHash: func(key string) (uint64, uint64) {
++			if key == "parked" {
++				return 5, 5
++			}
++			return 7, uint64(len(key))
++		},
++		ShouldUpdate: func(cur, prev any) bool {
++			mu.Lock()
++			compared = append(compared, [2]any{cur, prev})
++			mu.Unlock()
++			return false
++		},
++		OnExit: func(v any) {
++			mu.Lock()
++			exited[v]++
++			mu.Unlock()
++		},
++		OnReject: func(it *Item[any]) {
++			if it.Value == "parked" {
++				once.Do(func() {
++					close(parked)
++					select {
++					case <-release:
++					case <-time.After(10 * time.Second):
++					}
++				})
++				return
++			}
++			mu.Lock()
++			rejected = append(rejected, it.Value)
++			mu.Unlock()
++		},
++	})
++	require.NoError(t, err)
++	defer c.Close()
++
++	require.True(t, c.Set("a", 1, 1))
++	c.Wait()
++	c.Set("parked", "parked", 101)
++	waitClosed(t, parked, "the background worker to report the over-capacity item")
++
++	first := c.Set("bb", 10, 1)
++	second := c.Set("bb", 20, 1)
++	close(release)
++	c.Wait()
++
++	v, ok := c.Get("a")
++	require.True(t, ok)
++	require.Equal(t, 1, v)
++	require.Equal(t, int64(99), c.RemainingCost(), "only the value stored for \"a\" is charged")
++	mu.Lock()
++	defer mu.Unlock()
++	for _, pair := range compared {
++		require.NotContains(t, pair, 1, "ShouldUpdate compared a value of \"bb\" with the stored value of \"a\"")
++	}
++	if first && second {
++		require.Contains(t, compared, [2]any{20, 10}, "the second Set of \"bb\" was not decided against the first")
++		require.NotContains(t, rejected, 20, "a value ShouldUpdate turned down reached OnReject")
++		require.Zero(t, exited[20], "a value ShouldUpdate turned down reached OnExit")
++	}
++}
++
++// collisionLog records what a cache made by newCollidingCache hands to its
++// callbacks.
++type collisionLog struct {
++	mu       sync.Mutex
++	compared [][2]any
++	rejected []any
++	exited   map[any]int
++	evicted  map[any]int
++}
++
++// newCollidingCache returns a cache in which every key but "parked" has the
++// primary hash 7 and its length as the conflict hash, so "a", "bb", "ccc"
++// and so on all collide, with accept as its ShouldUpdate. Setting the over-capacity key "parked" holds the background
++// worker in OnReject until release is closed; parked is closed once it is
++// held.
++func newCollidingCache(t *testing.T, accept func(cur, prev any) bool) (*Cache[string, any], *collisionLog, chan struct{}, chan struct{}) {
++	t.Helper()
++	parked, release := make(chan struct{}), make(chan struct{})
++	log := &collisionLog{exited: map[any]int{}, evicted: map[any]int{}}
++	var once sync.Once
++	c, err := NewCache(&Config[string, any]{
++		NumCounters:        1000,
++		MaxCost:            100,
++		BufferItems:        64,
++		IgnoreInternalCost: true,
++		KeyToHash: func(key string) (uint64, uint64) {
++			if key == "parked" {
++				return 5, 5
++			}
++			return 7, uint64(len(key))
++		},
++		ShouldUpdate: func(cur, prev any) bool {
++			log.mu.Lock()
++			log.compared = append(log.compared, [2]any{cur, prev})
++			log.mu.Unlock()
++			return accept(cur, prev)
++		},
++		OnExit: func(v any) {
++			log.mu.Lock()
++			log.exited[v]++
++			log.mu.Unlock()
++		},
++		OnEvict: func(it *Item[any]) {
++			log.mu.Lock()
++			log.evicted[it.Value]++
++			log.mu.Unlock()
++		},
++		OnReject: func(it *Item[any]) {
++			if it.Value == "parked" {
++				once.Do(func() {
++					close(parked)
++					select {
++					case <-release:
++					case <-time.After(10 * time.Second):
++					}
++				})
++				return
++			}
++			log.mu.Lock()
++			log.rejected = append(log.rejected, it.Value)
++			log.mu.Unlock()
++		},
++	})
++	require.NoError(t, err)
++	return c, log, parked, release
++}
++
++// Pending Sets of one key are decided against each other, also when the
++// Sets of another key sharing their primary hash alternate with them. The
++// values of "a" are below 10 and those of "bb" are not, so a comparison of
++// the two keys shows. As in TestRepeatSetOfKeyCollidingWithStoredKeyIsAnUpdate,
++// the cache may turn the Sets of "bb" away, but only as itself.
++func TestAlternatingPendingSetsOfCollidingKeysAreDecidedPerKey(t *testing.T) {
++	c, log, parked, release := newCollidingCache(t, func(cur, prev any) bool { return false })
++	defer c.Close()
++
++	c.Set("parked", "parked", 101)
++	waitClosed(t, parked, "the background worker to report the over-capacity item")
++	require.True(t, c.Set("a", 1, 1))
++	first := c.Set("bb", 10, 1)
++	c.Set("a", 3, 1)
++	second := c.Set("bb", 30, 1)
++	close(release)
++	c.Wait()
++
++	v, ok := c.Get("a")
++	require.True(t, ok)
++	require.Equal(t, 1, v, "the Set of 3 was not decided against the pending Set of 1")
++	require.Equal(t, int64(99), c.RemainingCost(), "only the value stored for \"a\" is charged")
++	log.mu.Lock()
++	defer log.mu.Unlock()
++	isA := func(v any) bool {
++		n, ok := v.(int)
++		return ok && n < 10
++	}
++	for _, pair := range log.compared {
++		require.Equal(t, isA(pair[0]), isA(pair[1]), "ShouldUpdate compared values of \"a\" and \"bb\": %v", pair)
++	}
++	require.NotContains(t, log.rejected, 1)
++	require.NotContains(t, log.rejected, 3, "a value ShouldUpdate turned down reached OnReject")
++	require.Zero(t, log.exited[3], "a value ShouldUpdate turned down reached OnExit")
++	require.Zero(t, log.exited[1], "1 is still stored")
++	if first && second {
++		require.NotContains(t, log.rejected, 30, "a value ShouldUpdate turned down reached OnReject")
++		require.Zero(t, log.exited[30], "a value ShouldUpdate turned down reached OnExit")
++	}
++}
++
++// A Set of a stored key is decided against the stored value, also while
++// Sets of other keys sharing its primary hash are still pending. A value
++// ShouldUpdate turned down is never reported, not even by a Clear that
++// finds the other Sets still pending.
++func TestRejectedUpdateBesidePendingSetOfCollidingKeyIsNotReported(t *testing.T) {
++	c, log, parked, release := newCollidingCache(t, func(cur, prev any) bool { return false })
++	defer c.Close()
++
++	require.True(t, c.Set("a", 1, 1))
++	c.Wait()
++	c.Set("parked", "parked", 101)
++	waitClosed(t, parked, "the background worker to report the over-capacity item")
++	for _, k := range []string{"bb", "ccc", "dddd", "eeeee"} {
++		c.Set(k, 10, 1)
++	}
++	c.Set("a", 2, 1)
++	v, ok := c.Get("a")
++	require.True(t, ok)
++	require.Equal(t, 1, v, "ShouldUpdate turned the Set of 2 down")
++
++	cleared := make(chan struct{})
++	go func() {
++		c.Clear()
++		close(cleared)
++	}()
++	// Clear cannot finish while the worker is held. Give it a moment to
++	// start waiting for the worker, so that it finds the other Sets still
++	// pending; the assertions below hold however the two interleave.
++	select {
++	case <-cleared:
++	case <-time.After(100 * time.Millisecond):
++	}
++	close(release)
++	waitClosed(t, cleared, "Clear")
++
++	_, ok = c.Get("a")
++	require.False(t, ok, "\"a\" is still cached after Clear")
++	log.mu.Lock()
++	defer log.mu.Unlock()
++	require.NotContains(t, log.rejected, 2, "a value ShouldUpdate turned down reached OnReject")
++	require.Zero(t, log.exited[2], "a value ShouldUpdate turned down reached OnExit")
++	require.Zero(t, log.evicted[2], "a value ShouldUpdate turned down reached OnEvict")
++	require.Equal(t, 1, log.exited[1], "the stored value of \"a\" is reported once")
++}
++
++// A Del of a key that is not present reports nothing, also when the key
++// shares its primary hash with a stored key, and also when a Set of it is
++// still pending. The stored key keeps its value and its cost.
++func TestDelOfKeyCollidingWithStoredKeyLeavesItStored(t *testing.T) {
++	c, log, parked, release := newCollidingCache(t, func(cur, prev any) bool { return true })
++	defer c.Close()
++
++	stays := func(when string) {
++		t.Helper()
++		v, ok := c.Get("a")
++		require.True(t, ok, when)
++		require.Equal(t, 1, v, when)
++		require.Equal(t, int64(90), c.RemainingCost(), "%s: the cost of \"a\" is no longer charged", when)
++		_, ok = c.Get("bb")
++		require.False(t, ok, when)
++	}
++
++	require.True(t, c.Set("a", 1, 10))
++	c.Wait()
++	c.Del("bb")
++	c.Wait()
++	stays("after a Del of \"bb\"")
++
++	c.Set("parked", "parked", 101)
++	waitClosed(t, parked, "the background worker to report the over-capacity item")
++	c.Set("bb", 2, 1)
++	c.Del("bb")
++	close(release)
++	c.Wait()
++	stays("after a Del of \"bb\" behind a pending Set of it")
++
++	log.mu.Lock()
++	defer log.mu.Unlock()
++	require.Zero(t, log.exited[1], "the value of \"a\" was reported")
++	require.Zero(t, log.exited[nil], "OnExit was handed a zero value")
++	require.LessOrEqual(t, log.exited[2], 1, "the value of \"bb\" was reported more than once")
++}
++
++// OnExit may release the value it is handed (see Config.OnExit). An update
++// replaced before the background worker charges its cost must therefore not
++// have the Cost function asked about it afterwards.
++func TestCostIsNotAskedForAReleasedValue(t *testing.T) {
++	parked, release := make(chan struct{}), make(chan struct{})
++	var mu sync.Mutex
++	released := map[int]bool{}
++	var late []int
++	c := newExitTestCache(t, Config[uint64, int]{
++		ShouldUpdate: alwaysReplace,
++		OnReject:     parkOnFirst(parked, release),
++		Cost: func(v int) int64 {
++			mu.Lock()
++			if released[v] {
++				late = append(late, v)
++			}
++			mu.Unlock()
++			return int64(v)
++		},
++		OnExit: func(v int) {
++			mu.Lock()
++			released[v] = true
++			mu.Unlock()
++		},
++	})
++	defer c.Close()
++
++	require.True(t, c.Set(1, 10, 0))
++	c.Wait()
++	c.Set(99, parkedValue, 101)
++	waitClosed(t, parked, "the background worker to report the over-capacity item")
++
++	require.True(t, c.Set(1, 20, 0))
++	require.True(t, c.Set(1, 30, 0))
++	close(release)
++	c.Wait()
++
++	v, ok := c.Get(1)
++	require.True(t, ok)
++	require.Equal(t, 30, v)
++	require.Equal(t, int64(70), c.RemainingCost())
++	mu.Lock()
++	defer mu.Unlock()
++	require.Empty(t, late, "Cost was asked about a value already handed to OnExit")
++}
++
++// Once the cache holds a value, a Set from another goroutine may replace it
++// and OnExit may release it. A value the Cost function is being asked about
++// must not be released while Cost is still using it, whether the cache asks
++// Cost before it stores the value or keeps other writers of the key waiting
++// until Cost returns.
++func TestValueIsNotReleasedWhileCostIsAskedAboutIt(t *testing.T) {
++	var mu sync.Mutex
++	released := map[int]bool{}
++	var late []int
++	overlapped := false
++	other := make(chan struct{})
++	var once sync.Once
++	var c *Cache[uint64, int]
++	c = newExitTestCache(t, Config[uint64, int]{
++		ShouldUpdate: alwaysReplace,
++		Cost: func(v int) int64 {
++			mu.Lock()
++			if released[v] {
++				late = append(late, v)
++			}
++			mu.Unlock()
++			if v == 20 {
++				once.Do(func() {
++					// Another goroutine sets the key while Cost is busy with
++					// 20. Cost goes on only once that Set has returned or is
++					// waiting inside the cache, so a cache that lets it
++					// release 20 now has done so by then.
++					go competingSet(c, other)
++					waitForReturnOrWait(other, "competingSet")
++					mu.Lock()
++					overlapped = released[20]
++					mu.Unlock()
++				})
++			}
++			return int64(v)
++		},
++		OnExit: func(v int) {
++			mu.Lock()
++			released[v] = true
++			mu.Unlock()
++		},
++	})
++	defer c.Close()
++
++	require.True(t, c.Set(1, 10, 5))
++	c.Wait()
++	require.True(t, c.Set(1, 20, 0))
++	waitClosed(t, other, "the other goroutine's Set to return")
++	waitApplied(t, c)
++
++	v, ok := c.Get(1)
++	require.True(t, ok)
++	// Either Set may take effect last.
++	require.Contains(t, []int{20, 30}, v)
++	cost := map[int]int64{20: 20, 30: 5}[v]
++	require.Equal(t, 100-cost, c.RemainingCost())
++	mu.Lock()
++	defer mu.Unlock()
++	require.False(t, overlapped, "20 was handed to OnExit while Cost was asked about it")
++	require.Empty(t, late, "Cost was asked about a value already handed to OnExit")
++	require.True(t, released[10], "10 was replaced")
++	require.Equal(t, v != 20, released[20])
++	require.Equal(t, v != 30, released[30])
++}
++
++// competingSet sets key 1 to 30 and then closes done. It is a named function
++// so waitForReturnOrWait can tell the goroutine running it apart.
++func competingSet(c *Cache[uint64, int], done chan<- struct{}) {
++	c.Set(1, 30, 5)
++	close(done)
++}
++
++// waitForReturnOrWait returns once done is closed, or once the goroutine
++// running fn is parked (on a lock, a channel or the like) in two samples in a
++// row, so it can make no further progress until something else does. The
++// goroutine state is the bracketed status runtime.Stack prints for it. A
++// writer that waits by spinning never parks; after 10 seconds it is taken to
++// be waiting too.
++func waitForReturnOrWait(done <-chan struct{}, fn string) {
++	buf := make([]byte, 1<<20)
++	deadline := time.Now().Add(10 * time.Second)
++	parkedSamples := 0
++	for time.Now().Before(deadline) {
++		select {
++		case <-done:
++			return
++		default:
++		}
++		parked := false
++		for _, g := range strings.Split(string(buf[:runtime.Stack(buf, true)]), "\n\n") {
++			if !strings.Contains(g, "."+fn+"(") {
++				continue
++			}
++			header, _, _ := strings.Cut(g, "\n")
++			_, status, _ := strings.Cut(header, "[")
++			parked = !strings.HasPrefix(status, "running") && !strings.HasPrefix(status, "runnable")
++		}
++		if parked {
++			parkedSamples++
++			if parkedSamples == 2 {
++				return
++			}
++		} else {
++			parkedSamples = 0
++		}
++		runtime.Gosched()
++	}
++}
++
++// clearRounds is how many times TestClearDoesNotAskCostAboutAReportedUpdate
++// repeats its scenario. Whether Clear or the background worker gets to an
++// update left over from a full write buffer first is up to the scheduler; the
++// assertions hold either way, and repeating makes both orders all but certain.
++const clearRounds = 20
++
++// Clear hands every stored value to OnExit, which may release it (see
++// Config.OnExit). An accepted update of a stored key whose cost accounting is
++// still waiting, because the write buffer was full when it was made, must not
++// have the Cost function asked about its value after Clear has reported it.
++func TestClearDoesNotAskCostAboutAReportedUpdate(t *testing.T) {
++	for round := 0; round < clearRounds; round++ {
++		clearWithUpdateCostPending(t, round)
++	}
++}
++
++func clearWithUpdateCostPending(t *testing.T, round int) {
++	t.Helper()
++	parked, release := make(chan struct{}), make(chan struct{})
++	var mu sync.Mutex
++	released := map[int]bool{}
++	var late []int
++	var evicted []Item[int]
++	c := newExitTestCache(t, Config[uint64, int]{
++		ShouldUpdate: alwaysReplace,
++		OnReject:     parkOnFirst(parked, release),
++		Cost: func(v int) int64 {
++			mu.Lock()
++			if released[v] {
++				late = append(late, v)
++			}
++			mu.Unlock()
++			return int64(v)
++		},
++		OnExit: func(v int) {
++			mu.Lock()
++			released[v] = true
++			mu.Unlock()
++		},
++		OnEvict: func(it *Item[int]) {
++			if it.Value == 20 {
++				mu.Lock()
++				evicted = append(evicted, *it)
++				mu.Unlock()
++			}
++		},
++	})
++	defer c.Close()
++
++	require.True(t, c.Set(1, 10, 0))
++	c.Wait()
++	c.Set(99, parkedValue, 101)
++	waitClosed(t, parked, "the background worker to report the over-capacity item")
++	fillWriteBuffer(t, c)
++
++	// The update of stored key 1 does not fit into the write buffer. A cache
++	// may keep its cost accounting for later or make the Set wait for room.
++	updated := make(chan bool, 1)
++	var returned int64
++	go func() {
++		ok := c.Set(1, 20, 0)
++		atomic.AddInt64(&returned, 1)
++		updated <- ok
++	}()
++	waitForCallsToSettle(&returned, 1)
++	waitUpdate := func() {
++		select {
++		case ok := <-updated:
++			require.True(t, ok, "round %d: the update of stored key 1 was dropped", round)
++		case <-time.After(10 * time.Second):
++			t.Fatalf("round %d: timed out waiting for the update of key 1", round)
++		}
++	}
++	cleared := make(chan struct{})
++	if atomic.LoadInt64(&returned) == 1 {
++		// The Set returned with its cost accounting left over: Clear starts
++		// while the background worker is still held.
++		// Clear cannot return while the worker is held, so this only gives
++		// it time to reach the worker before the worker is let go.
++		var clearReturned int64
++		go func() {
++			c.Clear()
++			atomic.AddInt64(&clearReturned, 1)
++			close(cleared)
++		}()
++		waitForCallsToSettle(&clearReturned, 1)
++		close(release)
++		waitUpdate()
++	} else {
++		// The Set waits for room in the write buffer, so it has nothing left
++		// over; Clear runs once it has returned.
++		close(release)
++		waitUpdate()
++		go func() {
++			c.Clear()
++			close(cleared)
++		}()
++	}
++	waitClosed(t, cleared, "Clear to return")
++	waitApplied(t, c)
++
++	_, ok := c.Get(1)
++	require.False(t, ok, "round %d: key 1 was cleared", round)
++	require.Equal(t, int64(100), c.RemainingCost(), "round %d", round)
++	mu.Lock()
++	defer mu.Unlock()
++	require.True(t, released[20], "round %d: Clear reported 20", round)
++	require.Empty(t, late, "round %d: Cost was asked about a value Clear had already handed to OnExit", round)
++	// Clear reports the entry with the cost RemainingCost accounted for it:
++	// 20 once the update has been charged, 10 while its charge is pending.
++	require.Len(t, evicted, 1, "round %d: Clear reports key 1 to OnEvict once", round)
++	require.Contains(t, []int64{10, 20}, evicted[0].Cost, "round %d: cost Clear reported for key 1", round)
++}
++
++// orderTestCache parks the background worker twice, each time on an
++// over-capacity item: first before anything else is applied, then right after
++// the Sets queued ahead of the second over-capacity item.
++func orderTestCache(t *testing.T, shouldUpdate func(cur, prev int) bool) (c *Cache[uint64, int], rejects *int64, log *exitLog, parked, release []chan struct{}) {
++	parked = []chan struct{}{make(chan struct{}), make(chan struct{})}
++	release = []chan struct{}{make(chan struct{}), make(chan struct{})}
++	park := parkInTurn(parked, release)
++	rejects = new(int64)
++	log = newExitLog()
++	c = newExitTestCache(t, Config[uint64, int]{
++		ShouldUpdate: shouldUpdate,
++		OnExit:       log.record,
++		OnReject: func(it *Item[int]) {
++			if it.Value != parkedValue {
++				atomic.AddInt64(rejects, 1)
++				return
++			}
++			park(it)
++		},
++	})
++	c.Set(98, parkedValue, 101)
++	waitClosed(t, parked[0], "the background worker to report the first over-capacity item")
++	return c, rejects, log, parked, release
++}
++
++func alwaysReplace(cur, prev int) bool { return true }
++
++func TestSetsOfOneKeyTakeEffectInIssueOrder(t *testing.T) {
++	c, rejects, _, parked, release := orderTestCache(t, alwaysReplace)
++	defer c.Close()
++
++	c.Set(1, 10, 10)
++	c.Set(97, parkedValue, 101)
++	c.Set(1, 20, 20)
++	close(release[0])
++	// 10 is stored; 20 is still buffered when 30 is issued.
++	waitClosed(t, parked[1], "the background worker to report the second over-capacity item")
++	c.Set(1, 30, 30)
++	close(release[1])
++	c.Wait()
++
++	v, ok := c.Get(1)
++	require.True(t, ok)
++	require.Equal(t, 30, v)
++	require.Equal(t, int64(70), c.RemainingCost())
++	require.Zero(t, atomic.LoadInt64(rejects))
++}
++
++func TestSetsOfOneKeyApplyShouldUpdateInIssueOrder(t *testing.T) {
++	c, rejects, log, parked, release := orderTestCache(t, func(cur, prev int) bool { return cur > prev })
++	defer c.Close()
++
++	c.Set(1, 10, 10)
++	c.Set(97, parkedValue, 101)
++	c.Set(1, 20, 20)
++	close(release[0])
++	// 10 is stored; 20 is still buffered when 15 is issued, so 15 is decided
++	// against 20, not against 10.
++	waitClosed(t, parked[1], "the background worker to report the second over-capacity item")
++	c.Set(1, 15, 15)
++	close(release[1])
++	c.Wait()
++
++	v, ok := c.Get(1)
++	require.True(t, ok)
++	require.Equal(t, 20, v)
++	require.Equal(t, int64(80), c.RemainingCost())
++	require.Zero(t, atomic.LoadInt64(rejects))
++	require.Zero(t, log.snapshot()[15], "OnExit for the declined value")
++}
++
++func TestDelBetweenSetsOfOneKeyKeepsIssueOrder(t *testing.T) {
++	c, rejects, _, parked, release := orderTestCache(t, alwaysReplace)
++	defer c.Close()
++
++	c.Set(1, 10, 10)
++	c.Set(97, parkedValue, 101)
++	c.Del(1)
++	c.Set(1, 20, 20)
++	close(release[0])
++	// 10 is stored; the Del and 20 are still buffered when 30 is issued.
++	waitClosed(t, parked[1], "the background worker to report the second over-capacity item")
++	c.Set(1, 30, 30)
++	close(release[1])
++	c.Wait()
++
++	v, ok := c.Get(1)
++	require.True(t, ok)
++	require.Equal(t, 30, v)
++	require.Equal(t, int64(70), c.RemainingCost())
++	require.Zero(t, atomic.LoadInt64(rejects))
++}
++
++func TestDelAfterBufferedSetOfOneKeyKeepsIssueOrder(t *testing.T) {
++	c, rejects, log, parked, release := orderTestCache(t, func(cur, prev int) bool { return cur > prev })
++	defer c.Close()
++
++	c.Set(1, 10, 10)
++	c.Set(97, parkedValue, 101)
++	c.Set(1, 5, 5)
++	close(release[0])
++	// 10 is stored; 5 is still buffered, and declined against 10, when the
++	// Del is issued.
++	waitClosed(t, parked[1], "the background worker to report the second over-capacity item")
++	c.Del(1)
++	close(release[1])
++	c.Wait()
++
++	_, ok := c.Get(1)
++	require.False(t, ok)
++	require.Equal(t, int64(100), c.RemainingCost())
++	require.Zero(t, atomic.LoadInt64(rejects))
++	got := log.snapshot()
++	require.Equal(t, 1, got[10], "OnExit for the value the Del removed")
++	require.Zero(t, got[5], "OnExit for the declined value")
++}
++
++func TestSetDuringDelOnExitTakesEffectAfterDel(t *testing.T) {
++	entered, release := make(chan struct{}), make(chan struct{})
++	var once sync.Once
++	var rejects int64
++	c := newExitTestCache(t, Config[uint64, int]{
++		OnExit: func(v int) {
++			if v != 10 {
++				return
++			}
++			once.Do(func() {
++				close(entered)
++				select {
++				case <-release:
++				case <-time.After(10 * time.Second):
++				}
++			})
++		},
++		OnReject: func(*Item[int]) { atomic.AddInt64(&rejects, 1) },
++	})
++	defer c.Close()
++
++	require.True(t, c.Set(1, 10, 10))
++	c.Wait()
++
++	deleted := make(chan struct{})
++	go func() {
++		c.Del(1)
++		close(deleted)
++	}()
++	// The Del has removed 10 and is still inside OnExit when 20 is issued.
++	waitClosed(t, entered, "OnExit for the deleted value")
++	require.True(t, c.Set(1, 20, 20))
++	close(release)
++	waitClosed(t, deleted, "Del to return")
++	c.Wait()
++
++	v, ok := c.Get(1)
++	require.True(t, ok)
++	require.Equal(t, 20, v)
++	require.Equal(t, int64(80), c.RemainingCost())
++	require.Zero(t, atomic.LoadInt64(&rejects))
++}
++
++// itemRecorder keeps every Item pointer handed to OnEvict.
++type itemRecorder struct {
++	mu    sync.Mutex
++	items []*Item[int]
++}
++
++func (r *itemRecorder) record(it *Item[int]) {
++	r.mu.Lock()
++	r.items = append(r.items, it)
++	r.mu.Unlock()
++}
++
++func (r *itemRecorder) byValue(t *testing.T) map[int]Item[int] {
++	t.Helper()
++	r.mu.Lock()
++	defer r.mu.Unlock()
++	out := make(map[int]Item[int], len(r.items))
++	for _, it := range r.items {
++		out[it.Value] = *it
++	}
++	require.Len(t, out, len(r.items), "every OnEvict call needs its own Item")
++	return out
++}
++
++type storedEntry struct {
++	value int
++	cost  int64
++	ttl   time.Duration
++}
++
++func requireReported(t *testing.T, got map[int]Item[int], want []storedEntry, before, after time.Time) {
++	t.Helper()
++	require.Len(t, got, len(want))
++	for _, e := range want {
++		it, ok := got[e.value]
++		require.True(t, ok, "value %d was not reported", e.value)
++		require.Equal(t, e.cost, it.Cost, "cost of value %d", e.value)
++		if e.ttl == 0 {
++			require.True(t, it.Expiration.IsZero(), "expiration of value %d", e.value)
++			continue
++		}
++		require.False(t, it.Expiration.Before(before.Add(e.ttl)), "expiration of value %d", e.value)
++		require.False(t, it.Expiration.After(after.Add(e.ttl)), "expiration of value %d", e.value)
++	}
++}
++
++func TestClearReportsEachEntryWithItsOwnItem(t *testing.T) {
++	rec := &itemRecorder{}
++	c := newExitTestCache(t, Config[uint64, int]{MaxCost: 1 << 20, OnEvict: rec.record})
++	defer c.Close()
++
++	// Enough entries that many of them share a part of the cache's storage.
++	var entries []storedEntry
++	for i := 0; i < 1024; i++ {
++		entries = append(entries, storedEntry{1000 + i, int64(3 + i%5), time.Duration(i%3) * time.Hour})
++	}
++	before := time.Now()
++	for i, e := range entries {
++		require.True(t, c.SetWithTTL(uint64(i+1), e.value, e.cost, e.ttl))
++	}
++	after := time.Now()
++	c.Wait()
++
++	c.Clear()
++	requireReported(t, rec.byValue(t), entries, before, after)
++}
++
++// An updated entry is reported with the cost of the value it now holds,
++// including a cost computed by the Cost function.
++func TestClearReportsUpdatedEntryWithItsCost(t *testing.T) {
++	rec := &itemRecorder{}
++	c := newExitTestCache(t, Config[uint64, int]{
++		MaxCost:      1000,
++		Cost:         func(v int) int64 { return int64(v) },
++		ShouldUpdate: func(cur, prev int) bool { return true },
++		OnEvict:      rec.record,
++	})
++	defer c.Close()
++
++	require.True(t, c.Set(1, 10, 0))
++	require.True(t, c.Set(2, 20, 7))
++	c.Wait()
++	require.True(t, c.Set(1, 40, 0))
++	require.True(t, c.Set(2, 50, 9))
++	c.Wait()
++
++	c.Clear()
++	requireReported(t, rec.byValue(t), []storedEntry{{40, 40, 0}, {50, 9, 0}}, time.Time{}, time.Time{})
++}
++
++func TestEvictionReportsTheEvictedEntry(t *testing.T) {
++	rec := &itemRecorder{}
++	c := newExitTestCache(t, Config[uint64, int]{MaxCost: 10, OnEvict: rec.record})
++	defer c.Close()
++
++	entries := []storedEntry{{11, 4, time.Hour}, {22, 6, 2 * time.Hour}}
++	before := time.Now()
++	for i, e := range entries {
++		require.True(t, c.SetWithTTL(uint64(i+1), e.value, e.cost, e.ttl))
++	}
++	after := time.Now()
++	c.Wait()
++
++	// Admitting key 3 needs the whole capacity, so both stored keys are evicted.
++	c.Set(3, 33, 10)
++	c.Wait()
++	requireReported(t, rec.byValue(t), entries, before, after)
++}
++
++// With internal cost accounting on, OnEvict still reports the Cost the entry
++// took from RemainingCost(), whether it is removed by Clear or evicted.
++func TestOnEvictReportsCostIncludingInternalCost(t *testing.T) {
++	const maxCost = 1000
++	newCache := func(onEvict func(*Item[int])) *Cache[uint64, int] {
++		c, err := NewCache(&Config[uint64, int]{
++			NumCounters: 1000,
++			MaxCost:     maxCost,
++			BufferItems: 64,
++			OnEvict:     onEvict,
++		})
++		require.NoError(t, err)
++		return c
++	}
++	// setAll sets each entry and returns it with the cost it took.
++	setAll := func(c *Cache[uint64, int], entries []storedEntry) ([]storedEntry, time.Time, time.Time) {
++		var charged []storedEntry
++		before := time.Now()
++		for i, e := range entries {
++			remaining := c.RemainingCost()
++			require.True(t, c.SetWithTTL(uint64(i+1), e.value, e.cost, e.ttl))
++			c.Wait()
++			charged = append(charged, storedEntry{e.value, remaining - c.RemainingCost(), e.ttl})
++		}
++		return charged, before, time.Now()
++	}
++	entries := []storedEntry{{11, 4, time.Hour}, {22, 6, 0}}
++
++	rec := &itemRecorder{}
++	c := newCache(rec.record)
++	charged, before, after := setAll(c, entries)
++	c.Clear()
++	requireReported(t, rec.byValue(t), charged, before, after)
++	c.Close()
++
++	rec = &itemRecorder{}
++	c = newCache(rec.record)
++	charged, before, after = setAll(c, entries)
++	// Admitting key 3 needs the whole capacity, so both stored keys are evicted.
++	internal := charged[0].cost - entries[0].cost
++	c.Set(3, 33, maxCost-internal)
++	c.Wait()
++	requireReported(t, rec.byValue(t), charged, before, after)
++	c.Close()
++}
+diff --git a/cache_update_f4423e_test.go b/cache_update_f4423e_test.go
+new file mode 100644
+index 0000000..e6c3857
+--- /dev/null
++++ b/cache_update_f4423e_test.go
+@@ -0,0 +1,223 @@
++//go:build costleak_base
++
++/*
++ * SPDX-FileCopyrightText: © 2017-2025 Istari Digital, Inc.
++ * SPDX-License-Identifier: Apache-2.0
++ */
++
++package ristretto
++
++import (
++	"sync"
++	"sync/atomic"
++	"testing"
++	"time"
++
++	"github.com/stretchr/testify/require"
++)
++
++func TestShouldUpdateAcceptedUpdateAppliesCostDelta(t *testing.T) {
++	var exits int64
++	c, err := NewCache(&Config[uint64, int]{
++		NumCounters:        1000,
++		MaxCost:            100,
++		BufferItems:        64,
++		IgnoreInternalCost: true,
++		ShouldUpdate:       func(cur, prev int) bool { return true },
++		OnExit:             func(int) { atomic.AddInt64(&exits, 1) },
++	})
++	require.NoError(t, err)
++	defer c.Close()
++
++	require.True(t, c.Set(1, 111, 10))
++	c.Wait()
++	require.Equal(t, int64(90), c.RemainingCost())
++
++	require.True(t, c.Set(1, 222, 40))
++	c.Wait()
++
++	v, ok := c.Get(1)
++	require.True(t, ok)
++	require.Equal(t, 222, v)
++	require.Equal(t, int64(60), c.RemainingCost())
++	require.Equal(t, int64(1), atomic.LoadInt64(&exits))
++}
++
++func TestShouldUpdateRejectedUpdateKeepsValue(t *testing.T) {
++	c, err := NewCache(&Config[uint64, int]{
++		NumCounters:        1000,
++		MaxCost:            100,
++		BufferItems:        64,
++		IgnoreInternalCost: true,
++		ShouldUpdate:       func(cur, prev int) bool { return false },
++	})
++	require.NoError(t, err)
++	defer c.Close()
++
++	require.True(t, c.Set(1, 111, 10))
++	c.Wait()
++
++	c.Set(1, 222, 50)
++	c.Wait()
++
++	v, ok := c.Get(1)
++	require.True(t, ok)
++	require.Equal(t, 111, v)
++}
++
++func TestOverCapacityNewKeyIsRejected(t *testing.T) {
++	var rejects, exits int64
++	c, err := NewCache(&Config[uint64, int]{
++		NumCounters:        1000,
++		MaxCost:            10,
++		BufferItems:        64,
++		IgnoreInternalCost: true,
++		ShouldUpdate:       func(cur, prev int) bool { return false },
++		OnReject:           func(*Item[int]) { atomic.AddInt64(&rejects, 1) },
++		OnExit:             func(int) { atomic.AddInt64(&exits, 1) },
++	})
++	require.NoError(t, err)
++	defer c.Close()
++
++	c.Set(1, 111, 11)
++	c.Wait()
++
++	_, ok := c.Get(1)
++	require.False(t, ok)
++	require.Equal(t, int64(1), atomic.LoadInt64(&rejects))
++	require.Equal(t, int64(1), atomic.LoadInt64(&exits))
++	require.Equal(t, int64(10), c.RemainingCost())
++}
++
++// OnExit may release the value it is handed (see Config.OnExit). A Set that
++// the callback issues for the same key must not be decided by ShouldUpdate
++// against that released value: a Set whose admission was rejected is gone.
++func TestSetFromOnExitIsNotDecidedAgainstReleasedValue(t *testing.T) {
++	var mu sync.Mutex
++	released := map[int]bool{}
++	var compared []int
++	var c *Cache[uint64, int]
++	c, err := NewCache(&Config[uint64, int]{
++		NumCounters:        1000,
++		MaxCost:            100,
++		BufferItems:        64,
++		IgnoreInternalCost: true,
++		ShouldUpdate: func(cur, prev int) bool {
++			mu.Lock()
++			if released[prev] {
++				compared = append(compared, prev)
++			}
++			mu.Unlock()
++			return true
++		},
++		OnExit: func(v int) {
++			mu.Lock()
++			released[v] = true
++			mu.Unlock()
++			if v == 10 {
++				c.Set(1, 20, 1)
++			}
++		},
++	})
++	require.NoError(t, err)
++	defer c.Close()
++
++	// 10 costs more than MaxCost, so it is rejected and handed to OnExit,
++	// which sets the key again.
++	c.Set(1, 10, 101)
++	c.Wait()
++	c.Wait()
++
++	v, ok := c.Get(1)
++	require.True(t, ok)
++	require.Equal(t, 20, v)
++	require.Equal(t, int64(99), c.RemainingCost())
++	mu.Lock()
++	defer mu.Unlock()
++	require.Empty(t, compared, "ShouldUpdate was handed a value already handed to OnExit")
++}
++
++// Clear removes every entry, including the ones whose Set is still in the
++// write buffer, and hands each removed value to OnEvict exactly once. Clear
++// already drains the write buffer and passes each buffered new item to
++// OnEvict before it evicts the stored entries, and that must keep holding.
++func TestClearReportsBufferedSetsToOnEvict(t *testing.T) {
++	const parkedValue = -1
++	parked, release := make(chan struct{}), make(chan struct{})
++	var once sync.Once
++	var mu sync.Mutex
++	evicted := map[int]int{}
++	c, err := NewCache(&Config[uint64, int]{
++		NumCounters:        1000,
++		MaxCost:            1000,
++		BufferItems:        64,
++		IgnoreInternalCost: true,
++		OnEvict: func(it *Item[int]) {
++			mu.Lock()
++			evicted[it.Value]++
++			mu.Unlock()
++		},
++		// The over-capacity item holds the background worker in OnReject,
++		// so the Sets issued meanwhile stay in the write buffer.
++		OnReject: func(it *Item[int]) {
++			if it.Value != parkedValue {
++				return
++			}
++			once.Do(func() {
++				close(parked)
++				select {
++				case <-release:
++				case <-time.After(10 * time.Second):
++				}
++			})
++		},
++	})
++	require.NoError(t, err)
++	defer c.Close()
++
++	require.True(t, c.Set(1, 1, 1))
++	c.Wait()
++	c.Set(99, parkedValue, 1001)
++	select {
++	case <-parked:
++	case <-time.After(10 * time.Second):
++		t.Fatal("timed out waiting for the background worker to report the over-capacity item")
++	}
++	accepted := []int{1}
++	for k := uint64(2); k <= 33; k++ {
++		if c.Set(k, int(k), 1) {
++			accepted = append(accepted, int(k))
++		}
++	}
++
++	cleared := make(chan struct{})
++	go func() {
++		c.Clear()
++		close(cleared)
++	}()
++	// Clear cannot finish while the worker is held. Give it a moment to
++	// start waiting for the worker, so that it finds Sets still buffered;
++	// the assertions below hold however the two interleave.
++	select {
++	case <-cleared:
++	case <-time.After(100 * time.Millisecond):
++	}
++	close(release)
++	select {
++	case <-cleared:
++	case <-time.After(10 * time.Second):
++		t.Fatal("timed out waiting for Clear")
++	}
++
++	for k := uint64(1); k <= 33; k++ {
++		_, ok := c.Get(k)
++		require.False(t, ok, "key %d is still cached after Clear", k)
++	}
++	require.Equal(t, int64(1000), c.RemainingCost())
++	mu.Lock()
++	defer mu.Unlock()
++	for _, v := range accepted {
++		require.Equal(t, 1, evicted[v], "value %d was handed to OnEvict %d times", v, evicted[v])
++	}
++	require.Len(t, evicted, len(accepted))
++}
+diff --git a/test.sh b/test.sh
+new file mode 100755
+index 0000000..c9782b0
+--- /dev/null
++++ b/test.sh
+@@ -0,0 +1,66 @@
++#!/usr/bin/env bash
++# Usage:
++#   ./test.sh [--output_path <junit.xml>] <base|new>
++#
++# base  runs the existing tests of the cache package, the only package this
++#       change touches, plus a small set of regression controls in
++#       cache_update_f4423e_test.go (compiled only with -tags costleak_base) that
++#       already hold on the base commit and must keep holding after any
++#       change. The z, sim and contrib packages are not affected by it and
++#       are left out, so the baseline does not depend on the machine.
++# new   runs the callback and cost-accounting tests in cache_exit_697813_test.go,
++#       which are compiled only with -tags exitcallbacks.
++set -uo pipefail
++
++ORIG_PWD="$(pwd)"
++
++OUTPUT_PATH=""
++if [ "${1:-}" = "--output_path" ]; then
++  OUTPUT_PATH="$2"
++  shift 2
++  case "$OUTPUT_PATH" in
++    /*) : ;;
++    *) OUTPUT_PATH="$ORIG_PWD/$OUTPUT_PATH" ;;
++  esac
++fi
++
++MODE="${1:-new}"
++
++cd /app
++
++TEST_LOG="$(mktemp)"
++STATUS=0
++
++run_tests() {
++  go test -count=1 -v "$@" 2>&1 | tee -a "$TEST_LOG"
++  status=${PIPESTATUS[0]}
++  if [ "$status" -ne 0 ]; then
++    STATUS=$status
++  fi
++}
++
++NEW_TESTS='^(TestRejectedUpdateKeepsRemainingCost|TestRejectedUpdateKeepsRemainingCostWithCostFunction|TestRejectedUpdateFiresNoCallbacks|TestShouldUpdateMonotonicSequence|TestRejectedUpdatesUnderConcurrencyKeepRemainingCost|TestRejectedPendingValueGatesNextSet|TestAcceptedSetAfterRejectedPendingValueIsStored|TestAcceptedUpdateWithFullWriteBufferChargesItsCost|TestUpdateBehindPendingSetWithFullWriteBufferIsKept|TestDelWithFullWriteBufferReportsEachValueOnce|TestDelReportsRemovedValueOnce|TestDelOfMissingKeyReportsNothing|TestDelWhileSetIsBufferedReportsOnce|TestConcurrentSetDelReportEachValueOnce|TestDelDuringEvictionReportsOnce|TestDelDuringExpiryCleanupReportsOnce|TestDelDuringClearReportsOnce|TestRepeatSetBeforeApplyIsAnUpdate|TestRepeatSetBeforeApplyRespectsShouldUpdate|TestRepeatUpdateOfStoredKeyBeforeApplyIsAnUpdate|TestPendingSetsOfKeysSharingAHashAreNotCompared|TestRepeatSetOfKeyCollidingWithStoredKeyIsAnUpdate|TestAlternatingPendingSetsOfCollidingKeysAreDecidedPerKey|TestRejectedUpdateBesidePendingSetOfCollidingKeyIsNotReported|TestDelOfKeyCollidingWithStoredKeyLeavesItStored|TestCostIsNotAskedForAReleasedValue|TestValueIsNotReleasedWhileCostIsAskedAboutIt|TestClearDoesNotAskCostAboutAReportedUpdate|TestSetsOfOneKeyTakeEffectInIssueOrder|TestSetsOfOneKeyApplyShouldUpdateInIssueOrder|TestDelBetweenSetsOfOneKeyKeepsIssueOrder|TestDelAfterBufferedSetOfOneKeyKeepsIssueOrder|TestSetDuringDelOnExitTakesEffectAfterDel|TestClearReportsEachEntryWithItsOwnItem|TestClearReportsUpdatedEntryWithItsCost|TestEvictionReportsTheEvictedEntry|TestOnEvictReportsCostIncludingInternalCost)$'
++
++case "$MODE" in
++  base)
++    run_tests -timeout 900s -tags costleak_base .
++    ;;
++  new)
++    run_tests -timeout 600s -tags exitcallbacks -run "$NEW_TESTS" .
++    ;;
++  *)
++    echo "unknown mode: $MODE (expected base or new)" >&2
++    exit 2
++    ;;
++esac
++
++if [ -n "$OUTPUT_PATH" ]; then
++  go-junit-report -set-exit-code < "$TEST_LOG" > "$OUTPUT_PATH"
++  junit_status=$?
++  if [ "$junit_status" -ne 0 ] && [ "$STATUS" -eq 0 ]; then
++    echo "go-junit-report failed to convert the test log (exit $junit_status)" >&2
++    STATUS=$junit_status
++  fi
++fi
++
++exit "$STATUS"

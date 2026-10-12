@@ -1,0 +1,956 @@
+diff --git a/cache.go b/cache.go
+index 8db6f24..ad8734d 100644
+--- a/cache.go
++++ b/cache.go
+@@ -49,6 +49,15 @@ type Cache[K Key, V any] struct {
+ 	// setBuf is a buffer allowing us to batch/drop Sets during times of high
+ 	// contention.
+ 	setBuf chan *Item[V]
++	// deferred holds, per key, the newest update Set whose cost could not be
++	// sent on setBuf because it was full (see deferUpdate), and
++	// deferredTickets the tickets of queued updates that could not be sent
++	// either (see deferTicket).
++	deferredMu      sync.Mutex
++	deferred        map[uint64]*Item[V]
++	deferredTickets []*Item[V]
++	// deferredReady wakes processItems to apply the deferred work.
++	deferredReady chan struct{}
+ 	// onEvict is called for item evictions.
+ 	onEvict func(*Item[V])
+ 	// onReject is called when an item is rejected via admission policy.
+@@ -199,6 +208,21 @@ type Item[V any] struct {
+ 	Cost       int64
+ 	Expiration time.Time
+ 	wait       chan struct{}
++	// seq numbers the store write an itemUpdate charges the cost of.
++	seq uint64
++	// queued marks an itemNew or itemDelete held in its key's queue (see
++	// store.UpdateOrQueue). Sent on setBuf, it is a ticket for that queue.
++	queued bool
++	// applied marks an itemDelete whose store side Del already carried out.
++	applied bool
++	// costed marks an item whose cost addInternalCost already calculated.
++	costed bool
++	// settled marks a queued item that has been applied (or dropped by
++	// Clear) and taken out of its key's queue.
++	settled bool
++	// decided marks a queued itemNew that ShouldUpdate already accepted
++	// against the queued Set ahead of it, so applying it must not ask again.
++	decided bool
+ }
+ 
+ // NewCache returns a new Cache instance and any configuration errors, if any.
+@@ -225,6 +249,7 @@ func NewCache[K Key, V any](config *Config[K, V]) (*Cache[K, V], error) {
+ 		cachePolicy:        policy,
+ 		getBuf:             newRingBuffer(policy, config.BufferItems),
+ 		setBuf:             make(chan *Item[V], setBufSize),
++		deferredReady:      make(chan struct{}, 1),
+ 		keyToHash:          config.KeyToHash,
+ 		stop:               make(chan struct{}),
+ 		done:               make(chan struct{}),
+@@ -233,6 +258,7 @@ func NewCache[K Key, V any](config *Config[K, V]) (*Cache[K, V], error) {
+ 		cleanupTicker:      time.NewTicker(time.Duration(config.TtlTickerDurationInSec) * time.Second / 2),
+ 	}
+ 	cache.storedItems.SetShouldUpdateFn(config.ShouldUpdate)
++	cache.storedItems.SetUpdateCostFn(cache.addInternalCost)
+ 	cache.onExit = func(val V) {
+ 		if config.OnExit != nil {
+ 			config.OnExit(val)
+@@ -347,22 +373,136 @@ func (c *Cache[K, V]) SetWithTTL(key K, value V, cost int64, ttl time.Duration)
+ 	}
+ 	// cost is eventually updated. The expiration must also be immediately updated
+ 	// to prevent items from being prematurely removed from the map.
+-	if prev, ok := c.storedItems.Update(i); ok {
+-		c.onExit(prev)
++	// While earlier Sets or Dels of this key are still buffered, this one is
++	// buffered behind them rather than applied directly, so every Set sees
++	// the value left by the ones issued before it. A new key is buffered too,
++	// and the item is sent to cachePolicy while it is being queued.
++	prev, updated, existed, queued := c.storedItems.UpdateOrQueue(i, func(stored bool) bool {
++		if c.offer(i) {
++			return true
++		}
++		if stored {
++			// The key is stored, so this Set is an update, and an update
++			// is never dropped: its ticket waits for processItems instead.
++			c.deferTicket(i)
++			return true
++		}
++		return false
++	})
++	if updated {
+ 		i.flag = itemUpdate
++		// Send the cost update to cachePolicy. storedItems already holds the
++		// new value, so the update must not be lost when setBuf is full; it is
++		// then deferred instead. Report the replaced value only after that,
++		// so OnExit (user code) cannot hold back its cost accounting.
++		if !c.offer(i) {
++			c.deferUpdate(i)
++		}
++		c.onExit(prev)
++		return true
++	}
++	if existed {
++		// The key already exists and ShouldUpdate rejected this update: no
++		// changes are made in the cache. This must be a true no-op rather
++		// than an itemNew admission -- forwarding it to processItems would
++		// let policy.Add's updateIfHas corrupt the eviction policy's cost
++		// accounting for a value that was never actually stored (see
++		// policy.go). Set still reports true because the request was not
++		// dropped for buffer-contention reasons.
++		return true
++	}
++	if !queued {
++		// For all the other operations (set/delete), we return false which
++		// means the item was not inserted.
++		c.Metrics.add(dropSets, keyHash, 1)
++	}
++	return queued
++}
++
++// deferUpdate keeps an update Set that did not fit into setBuf until
++// processItems charges its cost. Only the newest update of a key is kept:
++// an older one no longer matches the stored value and would not be charged.
++func (c *Cache[K, V]) deferUpdate(i *Item[V]) {
++	c.deferredMu.Lock()
++	prev, ok := c.deferred[i.Key]
++	if !ok || prev.seq < i.seq {
++		if c.deferred == nil {
++			c.deferred = make(map[uint64]*Item[V])
++		}
++		c.deferred[i.Key] = i
++	}
++	c.deferredMu.Unlock()
++	if ok {
++		// Of the two updates only one is kept, but both updated the value.
++		c.Metrics.add(keyUpdate, i.Key, 1)
++	}
++	select {
++	case c.deferredReady <- struct{}{}:
++	default:
++		// A wake-up is already pending and will see this update.
++	}
++}
++
++// deferTicket keeps the ticket of a queued update that did not fit into
++// setBuf until processItems applies it.
++func (c *Cache[K, V]) deferTicket(i *Item[V]) {
++	c.deferredMu.Lock()
++	c.deferredTickets = append(c.deferredTickets, i)
++	c.deferredMu.Unlock()
++	select {
++	case c.deferredReady <- struct{}{}:
++	default:
++		// A wake-up is already pending and will see this ticket.
++	}
++}
++
++// takeDeferred hands over the work kept by deferUpdate and deferTicket.
++func (c *Cache[K, V]) takeDeferred() (map[uint64]*Item[V], []*Item[V]) {
++	c.deferredMu.Lock()
++	defer c.deferredMu.Unlock()
++	updates, tickets := c.deferred, c.deferredTickets
++	c.deferred, c.deferredTickets = nil, nil
++	return updates, tickets
++}
++
++// addInternalCost calculates the cost of a new or updated item, if needed,
++// and adds the cost of storing it.
++func (c *Cache[K, V]) addInternalCost(i *Item[V]) {
++	if i.costed {
++		return
++	}
++	i.costed = true
++	if i.Cost == 0 && c.cost != nil && i.flag != itemDelete {
++		i.Cost = c.cost(i.Value)
++	}
++	if !c.ignoreInternalCost {
++		// Add the cost of internally storing the object.
++		i.Cost += itemSize
++	}
++}
++
++// chargeUpdate charges the cost of an update Set applied to the store
++// directly. Such an update carries the number of that write; its cost is
++// charged only while that value is still stored: Sets from different
++// goroutines can buffer their updates out of order, and once a later write
++// replaced the value, that write's own cost is the one to charge.
++func (c *Cache[K, V]) chargeUpdate(i *Item[V]) {
++	if i.seq == 0 || c.storedItems.StoredBy(i.Key, i.Conflict, i.seq) {
++		c.addInternalCost(i)
++		c.cachePolicy.Update(i.Key, i.Cost)
++		return
+ 	}
+-	// Attempt to send item to cachePolicy.
++	// The Set still updated the value, so it counts as an update even
++	// though its cost is not charged.
++	c.Metrics.add(keyUpdate, i.Key, 1)
++}
++
++// offer sends i to processItems unless setBuf is full.
++func (c *Cache[K, V]) offer(i *Item[V]) bool {
+ 	select {
+ 	case c.setBuf <- i:
+ 		return true
+ 	default:
+-		if i.flag == itemUpdate {
+-			// Return true if this was an update operation since we've already
+-			// updated the storedItems. For all the other operations (set/delete), we
+-			// return false which means the item was not inserted.
+-			return true
+-		}
+-		c.Metrics.add(dropSets, keyHash, 1)
+ 		return false
+ 	}
+ }
+@@ -373,18 +513,35 @@ func (c *Cache[K, V]) Del(key K) {
+ 		return
+ 	}
+ 	keyHash, conflictHash := c.keyToHash(key)
+-	// Delete immediately.
+-	_, prev := c.storedItems.Del(keyHash, conflictHash)
+-	c.onExit(prev)
+-	// If we've set an item, it would be applied slightly later.
+-	// So we must push the same item to `setBuf` with the deletion flag.
+-	// This ensures that if a set is followed by a delete, it will be
+-	// applied in the correct order.
+-	c.setBuf <- &Item[V]{
++	// Delete immediately. Only fire OnExit when something was actually
++	// removed -- the key may not exist yet (e.g. a Set for it is still
++	// sitting unprocessed in setBuf), and calling OnExit unconditionally
++	// would hand it a zero value for a deletion that never happened.
++	// While earlier Sets or Dels of this key are still buffered, the delete
++	// is only buffered behind them and happens in processItems.
++	del := &Item[V]{
+ 		flag:     itemDelete,
+ 		Key:      keyHash,
+ 		Conflict: conflictHash,
+ 	}
++	removed, ok, queued, published := c.storedItems.DelOrQueue(del, func() bool {
++		return c.offer(del)
++	})
++	// If we've set an item, it would be applied slightly later.
++	// So we must push the same item to `setBuf` with the deletion flag.
++	// This ensures that if a set is followed by a delete, it will be
++	// applied in the correct order. It is pushed before OnExit runs, so a
++	// Set issued while that user callback is still running is buffered
++	// behind it.
++	if !queued {
++		del.applied = true
++	}
++	if !published {
++		c.setBuf <- del
++	}
++	if ok {
++		c.onExit(removed.value)
++	}
+ }
+ 
+ // GetTTL returns the TTL for the specified key and a bool that is true if the
+@@ -453,6 +610,15 @@ func (c *Cache[K, V]) Clear() {
+ 	c.stop <- struct{}{}
+ 	<-c.done
+ 
++	// Deferred work refers to values that are about to be released, so it is
++	// dropped first. The queued updates whose tickets were deferred are
++	// reported with the other queued operations below.
++	c.takeDeferred()
++	select {
++	case <-c.deferredReady:
++	default:
++	}
++
+ 	// Clear out the setBuf channel.
+ loop:
+ 	for {
+@@ -462,19 +628,36 @@ loop:
+ 				close(i.wait)
+ 				continue
+ 			}
+-			if i.flag != itemUpdate {
+-				// In itemUpdate, the value is already set in the storedItems.  So, no need to call
+-				// onEvict here.
++			if i.flag == itemNew && !i.queued {
++				// Only a still-pending admission deserves an eviction notice
++				// here: it never got the chance to be admitted or rejected.
++				// A leftover itemUpdate already applied its change to
++				// storedItems, and a leftover itemDelete already fired
++				// OnExit synchronously inside Del() itself -- calling
++				// onEvict for either here would be a spurious second exit
++				// notification (and, for itemDelete, one carrying a zero
++				// value, since Del() already removed the entry).
+ 				c.onEvict(i)
+ 			}
+ 		default:
+ 			break loop
+ 		}
+ 	}
++	// A queued ticket may belong to an operation that was already applied,
++	// so pending admissions are reported from the queues instead.
++	for _, i := range c.storedItems.DropQueued() {
++		if i.flag == itemNew {
++			c.onEvict(i)
++		}
++	}
+ 
+-	// Clear value hashmap and cachePolicy data.
++	// Clear value hashmap and cachePolicy data. Each stored entry is reported
++	// with its cost, so the policy is read before it is cleared.
++	c.storedItems.Clear(func(item *Item[V]) {
++		item.Cost = c.cachePolicy.Cost(item.Key)
++		c.onEvict(item)
++	})
+ 	c.cachePolicy.Clear()
+-	c.storedItems.Clear(c.onEvict)
+ 	// Only reset metrics if they're enabled.
+ 	if c.Metrics != nil {
+ 		c.Metrics.Clear()
+@@ -536,45 +719,148 @@ func (c *Cache[K, V]) processItems() {
+ 		}
+ 	}
+ 
+-	for {
+-		select {
+-		case i := <-c.setBuf:
+-			if i.wait != nil {
+-				close(i.wait)
+-				continue
++	// apply carries out one buffered operation. A queued one is taken out
++	// of its key's queue before any callback runs, so a Set issued from a
++	// callback is never decided against a value that callback released.
++	apply := func(i *Item[V]) {
++		settle := func() {
++			if i.queued {
++				c.storedItems.Settle(i)
++			}
++		}
++		defer settle()
++
++		switch i.flag {
++		case itemNew:
++			// Calculate item cost value.
++			c.addInternalCost(i)
++			// An earlier buffered Set for the same key may have been
++			// admitted after this one was queued; this one is then an
++			// update of it. ShouldUpdate already accepted it against that
++			// Set when it was queued, so it is not asked a second time.
++			if prev, updated, existed := c.storedItems.UpdateIfPresent(i); existed {
++				settle()
++				if updated {
++					c.cachePolicy.Update(i.Key, i.Cost)
++					c.onExit(prev)
++				}
++				return
+ 			}
+-			// Calculate item cost value if new or update.
+-			if i.Cost == 0 && c.cost != nil && i.flag != itemDelete {
+-				i.Cost = c.cost(i.Value)
++			// Another key with the same primary hash is stored. The policy
++			// tracks entries by primary hash only, so passing this item to
++			// it would overwrite the cost of the entry that stays stored;
++			// the item is turned away as itself instead.
++			if c.storedItems.Holds(i.Key) {
++				c.Metrics.add(rejectSets, i.Key, 1)
++				settle()
++				c.onReject(i)
++				return
+ 			}
+-			if !c.ignoreInternalCost {
+-				// Add the cost of internally storing the object.
+-				i.Cost += itemSize
++			// A Del that already removed this key from the store may
++			// still be on its way here; its leftover policy entry must
++			// not turn this Set into a rejected update.
++			c.cachePolicy.Del(i.Key)
++			victims, added := c.cachePolicy.Add(i.Key, i.Cost)
++			if added {
++				c.storedItems.Set(i)
++				c.Metrics.add(keyAdd, i.Key, 1)
++				trackAdmission(i.Key)
+ 			}
+-
+-			switch i.flag {
+-			case itemNew:
+-				victims, added := c.cachePolicy.Add(i.Key, i.Cost)
+-				if added {
+-					c.storedItems.Set(i)
+-					c.Metrics.add(keyAdd, i.Key, 1)
+-					trackAdmission(i.Key)
+-				} else {
+-					c.onReject(i)
+-				}
+-				for _, victim := range victims {
+-					victim.Conflict, victim.Value = c.storedItems.Del(victim.Key, 0)
++			settle()
++			if !added {
++				c.onReject(i)
++			}
++			for _, victim := range victims {
++				// A concurrent Cache.Del() for this exact key may have
++				// already removed it from the store and fired OnExit
++				// with the real value before the policy's eviction
++				// decision reaches here. In that case there is nothing
++				// left to evict: calling OnEvict/OnExit a second time
++				// would hand it a zero value for an eviction that never
++				// actually happened.
++				if removed, ok := c.storedItems.DelIfPresent(victim.Key, 0); ok {
++					victim.Conflict = removed.conflict
++					victim.Value = removed.value
++					victim.Expiration = removed.expiration
+ 					onEvict(victim)
+ 				}
++			}
+ 
+-			case itemUpdate:
+-				c.cachePolicy.Update(i.Key, i.Cost)
++		case itemUpdate:
++			c.chargeUpdate(i)
+ 
+-			case itemDelete:
++		case itemDelete:
++			if i.applied {
++				// Del already removed and reported the entry. Drop its
++				// policy entry, unless a Set issued after the Del has
++				// been admitted in the meantime.
++				if !c.storedItems.Holds(i.Key) {
++					c.cachePolicy.Del(i.Key)
++				}
++				return
++			}
++			// In the normal Cache.Del() path, the store-level deletion
++			// and its OnExit call already ran synchronously; this
++			// buffered event exists to apply the policy's cost
++			// accounting on the single processItems goroutine and to
++			// preserve ordering against a still-buffered Set for the
++			// same key, so usually nothing is removed here. Only fire
++			// OnExit when this call is the one that actually removed the
++			// entry, so a value is never handed to OnExit twice -- the
++			// second time with a zero value.
++			removed, ok := c.storedItems.DelIfPresent(i.Key, i.Conflict)
++			// The policy tracks entries by primary hash only. A Del of a
++			// key that merely shares its hash with a stored key must not
++			// drop that key's cost, so the policy entry goes only when no
++			// key with this hash is left in the store.
++			if !c.storedItems.Holds(i.Key) {
+ 				c.cachePolicy.Del(i.Key) // Deals with metrics updates.
+-				_, val := c.storedItems.Del(i.Key, i.Conflict)
+-				c.onExit(val)
+ 			}
++			settle()
++			if ok {
++				c.onExit(removed.value)
++			}
++		}
++	}
++	// applyTicket applies the queued operations of t's key, oldest first,
++	// up to and including t's own. Tickets of different callers can arrive
++	// in any order, so t may find its operation already applied; but once
++	// t is processed, its operation has taken effect.
++	applyTicket := func(t *Item[V]) {
++		for !t.settled {
++			next, ok := c.storedItems.Next(t.Key)
++			if !ok {
++				return
++			}
++			apply(next)
++		}
++	}
++	applyDeferred := func() {
++		updates, tickets := c.takeDeferred()
++		for _, i := range updates {
++			c.chargeUpdate(i)
++		}
++		for _, t := range tickets {
++			applyTicket(t)
++		}
++	}
++
++	for {
++		select {
++		case i := <-c.setBuf:
++			if i.wait != nil {
++				// Work deferred before Wait was called counts as applied.
++				applyDeferred()
++				close(i.wait)
++				continue
++			}
++			if i.queued {
++				applyTicket(i)
++				continue
++			}
++			apply(i)
++		case <-c.deferredReady:
++			applyDeferred()
+ 		case <-c.cleanupTicker.C:
+ 			c.storedItems.Cleanup(c.cachePolicy, onEvict)
+ 		case <-c.stop:
+diff --git a/store.go b/store.go
+index 39901e4..c28ef79 100644
+--- a/store.go
++++ b/store.go
+@@ -18,6 +18,8 @@ type storeItem[V any] struct {
+ 	conflict   uint64
+ 	value      V
+ 	expiration time.Time
++	// seq numbers the write that stored value (see StoredBy).
++	seq uint64
+ }
+ 
+ // store is the interface fulfilled by all hash map implementations in this
+@@ -37,14 +39,61 @@ type store[V any] interface {
+ 	Set(*Item[V])
+ 	// Del deletes the key-value pair from the Map.
+ 	Del(uint64, uint64) (uint64, V)
++	// DelIfPresent deletes the entry like Del, but returns the removed entry
++	// itself and whether anything was removed. Several paths can race to
++	// remove the same entry (Del, its buffered itemDelete event, admission
++	// eviction, TTL cleanup); only the one that gets removed == true may
++	// report it, so the entry is never reported twice or as a zero value.
++	DelIfPresent(key, conflict uint64) (removed storeItem[V], ok bool)
++	// DelIfExpired removes the entry only if, at the moment of removal, it
++	// has an expiration that is not after now. An entry re-set concurrently
++	// with a later expiration, or with none, is left in place.
++	DelIfExpired(key, conflict uint64, now time.Time) (removed storeItem[V], ok bool)
++	// StoredBy reports whether the entry's value is still the one stored by
++	// the write numbered seq.
++	StoredBy(key, conflict, seq uint64) bool
++	// UpdateOrQueue applies newItem as an update, like UpdateIfPresent, only
++	// when the key is stored and none of its Sets or Dels are still queued.
++	// Otherwise newItem is appended to the key's queue and, under the same
++	// lock, publish hands processItems a ticket for it, so a key's operations
++	// are queued and published in the order they were issued. publish is
++	// told whether the key is stored, in which case newItem is an update
++	// that must not be dropped. If publish fails, newItem is taken back out
++	// of the queue and queued is false.
++	UpdateOrQueue(newItem *Item[V], publish func(stored bool) bool) (prev V, updated, existed, queued bool)
++	// DelOrQueue deletes the entry like DelIfPresent when none of the key's
++	// operations are queued. Otherwise del is queued behind them like in
++	// UpdateOrQueue, but it stays queued even when publish fails: published
++	// then reports that the caller still has to deliver its ticket.
++	DelOrQueue(del *Item[V], publish func() bool) (removed storeItem[V], ok, queued, published bool)
++	// Next returns the oldest queued operation of key, which processItems
++	// applies whenever a ticket for key arrives, whichever ticket it is.
++	Next(key uint64) (*Item[V], bool)
++	// Settle removes i from the front of its key's queue once it is applied.
++	Settle(i *Item[V])
++	// DropQueued empties every queue and returns the operations it held.
++	DropQueued() []*Item[V]
++	// Holds reports whether any entry is stored under key.
++	Holds(key uint64) bool
+ 	// Update attempts to update the key with a new value and returns true if
+ 	// successful.
+ 	Update(*Item[V]) (V, bool)
++	// UpdateIfPresent behaves exactly like Update, but its third return value
++	// always reports whether the key was present beforehand, independent of
++	// whether the update was actually applied. This lets a caller tell a
++	// genuinely new key (existed == false) apart from a rejected update to an
++	// existing key (existed == true, updated == false), for which "no changes
++	// are made in the cache" -- so the caller must treat it as a true no-op
++	// rather than a new admission.
++	UpdateIfPresent(*Item[V]) (prev V, updated bool, existed bool)
+ 	// Cleanup removes items that have an expired TTL.
+ 	Cleanup(policy *defaultPolicy[V], onEvict func(item *Item[V]))
+ 	// Clear clears all contents of the store.
+ 	Clear(onEvict func(item *Item[V]))
+ 	SetShouldUpdateFn(f updateFn[V])
++	// SetUpdateCostFn sets the function that computes the cost of an update
++	// right before its value is stored.
++	SetUpdateCostFn(f func(*Item[V]))
+ 	// IterValues iterates the values of the Map, passing them to the callback.
+ 	// It guarantees that any value in the Map will be visited only once.
+ 	// The set of values visited by IterValues is non-deterministic.
+@@ -80,6 +129,12 @@ func (m *shardedMap[V]) SetShouldUpdateFn(f updateFn[V]) {
+ 	}
+ }
+ 
++func (m *shardedMap[V]) SetUpdateCostFn(f func(*Item[V])) {
++	for i := range m.shards {
++		m.shards[i].updateCost = f
++	}
++}
++
+ // IterValues iterates the values of the Map, passing them to the callback.
+ // It guarantees that any value in the Map will be visited only once.
+ // The set of values visited by IterValues is non-deterministic.
+@@ -127,10 +182,54 @@ func (sm *shardedMap[V]) Del(key, conflict uint64) (uint64, V) {
+ 	return sm.shards[key%numShards].Del(key, conflict)
+ }
+ 
++func (sm *shardedMap[V]) DelIfPresent(key, conflict uint64) (storeItem[V], bool) {
++	return sm.shards[key%numShards].delIfPresent(key, conflict)
++}
++
++func (sm *shardedMap[V]) StoredBy(key, conflict, seq uint64) bool {
++	return sm.shards[key%numShards].storedBy(key, conflict, seq)
++}
++
++func (sm *shardedMap[V]) UpdateOrQueue(newItem *Item[V], publish func(stored bool) bool) (V, bool, bool, bool) {
++	return sm.shards[newItem.Key%numShards].updateOrQueue(newItem, publish)
++}
++
++func (sm *shardedMap[V]) DelOrQueue(del *Item[V], publish func() bool) (storeItem[V], bool, bool, bool) {
++	return sm.shards[del.Key%numShards].delOrQueue(del, publish)
++}
++
++func (sm *shardedMap[V]) Next(key uint64) (*Item[V], bool) {
++	return sm.shards[key%numShards].next(key)
++}
++
++func (sm *shardedMap[V]) Settle(i *Item[V]) {
++	sm.shards[i.Key%numShards].settle(i)
++}
++
++func (sm *shardedMap[V]) DropQueued() []*Item[V] {
++	var dropped []*Item[V]
++	for i := uint64(0); i < numShards; i++ {
++		dropped = append(dropped, sm.shards[i].dropQueued()...)
++	}
++	return dropped
++}
++
++func (sm *shardedMap[V]) Holds(key uint64) bool {
++	return sm.shards[key%numShards].holds(key)
++}
++
++func (sm *shardedMap[V]) DelIfExpired(key, conflict uint64, now time.Time) (storeItem[V], bool) {
++	return sm.shards[key%numShards].delIfExpired(key, conflict, now)
++}
++
+ func (sm *shardedMap[V]) Update(newItem *Item[V]) (V, bool) {
+ 	return sm.shards[newItem.Key%numShards].Update(newItem)
+ }
+ 
++func (sm *shardedMap[V]) UpdateIfPresent(newItem *Item[V]) (V, bool, bool) {
++	return sm.shards[newItem.Key%numShards].updateIfPresent(newItem)
++}
++
+ func (sm *shardedMap[V]) Cleanup(policy *defaultPolicy[V], onEvict func(item *Item[V])) {
+ 	sm.expiryMap.cleanup(sm, policy, onEvict)
+ }
+@@ -147,12 +246,21 @@ type lockedMap[V any] struct {
+ 	data         map[uint64]storeItem[V]
+ 	em           *expirationMap[V]
+ 	shouldUpdate updateFn[V]
++	// updateCost computes the cost of an accepted update before its value is
++	// stored, while no other writer can replace that value yet.
++	updateCost func(*Item[V])
++	// queue holds, per key and in issue order, the buffered Sets and Dels
++	// that processItems has not applied yet.
++	queue map[uint64][]*Item[V]
++	// seq numbers every write to data.
++	seq uint64
+ }
+ 
+ func newLockedMap[V any](em *expirationMap[V]) *lockedMap[V] {
+ 	return &lockedMap[V]{
+-		data: make(map[uint64]storeItem[V]),
+-		em:   em,
++		data:  make(map[uint64]storeItem[V]),
++		queue: make(map[uint64][]*Item[V]),
++		em:    em,
+ 		shouldUpdate: func(cur, prev V) bool {
+ 			return true
+ 		},
+@@ -218,18 +326,133 @@ func (m *lockedMap[V]) Set(i *Item[V]) {
+ 		conflict:   i.Conflict,
+ 		value:      i.Value,
+ 		expiration: i.Expiration,
++		seq:        m.nextSeq(i),
+ 	}
+ }
+ 
++// nextSeq numbers a write to data, starting at 1, and records it on i.
++func (m *lockedMap[V]) nextSeq(i *Item[V]) uint64 {
++	m.seq++
++	i.seq = m.seq
++	return m.seq
++}
++
+ func (m *lockedMap[V]) Del(key, conflict uint64) (uint64, V) {
++	removed, _ := m.delIfPresent(key, conflict)
++	return removed.conflict, removed.value
++}
++
++// delIfPresent and delIfExpired decide and delete under one lock acquisition,
++// so the decision cannot be invalidated by a concurrent Set, Update or Del on
++// the same shard between the check and the removal.
++func (m *lockedMap[V]) delIfPresent(key, conflict uint64) (storeItem[V], bool) {
++	return m.delWhere(key, conflict, func(storeItem[V]) bool { return true })
++}
++
++func (m *lockedMap[V]) delIfExpired(key, conflict uint64, now time.Time) (storeItem[V], bool) {
++	return m.delWhere(key, conflict, func(item storeItem[V]) bool {
++		return !item.expiration.IsZero() && !item.expiration.After(now)
++	})
++}
++
++func (m *lockedMap[V]) storedBy(key, conflict, seq uint64) bool {
++	m.RLock()
++	defer m.RUnlock()
++	item, ok := m.data[key]
++	return ok && (conflict == 0 || conflict == item.conflict) && item.seq == seq
++}
++
++func (m *lockedMap[V]) delOrQueue(del *Item[V], publish func() bool) (storeItem[V], bool, bool, bool) {
++	m.Lock()
++	defer m.Unlock()
++	if len(m.queue[del.Key]) > 0 {
++		m.enqueueLocked(del)
++		return storeItem[V]{}, false, true, publish()
++	}
++	removed, ok := m.delWhereLocked(del.Key, del.Conflict, func(storeItem[V]) bool { return true })
++	return removed, ok, false, false
++}
++
++// lastQueuedOf returns the newest operation in q on the key with the given
++// conflict hash, or nil if none is queued. Keys that share a primary hash
++// share its queue, but each of them has a chain of operations of its own.
++func lastQueuedOf[V any](q []*Item[V], conflict uint64) *Item[V] {
++	for i := len(q) - 1; i >= 0; i-- {
++		if q[i] != nil && q[i].Conflict == conflict {
++			return q[i]
++		}
++	}
++	return nil
++}
++
++func (m *lockedMap[V]) enqueueLocked(i *Item[V]) {
++	i.queued = true
++	m.queue[i.Key] = append(m.queue[i.Key], i)
++}
++
++func (m *lockedMap[V]) next(key uint64) (*Item[V], bool) {
++	m.RLock()
++	defer m.RUnlock()
++	if q := m.queue[key]; len(q) > 0 {
++		return q[0], true
++	}
++	return nil, false
++}
++
++func (m *lockedMap[V]) dropQueued() []*Item[V] {
+ 	m.Lock()
+ 	defer m.Unlock()
++	var dropped []*Item[V]
++	for _, q := range m.queue {
++		for _, i := range q {
++			// A ticket still on its way finds its operation already gone.
++			i.settled = true
++		}
++		dropped = append(dropped, q...)
++	}
++	m.queue = make(map[uint64][]*Item[V])
++	return dropped
++}
++
++func (m *lockedMap[V]) holds(key uint64) bool {
++	m.RLock()
++	defer m.RUnlock()
++	_, ok := m.data[key]
++	return ok
++}
++
++func (m *lockedMap[V]) settle(i *Item[V]) {
++	m.Lock()
++	defer m.Unlock()
++	q := m.queue[i.Key]
++	if len(q) == 0 || q[0] != i {
++		return
++	}
++	i.settled = true
++	if len(q) == 1 {
++		delete(m.queue, i.Key)
++		return
++	}
++	q[0] = nil
++	m.queue[i.Key] = q[1:]
++}
++
++func (m *lockedMap[V]) delWhere(key, conflict uint64, want func(storeItem[V]) bool) (storeItem[V], bool) {
++	m.Lock()
++	defer m.Unlock()
++	return m.delWhereLocked(key, conflict, want)
++}
++
++func (m *lockedMap[V]) delWhereLocked(key, conflict uint64, want func(storeItem[V]) bool) (storeItem[V], bool) {
+ 	item, ok := m.data[key]
+ 	if !ok {
+-		return 0, zeroValue[V]()
++		return storeItem[V]{}, false
+ 	}
+ 	if conflict != 0 && (conflict != item.conflict) {
+-		return 0, zeroValue[V]()
++		return storeItem[V]{}, false
++	}
++	if !want(item) {
++		return storeItem[V]{}, false
+ 	}
+ 
+ 	if !item.expiration.IsZero() {
+@@ -237,21 +460,85 @@ func (m *lockedMap[V]) Del(key, conflict uint64) (uint64, V) {
+ 	}
+ 
+ 	delete(m.data, key)
+-	return item.conflict, item.value
++	return item, true
+ }
+ 
+ func (m *lockedMap[V]) Update(newItem *Item[V]) (V, bool) {
++	prev, updated, _ := m.updateIfPresent(newItem)
++	return prev, updated
++}
++
++// updateIfPresent implements UpdateIfPresent under this shard's single lock
++// acquisition, so "was the key present" and "was the update applied" are
++// determined atomically with respect to concurrent Set/Del/Update calls on
++// the same shard.
++func (m *lockedMap[V]) updateIfPresent(newItem *Item[V]) (V, bool, bool) {
++	m.Lock()
++	defer m.Unlock()
++	return m.updateLocked(newItem)
++}
++
++func (m *lockedMap[V]) updateOrQueue(newItem *Item[V], publish func(stored bool) bool) (V, bool, bool, bool) {
+ 	m.Lock()
+ 	defer m.Unlock()
++	q := m.queue[newItem.Key]
++	if prev := lastQueuedOf(q, newItem.Conflict); prev == nil {
++		// Nothing is queued for this key itself; operations of other keys
++		// that only share its hash may be. Then this Set is decided now, as
++		// with an empty queue: an update of the stored value is applied or
++		// turned down at once, and only a fresh admission is queued.
++		if prev, updated, existed := m.updateLocked(newItem); existed {
++			return prev, updated, true, false
++		}
++	} else if prev.flag != itemDelete {
++		// A Set still queued for this key is applied before newItem, so
++		// ShouldUpdate decides it against that one's value -- even if that
++		// predecessor later fails admission, since the chain's outcome must
++		// not depend on whether an earlier link in it gets admitted. Only a
++		// queued Del of this same key leaves nothing to compare against:
++		// newItem then follows it as a fresh admission. Operations on other
++		// keys that only share this key's hash sit in the same queue, but
++		// they neither stand in for nor break this key's chain.
++		if m.shouldUpdate != nil && !m.shouldUpdate(newItem.Value, prev.Value) {
++			return prev.Value, false, true, false
++		}
++		newItem.decided = true
++	}
++	m.enqueueLocked(newItem)
++	stored, ok := m.data[newItem.Key]
++	if publish(ok && (newItem.Conflict == 0 || newItem.Conflict == stored.conflict)) {
++		return zeroValue[V](), false, false, true
++	}
++	// Take newItem back out. The lock is still held, so it is still last.
++	q = m.queue[newItem.Key]
++	q[len(q)-1] = nil
++	if len(q) == 1 {
++		delete(m.queue, newItem.Key)
++	} else {
++		m.queue[newItem.Key] = q[:len(q)-1]
++	}
++	newItem.queued = false
++	newItem.decided = false
++	return zeroValue[V](), false, false, false
++}
++
++func (m *lockedMap[V]) updateLocked(newItem *Item[V]) (V, bool, bool) {
+ 	item, ok := m.data[newItem.Key]
+ 	if !ok {
+-		return zeroValue[V](), false
++		return zeroValue[V](), false, false
+ 	}
+ 	if newItem.Conflict != 0 && (newItem.Conflict != item.conflict) {
+-		return zeroValue[V](), false
++		return zeroValue[V](), false, false
++	}
++	if !newItem.decided && m.shouldUpdate != nil && !m.shouldUpdate(newItem.Value, item.value) {
++		return item.value, false, true
+ 	}
+-	if m.shouldUpdate != nil && !m.shouldUpdate(newItem.Value, item.value) {
+-		return item.value, false
++	// Once the value is stored, a concurrent Set may replace it and OnExit
++	// may release it, so its cost is computed now. Like ShouldUpdate, this
++	// runs only for an update that is applied, never for one that is turned
++	// down or dropped.
++	if m.updateCost != nil {
++		m.updateCost(newItem)
+ 	}
+ 
+ 	m.em.update(newItem.Key, newItem.Conflict, item.expiration, newItem.Expiration)
+@@ -260,22 +547,28 @@ func (m *lockedMap[V]) Update(newItem *Item[V]) (V, bool) {
+ 		conflict:   newItem.Conflict,
+ 		value:      newItem.Value,
+ 		expiration: newItem.Expiration,
++		seq:        m.nextSeq(newItem),
+ 	}
+ 
+-	return item.value, true
++	return item.value, true, true
+ }
+ 
+ func (m *lockedMap[V]) Clear(onEvict func(item *Item[V])) {
+ 	m.Lock()
+-	defer m.Unlock()
+-	i := &Item[V]{}
+-	if onEvict != nil {
+-		for _, si := range m.data {
+-			i.Key = si.key
+-			i.Conflict = si.conflict
+-			i.Value = si.value
+-			onEvict(i)
+-		}
+-	}
++	data := m.data
+ 	m.data = make(map[uint64]storeItem[V])
++	m.Unlock()
++	if onEvict == nil {
++		return
++	}
++	// Report outside the lock: OnEvict is user code and may use the cache.
++	for _, si := range data {
++		// A fresh Item per entry: callers may keep the pointer.
++		onEvict(&Item[V]{
++			Key:        si.key,
++			Conflict:   si.conflict,
++			Value:      si.value,
++			Expiration: si.expiration,
++		})
++	}
+ }
+diff --git a/ttl.go b/ttl.go
+index c1cc166..28c0623 100644
+--- a/ttl.go
++++ b/ttl.go
+@@ -133,22 +133,24 @@ func (m *expirationMap[V]) cleanup(store store[V], policy *defaultPolicy[V], onE
+ 
+ 	for _, keys := range buckets {
+ 		for key, conflict := range keys {
+-			expr := store.Expiration(key)
+-			// Sanity check. Verify that the store agrees that this key is expired.
+-			if expr.After(now) {
++			// The bucket was detached above, so between then and now the key
++			// may have been deleted (Del already reported it) or re-set with a
++			// later expiration or none. Only an entry that is still expired at
++			// the moment of removal is removed and reported here.
++			removed, ok := store.DelIfExpired(key, conflict, now)
++			if !ok {
+ 				continue
+ 			}
+ 
+ 			cost := policy.Cost(key)
+ 			policy.Del(key)
+-			_, value := store.Del(key, conflict)
+ 
+ 			if onEvict != nil {
+ 				onEvict(&Item[V]{Key: key,
+-					Conflict:   conflict,
+-					Value:      value,
++					Conflict:   removed.conflict,
++					Value:      removed.value,
+ 					Cost:       cost,
+-					Expiration: expr,
++					Expiration: removed.expiration,
+ 				})
+ 			}
+ 		}
