@@ -1,0 +1,686 @@
+diff --git a/server/bulk_events_a710bf_test.go b/server/bulk_events_a710bf_test.go
+new file mode 100644
+index 0000000..c341dea
+--- /dev/null
++++ b/server/bulk_events_a710bf_test.go
+@@ -0,0 +1,609 @@
++//go:build bulkevents
++
++package server
++
++import (
++	"context"
++	"encoding/json"
++	"fmt"
++	"net"
++	"net/http/httptest"
++	"strings"
++	"sync"
++	"syscall"
++	"testing"
++	"time"
++
++	"github.com/axllent/mailpit/internal/storage"
++	"github.com/axllent/mailpit/server/apiv1"
++	"github.com/axllent/mailpit/server/websockets"
++	"github.com/gorilla/websocket"
++)
++
++// browserBX records the notifications a connected web UI receives.
++type browserBX struct {
++	mu     sync.Mutex
++	events []eventBX
++	closed bool
++	last   time.Time
++	conn   *websocket.Conn
++
++	// a browser that is behind stops reading after its first notification
++	// until catchUp is called
++	behind     chan struct{}
++	behindOnce sync.Once
++}
++
++type eventBX struct {
++	Type string
++	Data struct {
++		ID   string
++		Read bool
++		Tags []string
++	}
++}
++
++var startOnceBX sync.Once
++
++// startBX starts the API with an empty mailbox. The database and the
++// notification hub are shared by these tests and opened only once, because
++// background work started by one test may still be running when the next
++// one begins.
++func startBX(t *testing.T) *httptest.Server {
++	t.Helper()
++	startOnceBX.Do(func() {
++		setup()
++		websockets.MessageHub = websockets.NewHub()
++		websockets.SetCheckOriginFunc(corsOriginAccessControl)
++		go websockets.MessageHub.Run()
++	})
++	if err := storage.DeleteAllMessages(); err != nil {
++		t.Fatal(err)
++	}
++
++	ts := httptest.NewUnstartedServer(apiRoutes())
++	ts.Listener = smallBufferListenerBX{ts.Listener}
++	ts.Start()
++	t.Cleanup(ts.Close)
++	return ts
++}
++
++// connectBX connects one web UI client that reads every notification.
++func connectBX(t *testing.T, ts *httptest.Server) *browserBX {
++	t.Helper()
++	b := dialBX(t, ts, websocket.DefaultDialer, false)
++	b.settle(t)
++	return b
++}
++
++// connectBehindBX connects a web UI client with a small receive buffer that
++// stops reading once it is registered, until catchUp is called.
++func connectBehindBX(t *testing.T, ts *httptest.Server) *browserBX {
++	t.Helper()
++	return dialBX(t, ts, smallBufferDialerBX(), true)
++}
++
++// catchUp makes a browser that is behind read its notifications again.
++func (b *browserBX) catchUp() {
++	if b.behind != nil {
++		b.behindOnce.Do(func() { close(b.behind) })
++	}
++}
++
++func dialBX(t *testing.T, ts *httptest.Server, dialer *websocket.Dialer, behind bool) *browserBX {
++	t.Helper()
++	conn, _, err := dialer.Dial("ws"+strings.TrimPrefix(ts.URL, "http")+"/api/events", nil)
++	if err != nil {
++		t.Fatalf("connecting to /api/events: %v", err)
++	}
++
++	b := &browserBX{conn: conn, last: time.Now()}
++	if behind {
++		b.behind = make(chan struct{})
++	}
++	done := make(chan struct{})
++	t.Cleanup(func() {
++		b.catchUp()
++		_ = conn.Close()
++		<-done
++	})
++	go func() {
++		defer close(done)
++		for first := true; ; first = false {
++			if !first && b.behind != nil {
++				<-b.behind
++			}
++			_, msg, err := conn.ReadMessage()
++			b.mu.Lock()
++			b.last = time.Now()
++			if err != nil {
++				b.closed = true
++				b.mu.Unlock()
++				return
++			}
++			var e eventBX
++			_ = json.Unmarshal(msg, &e)
++			b.events = append(b.events, e)
++			b.mu.Unlock()
++		}
++	}()
++
++	// wait until the client is registered and receiving notifications
++	deadline := time.Now().Add(10 * time.Second)
++	for {
++		storage.BroadcastMailboxStats()
++		time.Sleep(300 * time.Millisecond)
++		b.mu.Lock()
++		ready := len(b.events) > 0
++		b.events = nil
++		b.mu.Unlock()
++		if ready {
++			break
++		}
++		if time.Now().After(deadline) {
++			t.Fatal("the web UI client never received a notification")
++		}
++	}
++	return b
++}
++
++// settle waits until no notification has arrived for a while, then returns
++// what was received since the previous call.
++func (b *browserBX) settle(t *testing.T) []eventBX {
++	t.Helper()
++	start := time.Now()
++	deadline := start.Add(20 * time.Second)
++	for {
++		b.mu.Lock()
++		since := b.last
++		if since.Before(start) {
++			since = start
++		}
++		quiet := time.Since(since) > 750*time.Millisecond
++		b.mu.Unlock()
++		if quiet || time.Now().After(deadline) {
++			break
++		}
++		time.Sleep(25 * time.Millisecond)
++	}
++	b.mu.Lock()
++	defer b.mu.Unlock()
++	out := b.events
++	b.events = nil
++	return out
++}
++
++// stillConnected checks that the client keeps receiving notifications after
++// the action, by delivering one more message.
++func (b *browserBX) stillConnected(t *testing.T) {
++	t.Helper()
++	b.mu.Lock()
++	closed := b.closed
++	b.mu.Unlock()
++	if closed {
++		t.Fatal("the web UI connection was closed by the server")
++	}
++	if _, err := storage.Store(rawMessageBX("after", 0), nil); err != nil {
++		t.Fatal(err)
++	}
++	for _, e := range b.settle(t) {
++		if e.Type == "new" {
++			return
++		}
++	}
++	t.Fatal("the web UI client stopped receiving notifications")
++}
++
++func rawMessageBX(tag string, i int) *[]byte {
++	raw := []byte(fmt.Sprintf("From: sender-%d@example.com\r\nTo: rcpt@example.com\r\n"+
++		"Subject: %s message %d\r\nMessage-ID: <%s-%d-%d@example.com>\r\n\r\nbody %d\r\n",
++		i, tag, i, tag, i, time.Now().UnixNano(), i))
++	return &raw
++}
++
++func storeBX(t *testing.T, tag string, n int) []string {
++	t.Helper()
++	ids := make([]string, 0, n)
++	for i := 0; i < n; i++ {
++		id, err := storage.Store(rawMessageBX(tag, i), nil)
++		if err != nil {
++			t.Fatal(err)
++		}
++		ids = append(ids, id)
++	}
++	return ids
++}
++
++func countsBX(t *testing.T, base string) (total, unread uint64) {
++	t.Helper()
++	m := apiv1.MessagesSummary{}
++	data, err := clientGet(base + "/api/v1/messages?limit=1")
++	if err != nil {
++		t.Fatal(err)
++	}
++	if err := json.Unmarshal(data, &m); err != nil {
++		t.Fatalf("decoding %s: %v", data, err)
++	}
++	return m.Total, m.Unread
++}
++
++// toldAboutAllBX reports whether the notifications tell a client about every
++// listed message. A reload notification ("prune") counts for every message;
++// otherwise each message needs its own notification of the given kind.
++func toldAboutAllBX(events []eventBX, kind string, ids []string) (bool, int) {
++	seen := map[string]bool{}
++	for _, e := range events {
++		if e.Type == "prune" {
++			return true, len(ids)
++		}
++		if e.Type == kind {
++			seen[e.Data.ID] = true
++		}
++	}
++	n := 0
++	for _, id := range ids {
++		if seen[id] {
++			n++
++		}
++	}
++	return n == len(ids), n
++}
++
++func idsJSONBX(ids []string) string {
++	b, _ := json.Marshal(ids)
++	return string(b)
++}
++
++func TestDeleteSearchTellsBrowserAboutEveryDeletionBX(t *testing.T) {
++	ts := startBX(t)
++	ids := storeBX(t, "doomed", 1100)
++	storeBX(t, "kept", 5)
++	b := connectBX(t, ts)
++
++	if _, err := clientDelete(ts.URL+"/api/v1/search?query=doomed", ""); err != nil {
++		t.Fatalf("deleting by search: %v", err)
++	}
++	events := b.settle(t)
++
++	if total, _ := countsBX(t, ts.URL); total != 5 {
++		t.Fatalf("after deleting 1100 of 1105 messages, total is %d, want 5", total)
++	}
++	if ok, n := toldAboutAllBX(events, "delete", ids); !ok {
++		t.Errorf("1100 messages were deleted; the web UI was told about %d of them "+
++			"and was not told to reload", n)
++	}
++	b.stillConnected(t)
++}
++
++func TestSearchMarkReadKeepsBrowserConnectedBX(t *testing.T) {
++	ts := startBX(t)
++	ids := storeBX(t, "bulkread", 3000)
++	b := connectBehindBX(t, ts)
++
++	if _, err := clientPut(ts.URL+"/api/v1/messages", `{"Read":true,"Search":"bulkread"}`); err != nil {
++		t.Fatalf("marking a search as read: %v", err)
++	}
++	// the browser is a second behind before it reads again
++	time.Sleep(time.Second)
++	b.catchUp()
++	events := b.settle(t)
++
++	if _, unread := countsBX(t, ts.URL); unread != 0 {
++		t.Fatalf("after marking every message read, %d are unread", unread)
++	}
++	b.stillConnected(t)
++	if ok, n := toldAboutAllBX(events, "update", ids); !ok {
++		t.Errorf("3000 messages were marked read; the web UI was told about %d of them "+
++			"and was not told to reload", n)
++	}
++}
++
++func TestDeleteManyIDsKeepsBrowserConnectedBX(t *testing.T) {
++	ts := startBX(t)
++	ids := storeBX(t, "bulkdelete", 3000)
++	b := connectBehindBX(t, ts)
++
++	if _, err := clientDelete(ts.URL+"/api/v1/messages", `{"IDs":`+idsJSONBX(ids)+`}`); err != nil {
++		t.Fatalf("deleting by IDs: %v", err)
++	}
++	// the browser is a second behind before it reads again
++	time.Sleep(time.Second)
++	b.catchUp()
++	events := b.settle(t)
++
++	if total, _ := countsBX(t, ts.URL); total != 0 {
++		t.Fatalf("after deleting every message, total is %d", total)
++	}
++	b.stillConnected(t)
++	if ok, n := toldAboutAllBX(events, "delete", ids); !ok {
++		t.Errorf("3000 messages were deleted; the web UI was told about %d of them "+
++			"and was not told to reload", n)
++	}
++}
++
++func TestBulkActionsAcceptLongIDListsBX(t *testing.T) {
++	ts := startBX(t)
++	real := storeBX(t, "longlist", 50)
++	ids := append([]string{}, real...)
++	for i := 0; i < 40000; i++ {
++		ids = append(ids, fmt.Sprintf("missing-%d", i))
++	}
++
++	if _, err := clientPut(ts.URL+"/api/v1/messages", `{"Read":true,"IDs":`+idsJSONBX(ids)+`}`); err != nil {
++		t.Fatalf("marking 40050 IDs read: %v", err)
++	}
++	if _, unread := countsBX(t, ts.URL); unread != 0 {
++		t.Fatalf("after marking every stored message read, %d are unread", unread)
++	}
++
++	if _, err := clientPut(ts.URL+"/api/v1/messages", `{"Read":false,"IDs":`+idsJSONBX(ids)+`}`); err != nil {
++		t.Fatalf("marking 40050 IDs unread: %v", err)
++	}
++	if _, unread := countsBX(t, ts.URL); unread != 50 {
++		t.Fatalf("after marking every stored message unread, %d are unread, want 50", unread)
++	}
++
++	if _, err := clientDelete(ts.URL+"/api/v1/messages", `{"IDs":`+idsJSONBX(ids)+`}`); err != nil {
++		t.Fatalf("deleting 40050 IDs: %v", err)
++	}
++	if total, _ := countsBX(t, ts.URL); total != 0 {
++		t.Fatalf("after deleting every stored message, total is %d", total)
++	}
++}
++
++func TestReadStatusNotificationsArriveInOrderBX(t *testing.T) {
++	ts := startBX(t)
++	id := storeBX(t, "toggle", 1)[0]
++	b := connectBX(t, ts)
++
++	const rounds = 5000
++	for i := 0; i < rounds; i++ {
++		if err := storage.MarkRead([]string{id}); err != nil {
++			t.Fatal(err)
++		}
++		if err := storage.MarkUnread([]string{id}); err != nil {
++			t.Fatal(err)
++		}
++	}
++
++	var got []bool
++	for _, e := range b.settle(t) {
++		if e.Type == "update" && e.Data.ID == id {
++			got = append(got, e.Data.Read)
++		}
++	}
++	if len(got) != 2*rounds {
++		t.Fatalf("expected %d read-status notifications, got %d", 2*rounds, len(got))
++	}
++	for i, read := range got {
++		if want := i%2 == 0; read != want {
++			t.Fatalf("notification %d says Read=%v, but that change made it Read=%v; "+
++				"the web UI would show the wrong state", i+1, read, want)
++		}
++	}
++}
++
++// smallBufferListenerBX keeps the server's socket send buffer small, so that a
++// client which stops reading is noticed after a few kilobytes rather than
++// after whatever the operating system would otherwise buffer.
++type smallBufferListenerBX struct{ net.Listener }
++
++// smallBufferDialerBX dials with a small socket receive buffer, so that a
++// client which stops reading is noticed quickly.
++func smallBufferDialerBX() *websocket.Dialer {
++	return &websocket.Dialer{NetDialContext: func(ctx context.Context, network, addr string) (net.Conn, error) {
++		nd := net.Dialer{Control: func(_, _ string, c syscall.RawConn) error {
++			// best effort: a sandbox may refuse to resize the buffer
++			return c.Control(func(fd uintptr) {
++				_ = syscall.SetsockoptInt(int(fd), syscall.SOL_SOCKET, syscall.SO_RCVBUF, 4096)
++			})
++		}}
++		return nd.DialContext(ctx, network, addr)
++	}}
++}
++
++func (l smallBufferListenerBX) Accept() (net.Conn, error) {
++	c, err := l.Listener.Accept()
++	if tc, ok := c.(*net.TCPConn); ok {
++		_ = tc.SetWriteBuffer(4096)
++	}
++	return c, err
++}
++
++func TestSlowBrowserIsNotDisconnectedBX(t *testing.T) {
++	ts := startBX(t)
++	id := storeBX(t, "slow", 1)[0]
++
++	// a browser with a small receive buffer that stops reading for a second
++	conn, _, err := smallBufferDialerBX().Dial("ws"+strings.TrimPrefix(ts.URL, "http")+"/api/events", nil)
++	if err != nil {
++		t.Fatalf("connecting to /api/events: %v", err)
++	}
++
++	// the client reads until it has received one notification, which shows it
++	// is registered, then stops reading until resume is closed
++	var (
++		mu     sync.Mutex
++		got    []bool
++		closed bool
++	)
++	registered := make(chan struct{})
++	resume := make(chan struct{})
++	var resumeOnce sync.Once
++	resumeReading := func() { resumeOnce.Do(func() { close(resume) }) }
++	done := make(chan struct{})
++	go func() {
++		defer close(done)
++		if _, _, err := conn.ReadMessage(); err != nil {
++			mu.Lock()
++			closed = true
++			mu.Unlock()
++			return
++		}
++		close(registered)
++		<-resume
++		for {
++			_, msg, err := conn.ReadMessage()
++			if err != nil {
++				mu.Lock()
++				closed = true
++				mu.Unlock()
++				return
++			}
++			var e eventBX
++			_ = json.Unmarshal(msg, &e)
++			if e.Type == "update" && e.Data.ID == id {
++				mu.Lock()
++				got = append(got, e.Data.Read)
++				mu.Unlock()
++			}
++		}
++	}()
++	t.Cleanup(func() {
++		resumeReading()
++		_ = conn.Close()
++		<-done
++	})
++
++	for deadline := time.Now().Add(10 * time.Second); ; {
++		storage.BroadcastMailboxStats()
++		select {
++		case <-registered:
++		case <-done:
++			t.Fatal("the web UI connection closed before receiving a notification")
++		case <-time.After(300 * time.Millisecond):
++			if time.Now().After(deadline) {
++				t.Fatal("the web UI client never received a notification")
++			}
++			continue
++		}
++		break
++	}
++
++	const rounds = 5000
++	paused := time.AfterFunc(time.Second, resumeReading)
++	defer paused.Stop()
++	for i := 0; i < rounds; i++ {
++		if err := storage.MarkRead([]string{id}); err != nil {
++			t.Fatal(err)
++		}
++		if err := storage.MarkUnread([]string{id}); err != nil {
++			t.Fatal(err)
++		}
++	}
++
++	deadline := time.Now().Add(60 * time.Second)
++	for {
++		mu.Lock()
++		n, c := len(got), closed
++		mu.Unlock()
++		if n == 2*rounds || c || time.Now().After(deadline) {
++			break
++		}
++		time.Sleep(25 * time.Millisecond)
++	}
++
++	mu.Lock()
++	defer mu.Unlock()
++	if closed {
++		t.Fatalf("the web UI stopped reading for a second and was disconnected after %d of %d notifications",
++			len(got), 2*rounds)
++	}
++	if len(got) != 2*rounds {
++		t.Fatalf("the web UI caught up but received %d of %d notifications", len(got), 2*rounds)
++	}
++	for i, read := range got {
++		if want := i%2 == 0; read != want {
++			t.Fatalf("notification %d says Read=%v, but that change made it Read=%v", i+1, read, want)
++		}
++	}
++}
++
++func tagCountsBX(t *testing.T, base string) map[string]int64 {
++	t.Helper()
++	data, err := clientGet(base + "/api/v1/info")
++	if err != nil {
++		t.Fatal(err)
++	}
++	var info struct {
++		Tags map[string]int64
++	}
++	if err := json.Unmarshal(data, &info); err != nil {
++		t.Fatalf("decoding %s: %v", data, err)
++	}
++	return info.Tags
++}
++
++func TestMarkAllUpdatesOpenBrowserBX(t *testing.T) {
++	ts := startBX(t)
++	ids := storeBX(t, "everything", 50)
++	b := connectBX(t, ts)
++
++	if _, err := clientPut(ts.URL+"/api/v1/messages", `{"Read":true}`); err != nil {
++		t.Fatalf("marking every message read: %v", err)
++	}
++	events := b.settle(t)
++	if _, unread := countsBX(t, ts.URL); unread != 0 {
++		t.Fatalf("after marking every message read, %d are unread", unread)
++	}
++	if ok, n := toldAboutAllBX(events, "update", ids); !ok {
++		t.Errorf("every message was marked read; an open web UI was told about %d of 50 "+
++			"and was not told to reload", n)
++	}
++
++	if _, err := clientPut(ts.URL+"/api/v1/messages", `{"Read":false}`); err != nil {
++		t.Fatalf("marking every message unread: %v", err)
++	}
++	events = b.settle(t)
++	if _, unread := countsBX(t, ts.URL); unread != 50 {
++		t.Fatalf("after marking every message unread, %d are unread, want 50", unread)
++	}
++	if ok, n := toldAboutAllBX(events, "update", ids); !ok {
++		t.Errorf("every message was marked unread; an open web UI was told about %d of 50 "+
++			"and was not told to reload", n)
++	}
++	b.stillConnected(t)
++}
++
++func TestBulkTaggingReachesBrowserBX(t *testing.T) {
++	ts := startBX(t)
++	ids := storeBX(t, "bulktag", 3000)
++	b := connectBehindBX(t, ts)
++
++	if _, err := clientPut(ts.URL+"/api/v1/tags", `{"Tags":["Campaign"],"IDs":`+idsJSONBX(ids)+`}`); err != nil {
++		t.Fatalf("tagging 3000 messages: %v", err)
++	}
++	// the browser is a second behind before it reads again
++	time.Sleep(time.Second)
++	b.catchUp()
++	events := b.settle(t)
++
++	if n := tagCountsBX(t, ts.URL)["Campaign"]; n != 3000 {
++		t.Fatalf("after tagging 3000 messages the tag is on %d", n)
++	}
++	b.stillConnected(t)
++	if ok, n := toldAboutAllBX(events, "update", ids); !ok {
++		t.Errorf("3000 messages were tagged; the web UI was told about %d of them "+
++			"and was not told to reload", n)
++	}
++}
++
++func TestTaggingMissingMessagesLeavesNoTagBX(t *testing.T) {
++	ts := startBX(t)
++	ids := storeBX(t, "present", 2)
++
++	if _, err := clientPut(ts.URL+"/api/v1/tags", `{"Tags":["Ghost"],"IDs":["gone-1","gone-2"]}`); err != nil {
++		t.Fatalf("tagging messages that do not exist: %v", err)
++	}
++	if n, ok := tagCountsBX(t, ts.URL)["Ghost"]; ok {
++		t.Errorf("no existing message was tagged, but the tag list has Ghost on %d message(s)", n)
++	}
++
++	mixed := []string{"gone-3", ids[0]}
++	if _, err := clientPut(ts.URL+"/api/v1/tags", `{"Tags":["Mixed"],"IDs":`+idsJSONBX(mixed)+`}`); err != nil {
++		t.Fatalf("tagging a mix of existing and missing messages: %v", err)
++	}
++	if n := tagCountsBX(t, ts.URL)["Mixed"]; n != 1 {
++		t.Errorf("one existing message was tagged, but the tag list has Mixed on %d", n)
++	}
++}
+diff --git a/test.sh b/test.sh
+new file mode 100755
+index 0000000..d84911c
+--- /dev/null
++++ b/test.sh
+@@ -0,0 +1,65 @@
++#!/bin/sh
++set -e
++
++# ./test.sh [--output_path <junit.xml>] [base|new] runs one test set.
++# base runs the existing tests of the packages listed below; new runs only the
++# tests in files behind the bulkevents build tag. The mode defaults to base.
++OUTPUT_PATH=""
++MODE=""
++while [ "$#" -gt 0 ]; do
++    case "$1" in
++        --output_path)
++            if [ "$#" -lt 2 ] || [ -z "$2" ]; then
++                echo "--output_path needs a file path" >&2
++                exit 2
++            fi
++            OUTPUT_PATH="$2"
++            shift 2
++            ;;
++        base|new)
++            if [ -n "$MODE" ]; then
++                echo "mode given more than once: $MODE and $1" >&2
++                exit 2
++            fi
++            MODE="$1"
++            shift
++            ;;
++        *)
++            echo "usage: ./test.sh [--output_path <junit.xml>] [base|new]" >&2
++            exit 2
++            ;;
++    esac
++done
++[ -n "$MODE" ] || MODE=base
++case "$OUTPUT_PATH" in
++    "" | /*) ;;
++    *) OUTPUT_PATH="$PWD/$OUTPUT_PATH" ;;
++esac
++[ -f go.mod ] || cd "$(dirname "$0")"
++
++case "$MODE" in
++    base)
++        set -- -timeout 600s ./internal/storage/... ./server/...
++        ;;
++    new)
++        files=$(grep -rl --include='*_test.go' '^//go:build bulkevents$' .)
++        tests=$(sed -n 's/^func \(Test[A-Za-z0-9_]*\)(t \*testing\.T) {$/\1/p' $files | paste -sd '|' -)
++        set -- -tags bulkevents -timeout 600s -run "^($tests)\$" \
++            $(for f in $files; do dirname "$f"; done | sort -u)
++        ;;
++esac
++
++TEST_LOG="$(mktemp)"
++STATUS=0
++go test -count=1 -v "$@" >"$TEST_LOG" 2>&1 || STATUS=$?
++cat "$TEST_LOG"
++
++if [ -n "$OUTPUT_PATH" ]; then
++    junit_status=0
++    go-junit-report -set-exit-code <"$TEST_LOG" >"$OUTPUT_PATH" || junit_status=$?
++    if [ "$junit_status" -ne 0 ] && [ "$STATUS" -eq 0 ]; then
++        echo "go-junit-report failed to convert the test log (exit $junit_status)" >&2
++        STATUS=$junit_status
++    fi
++fi
++exit "$STATUS"

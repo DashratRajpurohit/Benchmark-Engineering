@@ -1,0 +1,23 @@
+{
+ "byAgent": {
+  "antigravity": {
+   "medianLOC": 1052.5,
+   "medianMessages": 387.5,
+   "passed": 2,
+   "total": 2
+  }
+ },
+ "byModel": {
+  "gemini-3.8-flash": {
+   "medianLOC": 1052.5,
+   "medianMessages": 387.5,
+   "passed": 2,
+   "total": 2
+  }
+ },
+ "medianLocOverall": 1052.5,
+ "medianMessagesOverall": 387.5,
+ "passedRuns": 2,
+ "totalRuns": 2,
+ "updatedAt": 1791806882220
+}

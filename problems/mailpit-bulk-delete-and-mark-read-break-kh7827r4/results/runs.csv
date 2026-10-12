@@ -1,0 +1,5 @@
+label,agent,agentType,verdict,stale,reEvalRound,fault,filesModified,solutionLOC,agentMessages,sequenceLength,executionTimeSeconds,environmentBlocker,createdIST,id
+Nova #1,Nova,antigravity,PASS_LEGITIMATE,True,,pass,9,838,439,540679,1888.50254,True,2026-10-11T22:35:19.921000+05:30,rd7fawwc69hrzdqkccdhm7bg098g2jzy
+Nova #1,Nova,antigravity,PASS_LEGITIMATE,True,,pass,7,779,287,246336,1425.152781,False,2026-10-12T11:28:23.819000+05:30,rd7a984vfbdr4233krjatmvkzx8g5eev
+Nova #1,Nova,antigravity,PASS_LEGITIMATE,True,,pass,16,1136,431,551876,3689.472236,True,2026-10-12T15:48:57.580000+05:30,rd79fta38n0hfnfz6dm28fh79h8g420t
+Nova #1,Nova,antigravity,PASS_LEGITIMATE,True,,pass,11,969,344,235271,3416.358971,True,2026-10-12T16:40:50.628000+05:30,rd764tdf3qh05wt5z885arbjs58g44ns

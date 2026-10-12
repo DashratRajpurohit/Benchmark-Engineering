@@ -1,0 +1,795 @@
+diff --git a/internal/storage/messages.go b/internal/storage/messages.go
+index bd54f7a..dee060e 100644
+--- a/internal/storage/messages.go
++++ b/internal/storage/messages.go
+@@ -542,111 +542,103 @@ func LatestID(r *http.Request) (string, error) {
+ 
+ // MarkRead will mark a message as read
+ func MarkRead(ids []string) error {
+-	if len(ids) == 0 {
+-		return nil
+-	}
++	return setReadStatus(ids, true)
++}
+ 
+-	args := make([]any, len(ids))
+-	for i, id := range ids {
+-		args[i] = id
+-	}
+-	placeholder := `(?` + strings.Repeat(",?", len(ids)-1) + `)`
++// MarkUnread will mark a message as unread
++func MarkUnread(ids []string) error {
++	return setReadStatus(ids, false)
++}
+ 
+-	// Find which messages are actually unread (will change state)
+-	toUpdate := []string{}
+-	rows, err := db.Query(fmt.Sprintf(`SELECT ID FROM %s WHERE Read = 0 AND ID IN %s`, tenant("mailbox"), placeholder), args...) // #nosec
+-	if err != nil {
+-		return err
+-	}
+-	for rows.Next() {
+-		var id string
+-		if err := rows.Scan(&id); err != nil {
+-			_ = rows.Close()
+-			return err
++// sqlChunkSize is the maximum number of message IDs bound to a single query
++const sqlChunkSize = 1000
++
++// uniqueIDs returns the IDs without duplicates, keeping their order, so that a
++// message listed twice is not counted twice when the IDs are queried in chunks
++func uniqueIDs(ids []string) []string {
++	seen := make(map[string]bool, len(ids))
++	out := make([]string, 0, len(ids))
++	for _, id := range ids {
++		if !seen[id] {
++			seen[id] = true
++			out = append(out, id)
+ 		}
+-		toUpdate = append(toUpdate, id)
+-	}
+-	_ = rows.Close()
+-
+-	if len(toUpdate) == 0 {
+-		return nil
+-	}
+-
+-	updateArgs := make([]any, len(toUpdate))
+-	for i, id := range toUpdate {
+-		updateArgs[i] = id
+-	}
+-	updatePlaceholder := `(?` + strings.Repeat(",?", len(toUpdate)-1) + `)`
+-
+-	if _, err := db.Exec(fmt.Sprintf(`UPDATE %s SET Read = 1 WHERE ID IN %s`, tenant("mailbox"), updatePlaceholder), updateArgs...); err != nil { // #nosec
+-		return err
+-	}
+-
+-	for _, id := range toUpdate {
+-		logger.Log().Debugf("[db] marked message %s as read", id)
+-		websockets.Broadcast("update", struct {
+-			ID   string
+-			Read bool
+-		}{ID: id, Read: true})
+ 	}
+ 
+-	BroadcastMailboxStats()
+-
+-	return nil
++	return out
+ }
+ 
+-// MarkUnread will mark a message as unread
+-func MarkUnread(ids []string) error {
++// setReadStatus marks messages as read or unread, notifying connected clients
++// of the messages whose status changed
++func setReadStatus(ids []string, read bool) error {
+ 	if len(ids) == 0 {
+ 		return nil
+ 	}
+ 
+-	args := make([]any, len(ids))
+-	for i, id := range ids {
+-		args[i] = id
++	ids = uniqueIDs(ids)
++
++	changeMu.Lock()
++	defer changeMu.Unlock()
++
++	status := "read"
++	from, to := 0, 1
++	if !read {
++		status = "unread"
++		from, to = 1, 0
+ 	}
+-	placeholder := `(?` + strings.Repeat(",?", len(ids)-1) + `)`
+ 
+-	// Find which messages are actually read (will change state)
++	// Find which messages will actually change state
+ 	toUpdate := []string{}
+-	rows, err := db.Query(fmt.Sprintf(`SELECT ID FROM %s WHERE Read = 1 AND ID IN %s`, tenant("mailbox"), placeholder), args...) // #nosec
+-	if err != nil {
+-		return err
+-	}
+-	for rows.Next() {
+-		var id string
+-		if err := rows.Scan(&id); err != nil {
++	for _, chunk := range chunkBy(ids, sqlChunkSize) {
++		args := make([]any, len(chunk))
++		for i, id := range chunk {
++			args[i] = id
++		}
++		placeholder := `(?` + strings.Repeat(",?", len(chunk)-1) + `)`
++
++		rows, err := db.Query(fmt.Sprintf(`SELECT ID FROM %s WHERE Read = %d AND ID IN %s`, tenant("mailbox"), from, placeholder), args...) // #nosec
++		if err != nil {
++			return err
++		}
++		for rows.Next() {
++			var id string
++			if err := rows.Scan(&id); err != nil {
++				_ = rows.Close()
++				return err
++			}
++			toUpdate = append(toUpdate, id)
++		}
++		if err := rows.Err(); err != nil {
+ 			_ = rows.Close()
+ 			return err
+ 		}
+-		toUpdate = append(toUpdate, id)
++		_ = rows.Close()
+ 	}
+-	_ = rows.Close()
+ 
+ 	if len(toUpdate) == 0 {
+ 		return nil
+ 	}
+ 
+-	updateArgs := make([]any, len(toUpdate))
+-	for i, id := range toUpdate {
+-		updateArgs[i] = id
+-	}
+-	updatePlaceholder := `(?` + strings.Repeat(",?", len(toUpdate)-1) + `)`
++	for _, chunk := range chunkBy(toUpdate, sqlChunkSize) {
++		args := make([]any, len(chunk))
++		for i, id := range chunk {
++			args[i] = id
++		}
++		placeholder := `(?` + strings.Repeat(",?", len(chunk)-1) + `)`
+ 
+-	if _, err := db.Exec(fmt.Sprintf(`UPDATE %s SET Read = 0 WHERE ID IN %s`, tenant("mailbox"), updatePlaceholder), updateArgs...); err != nil { // #nosec
+-		return err
++		if _, err := db.Exec(fmt.Sprintf(`UPDATE %s SET Read = %d WHERE ID IN %s`, tenant("mailbox"), to, placeholder), args...); err != nil { // #nosec
++			return err
++		}
+ 	}
+ 
+ 	dbLastAction = time.Now()
+ 
+ 	for _, id := range toUpdate {
+-		logger.Log().Debugf("[db] marked message %s as unread", id)
+-		websockets.Broadcast("update", struct {
+-			ID   string
+-			Read bool
+-		}{ID: id, Read: false})
++		logger.Log().Debugf("[db] marked message %s as %s", id, status)
+ 	}
+ 
++	broadcastReadStatus(toUpdate, read)
++
+ 	BroadcastMailboxStats()
+ 
+ 	return nil
+@@ -654,6 +646,9 @@ func MarkUnread(ids []string) error {
+ 
+ // MarkAllRead will mark all messages as read
+ func MarkAllRead() error {
++	changeMu.Lock()
++	defer changeMu.Unlock()
++
+ 	var (
+ 		start = time.Now()
+ 		total = CountUnread()
+@@ -670,6 +665,11 @@ func MarkAllRead() error {
+ 	elapsed := time.Since(start)
+ 	logger.Log().Debugf("[db] marked %v messages as read in %s", total, elapsed)
+ 
++	if total > 0 {
++		// every listed message may have changed, so connected clients reload
++		websockets.Broadcast("prune", nil)
++	}
++
+ 	BroadcastMailboxStats()
+ 
+ 	dbLastAction = time.Now()
+@@ -679,6 +679,9 @@ func MarkAllRead() error {
+ 
+ // MarkAllUnread will mark all messages as unread
+ func MarkAllUnread() error {
++	changeMu.Lock()
++	defer changeMu.Unlock()
++
+ 	var (
+ 		start = time.Now()
+ 		total = CountRead()
+@@ -695,6 +698,11 @@ func MarkAllUnread() error {
+ 	elapsed := time.Since(start)
+ 	logger.Log().Debugf("[db] marked %v messages as unread in %s", total, elapsed)
+ 
++	if total > 0 {
++		// every listed message may have changed, so connected clients reload
++		websockets.Broadcast("prune", nil)
++	}
++
+ 	BroadcastMailboxStats()
+ 
+ 	dbLastAction = time.Now()
+@@ -710,35 +718,42 @@ func DeleteMessages(ids []string) error {
+ 
+ 	start := time.Now()
+ 
+-	args := make([]any, len(ids))
+-	for i, id := range ids {
+-		args[i] = id
+-	}
+-
+-	sql := fmt.Sprintf(`SELECT ID, Size FROM %s WHERE  ID IN (?%s)`, tenant("mailbox"), strings.Repeat(",?", len(args)-1)) // #nosec
+-	rows, err := db.Query(sql, args...)
+-	if err != nil {
+-		return err
+-	}
+-	defer func() { _ = rows.Close() }()
++	changeMu.Lock()
++	defer changeMu.Unlock()
+ 
+ 	toDelete := []string{}
+ 	var totalSize uint64
+ 
+-	for rows.Next() {
+-		var id string
+-		var size float64 // use float64 for rqlite compatibility
++	for _, chunk := range chunkBy(uniqueIDs(ids), sqlChunkSize) {
++		args := make([]any, len(chunk))
++		for i, id := range chunk {
++			args[i] = id
++		}
+ 
+-		if err := rows.Scan(&id, &size); err != nil {
++		sql := fmt.Sprintf(`SELECT ID, Size FROM %s WHERE  ID IN (?%s)`, tenant("mailbox"), strings.Repeat(",?", len(args)-1)) // #nosec
++		rows, err := db.Query(sql, args...)
++		if err != nil {
+ 			return err
+ 		}
+ 
+-		toDelete = append(toDelete, id)
+-		totalSize = totalSize + uint64(size)
+-	}
++		for rows.Next() {
++			var id string
++			var size float64 // use float64 for rqlite compatibility
+ 
+-	if err = rows.Err(); err != nil {
+-		return err
++			if err := rows.Scan(&id, &size); err != nil {
++				_ = rows.Close()
++				return err
++			}
++
++			toDelete = append(toDelete, id)
++			totalSize = totalSize + uint64(size)
++		}
++
++		if err = rows.Err(); err != nil {
++			_ = rows.Close()
++			return err
++		}
++		_ = rows.Close()
+ 	}
+ 
+ 	if len(toDelete) == 0 {
+@@ -752,19 +767,21 @@ func DeleteMessages(ids []string) error {
+ 	// roll back if it fails
+ 	defer func() { _ = tx.Rollback() }()
+ 
+-	args = make([]any, len(toDelete))
+-	for i, id := range toDelete {
+-		args[i] = id
+-	}
+-
+ 	tables := []string{"mailbox", "mailbox_data", "message_tags"}
+ 
+-	for _, t := range tables {
+-		sql = fmt.Sprintf(`DELETE FROM %s WHERE ID IN (?%s)`, tenant(t), strings.Repeat(",?", len(toDelete)-1))
++	for _, chunk := range chunkBy(toDelete, sqlChunkSize) {
++		args := make([]any, len(chunk))
++		for i, id := range chunk {
++			args[i] = id
++		}
+ 
+-		_, err = tx.Exec(sql, args...) // #nosec
+-		if err != nil {
+-			return err
++		for _, t := range tables {
++			sql := fmt.Sprintf(`DELETE FROM %s WHERE ID IN (?%s)`, tenant(t), strings.Repeat(",?", len(chunk)-1))
++
++			_, err = tx.Exec(sql, args...) // #nosec
++			if err != nil {
++				return err
++			}
+ 		}
+ 	}
+ 
+@@ -790,22 +807,20 @@ func DeleteMessages(ids []string) error {
+ 
+ 	BroadcastMailboxStats()
+ 
+-	// broadcast individual message deletions
+ 	for _, id := range toDelete {
+ 		invalidateEnvelopeCache(id)
+-
+-		d := struct {
+-			ID string
+-		}{ID: id}
+-
+-		websockets.Broadcast("delete", d)
+ 	}
+ 
++	broadcastDeleted(toDelete)
++
+ 	return nil
+ }
+ 
+ // DeleteAllMessages will delete all messages from a mailbox
+ func DeleteAllMessages() error {
++	changeMu.Lock()
++	defer changeMu.Unlock()
++
+ 	var (
+ 		start = time.Now()
+ 		total int
+diff --git a/internal/storage/notifications.go b/internal/storage/notifications.go
+index ff42959..dcdcde7 100644
+--- a/internal/storage/notifications.go
++++ b/internal/storage/notifications.go
+@@ -1,28 +1,33 @@
+ package storage
+ 
+ import (
++	"sync"
++	"sync/atomic"
+ 	"time"
+ 
+ 	"github.com/axllent/mailpit/config"
+ 	"github.com/axllent/mailpit/server/websockets"
+ )
+ 
+-var bcStatsDelay = false
++var bcStatsDelay atomic.Bool
++
++// changeMu is held while messages are changed and the resulting notifications
++// are queued, so that connected clients are notified in the same order as the
++// changes are applied to the database
++var changeMu sync.Mutex
+ 
+ // BroadcastMailboxStats broadcasts the total number of messages
+ // displayed to the web UI, as well as the total unread messages.
+ // The lookup is very fast (< 10ms / 100k messages under load).
+ // Rate limited to 4x per second.
+ func BroadcastMailboxStats() {
+-	if bcStatsDelay {
++	if !bcStatsDelay.CompareAndSwap(false, true) {
+ 		return
+ 	}
+ 
+-	bcStatsDelay = true
+-
+ 	go func() {
+ 		time.Sleep(250 * time.Millisecond)
+-		bcStatsDelay = false
++		bcStatsDelay.Store(false)
+ 		b := struct {
+ 			Total   uint64
+ 			Unread  uint64
+@@ -36,3 +41,38 @@ func BroadcastMailboxStats() {
+ 		websockets.Broadcast("stats", b)
+ 	}()
+ }
++
++// bulkBroadcastLimit is the number of changed messages above which connected
++// clients are told to reload rather than sent one notification per message.
++const bulkBroadcastLimit = 200
++
++// broadcastDeleted notifies connected clients of deleted messages
++func broadcastDeleted(ids []string) {
++	if len(ids) > bulkBroadcastLimit {
++		websockets.Broadcast("prune", nil)
++		return
++	}
++
++	for _, id := range ids {
++		d := struct {
++			ID string
++		}{ID: id}
++
++		websockets.Broadcast("delete", d)
++	}
++}
++
++// broadcastReadStatus notifies connected clients of messages marked as read or unread
++func broadcastReadStatus(ids []string, read bool) {
++	if len(ids) > bulkBroadcastLimit {
++		websockets.Broadcast("prune", nil)
++		return
++	}
++
++	for _, id := range ids {
++		websockets.Broadcast("update", struct {
++			ID   string
++			Read bool
++		}{ID: id, Read: read})
++	}
++}
+diff --git a/internal/storage/search.go b/internal/storage/search.go
+index 519220d..73da5e5 100644
+--- a/internal/storage/search.go
++++ b/internal/storage/search.go
+@@ -13,7 +13,6 @@ import (
+ 	"github.com/araddon/dateparse"
+ 	"github.com/axllent/mailpit/internal/logger"
+ 	"github.com/axllent/mailpit/internal/tools"
+-	"github.com/axllent/mailpit/server/websockets"
+ 	"github.com/leporo/sqlf"
+ )
+ 
+@@ -146,6 +145,9 @@ func SearchUnreadCount(search, timezone string, beforeTS int64) (int64, error) {
+ // is:read, is:unread, has:attachment, to:<term>, from:<term> & subject:<term>
+ // Negative searches also also included by prefixing the search term with a `-` or `!`
+ func DeleteSearch(search, timezone string) error {
++	changeMu.Lock()
++	defer changeMu.Unlock()
++
+ 	q := searchQueryBuilder(search, timezone)
+ 
+ 	ids := []string{}
+@@ -177,22 +179,6 @@ func DeleteSearch(search, timezone string) error {
+ 	if len(ids) > 0 {
+ 		total := len(ids)
+ 
+-		// split ids into chunks of 1000 ids
+-		var chunks [][]string
+-		if total > 1000 {
+-			chunkSize := 1000
+-			chunks = make([][]string, 0, (len(ids)+chunkSize-1)/chunkSize)
+-			for chunkSize < len(ids) {
+-				ids, chunks = ids[chunkSize:], append(chunks, ids[0:chunkSize:chunkSize])
+-			}
+-			if len(ids) > 0 {
+-				// add remaining ids <= 1000
+-				chunks = append(chunks, ids)
+-			}
+-		} else {
+-			chunks = append(chunks, ids)
+-		}
+-
+ 		// begin a transaction to ensure both the message
+ 		// and data are deleted successfully
+ 		tx, err := db.BeginTx(context.Background(), nil)
+@@ -203,27 +189,27 @@ func DeleteSearch(search, timezone string) error {
+ 		// roll back if it fails
+ 		defer func() { _ = tx.Rollback() }()
+ 
+-		for _, ids := range chunks {
+-			delIDs := make([]any, len(ids))
+-			for i, id := range ids {
++		for _, chunk := range chunkBy(ids, sqlChunkSize) {
++			delIDs := make([]any, len(chunk))
++			for i, id := range chunk {
+ 				delIDs[i] = id
+ 			}
+ 
+-			sqlDelete1 := `DELETE FROM ` + tenant("mailbox") + ` WHERE ID IN (?` + strings.Repeat(",?", len(ids)-1) + `)` // #nosec
++			sqlDelete1 := `DELETE FROM ` + tenant("mailbox") + ` WHERE ID IN (?` + strings.Repeat(",?", len(chunk)-1) + `)` // #nosec
+ 
+ 			_, err = tx.Exec(sqlDelete1, delIDs...)
+ 			if err != nil {
+ 				return err
+ 			}
+ 
+-			sqlDelete2 := `DELETE FROM ` + tenant("mailbox_data") + ` WHERE ID IN (?` + strings.Repeat(",?", len(ids)-1) + `)` // #nosec
++			sqlDelete2 := `DELETE FROM ` + tenant("mailbox_data") + ` WHERE ID IN (?` + strings.Repeat(",?", len(chunk)-1) + `)` // #nosec
+ 
+ 			_, err = tx.Exec(sqlDelete2, delIDs...)
+ 			if err != nil {
+ 				return err
+ 			}
+ 
+-			sqlDelete3 := `DELETE FROM ` + tenant("message_tags") + ` WHERE ID IN (?` + strings.Repeat(",?", len(ids)-1) + `)` // #nosec
++			sqlDelete3 := `DELETE FROM ` + tenant("message_tags") + ` WHERE ID IN (?` + strings.Repeat(",?", len(chunk)-1) + `)` // #nosec
+ 
+ 			_, err = tx.Exec(sqlDelete3, delIDs...)
+ 			if err != nil {
+@@ -244,16 +230,10 @@ func DeleteSearch(search, timezone string) error {
+ 		dbLastAction = time.Now()
+ 
+ 		// broadcast changes
+-		if len(ids) > 200 {
+-			websockets.Broadcast("prune", nil)
+-		} else {
+-			for _, id := range ids {
+-				d := struct {
+-					ID string
+-				}{ID: id}
+-				websockets.Broadcast("delete", d)
+-			}
++		for _, id := range ids {
++			invalidateEnvelopeCache(id)
+ 		}
++		broadcastDeleted(ids)
+ 
+ 		addDeletedSize(deleteSize)
+ 
+diff --git a/internal/storage/tags.go b/internal/storage/tags.go
+index 6398588..11e1b21 100644
+--- a/internal/storage/tags.go
++++ b/internal/storage/tags.go
+@@ -21,6 +21,24 @@ var (
+ 
+ // SetMessageTags will set the tags for a given database ID, removing any not in the array
+ func SetMessageTags(id string, tags []string) ([]string, error) {
++	applyTags, tagNames, err := setMessageTags(id, tags)
++	if err != nil {
++		return []string{}, err
++	}
++
++	d := struct {
++		ID   string
++		Tags []string
++	}{ID: id, Tags: applyTags}
++
++	websockets.Broadcast("update", d)
++
++	return tagNames, nil
++}
++
++// setMessageTags overwrites the tags of a message without notifying clients.
++// It returns the tags now set on the message and the names of the tags added.
++func setMessageTags(id string, tags []string) ([]string, []string, error) {
+ 	// Clean and deduplicate incoming tags (case-insensitive)
+ 	seen := make(map[string]struct{})
+ 	applyTags := []string{}
+@@ -58,7 +76,7 @@ func SetMessageTags(id string, tags []string) ([]string, error) {
+ 		}
+ 		name, err := addMessageTag(id, t)
+ 		if err != nil {
+-			return []string{}, err
++			return []string{}, []string{}, err
+ 		}
+ 		tagNames = append(tagNames, name)
+ 	}
+@@ -72,18 +90,77 @@ func SetMessageTags(id string, tags []string) ([]string, error) {
+ 	}
+ 	if len(toDelete) > 0 {
+ 		if err := deleteMessageTags(id, toDelete); err != nil {
+-			return []string{}, err
++			return []string{}, []string{}, err
+ 		}
+ 	}
+ 
+-	d := struct {
+-		ID   string
+-		Tags []string
+-	}{ID: id, Tags: applyTags}
++	return applyTags, tagNames, nil
++}
+ 
+-	websockets.Broadcast("update", d)
++// SetTagsOnMessages sets the tags of several messages at once, overwriting
++// their existing tags. IDs of messages that do not exist are ignored, and
++// connected clients are told to reload if many messages changed.
++func SetTagsOnMessages(ids []string, tags []string) error {
++	if len(ids) == 0 {
++		return nil
++	}
+ 
+-	return tagNames, nil
++	changeMu.Lock()
++	defer changeMu.Unlock()
++
++	existing := []string{}
++	for _, chunk := range chunkBy(uniqueIDs(ids), sqlChunkSize) {
++		args := make([]any, len(chunk))
++		for i, id := range chunk {
++			args[i] = id
++		}
++
++		rows, err := db.Query(fmt.Sprintf(`SELECT ID FROM %s WHERE ID IN (?%s)`, tenant("mailbox"), strings.Repeat(",?", len(chunk)-1)), args...) // #nosec
++		if err != nil {
++			return err
++		}
++		for rows.Next() {
++			var id string
++			if err := rows.Scan(&id); err != nil {
++				_ = rows.Close()
++				return err
++			}
++			existing = append(existing, id)
++		}
++		if err := rows.Err(); err != nil {
++			_ = rows.Close()
++			return err
++		}
++		_ = rows.Close()
++	}
++
++	if len(existing) == 0 {
++		return nil
++	}
++
++	applied := []string{}
++	for _, id := range existing {
++		var err error
++		if applied, _, err = setMessageTags(id, tags); err != nil {
++			return err
++		}
++	}
++
++	if len(existing) > bulkBroadcastLimit {
++		websockets.Broadcast("prune", nil)
++		return nil
++	}
++
++	for _, id := range existing {
++		d := struct {
++			ID   string
++			Tags []string
++		}{ID: id, Tags: applied}
++
++		websockets.Broadcast("update", d)
++	}
++
++	return nil
+ }
+ 
+ // AddMessageTag adds a tag to a message
+diff --git a/server/apiv1/tags.go b/server/apiv1/tags.go
+index 1c5ce73..cb5e80b 100644
+--- a/server/apiv1/tags.go
++++ b/server/apiv1/tags.go
+@@ -64,15 +64,9 @@ func SetMessageTags(w http.ResponseWriter, r *http.Request) {
+ 		return
+ 	}
+ 
+-	ids := data.IDs
+-
+-	if len(ids) > 0 {
+-		for _, id := range ids {
+-			if _, err := storage.SetMessageTags(id, data.Tags); err != nil {
+-				httpError(w, err.Error())
+-				return
+-			}
+-		}
++	if err := storage.SetTagsOnMessages(data.IDs, data.Tags); err != nil {
++		httpError(w, err.Error())
++		return
+ 	}
+ 
+ 	w.Header().Add("Content-Type", "text/plain")
+diff --git a/server/websockets/hub.go b/server/websockets/hub.go
+index a3f8b49..5e22f27 100644
+--- a/server/websockets/hub.go
++++ b/server/websockets/hub.go
+@@ -3,7 +3,9 @@ package websockets
+ 
+ import (
+ 	"encoding/json"
++	"sync"
+ 	"sync/atomic"
++	"time"
+ 
+ 	"github.com/axllent/mailpit/internal/logger"
+ 	"github.com/gorilla/websocket"
+@@ -26,6 +28,12 @@ type Hub struct {
+ 
+ 	// clientCount is an atomic count of connected clients, safe for concurrent reads.
+ 	clientCount atomic.Int64
++
++	// pending holds notifications in the order they were broadcast until Run
++	// delivers them; queued signals Run that pending is not empty.
++	pendingMu sync.Mutex
++	pending   [][]byte
++	queued    chan struct{}
+ }
+ 
+ // WebsocketNotification struct for responses
+@@ -41,6 +49,7 @@ func NewHub() *Hub {
+ 		register:   make(chan *Client),
+ 		unregister: make(chan *Client),
+ 		Clients:    make(map[*Client]bool),
++		queued:     make(chan struct{}, 1),
+ 	}
+ }
+ 
+@@ -62,24 +71,61 @@ func (h *Hub) Run() {
+ 				h.clientCount.Add(-1)
+ 			}
+ 		case message := <-h.Broadcast:
+-			prepared, err := websocket.NewPreparedMessage(websocket.TextMessage, message)
+-			if err != nil {
+-				logger.Log().Errorf("[websocket] error preparing message: %s", err.Error())
+-				continue
+-			}
+-			for client := range h.Clients {
+-				select {
+-				case client.send <- prepared:
+-				default:
+-					close(client.send)
+-					delete(h.Clients, client)
+-					h.clientCount.Add(-1)
+-				}
++			h.send(message)
++		case <-h.queued:
++			h.pendingMu.Lock()
++			messages := h.pending
++			h.pending = nil
++			h.pendingMu.Unlock()
++
++			for _, message := range messages {
++				h.send(message)
+ 			}
+ 		}
+ 	}
+ }
+ 
++// send delivers a message to every connected client
++func (h *Hub) send(message []byte) {
++	prepared, err := websocket.NewPreparedMessage(websocket.TextMessage, message)
++	if err != nil {
++		logger.Log().Errorf("[websocket] error preparing message: %s", err.Error())
++		return
++	}
++	for client := range h.Clients {
++		select {
++		case client.send <- prepared:
++			continue
++		default:
++		}
++
++		// the client is behind; give it as long as a single write may take
++		// before treating it as stuck and disconnecting it
++		timer := time.NewTimer(writeWait)
++		select {
++		case client.send <- prepared:
++			timer.Stop()
++		case <-timer.C:
++			close(client.send)
++			delete(h.Clients, client)
++			h.clientCount.Add(-1)
++		}
++	}
++}
++
++// enqueue adds a message to the pending queue without blocking the caller,
++// so that messages are delivered in the order they were broadcast
++func (h *Hub) enqueue(message []byte) {
++	h.pendingMu.Lock()
++	h.pending = append(h.pending, message)
++	h.pendingMu.Unlock()
++
++	select {
++	case h.queued <- struct{}{}:
++	default:
++	}
++}
++
+ // Broadcast will spawn a broadcast message to all connected clients
+ func Broadcast(t string, msg any) {
+ 	if MessageHub == nil || MessageHub.clientCount.Load() == 0 {
+@@ -96,7 +142,7 @@ func Broadcast(t string, msg any) {
+ 		return
+ 	}
+ 
+-	go func() { MessageHub.Broadcast <- b }()
++	MessageHub.enqueue(b)
+ }
+ 
+ // BroadCastClientError is a wrapper to broadcast client errors to the web UI

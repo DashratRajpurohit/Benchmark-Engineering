@@ -1,0 +1,17 @@
+{
+  "problemId": "kh7827r49ggjqr6d7sxpz59qx58g20kz",
+  "title": "Bulk delete and mark-read break on large mailboxes",
+  "status": "draft",
+  "version": 0,
+  "versionId": "kd740gzgzgsjbm77t8ntn283a98g2fhj",
+  "isLocked": false,
+  "language": "go",
+  "difficulty": null,
+  "category": "bugfix",
+  "repoUrl": "https://github.com/axllent/mailpit",
+  "commitHash": "d10be4f0e565ea9a7fe7a3f5c39ee096523b4446",
+  "githubIssueUrl": null,
+  "estimatedLOC": null,
+  "testOutputMode": null,
+  "downloadedAt": "2026-10-24T17:09:59.512Z"
+}
