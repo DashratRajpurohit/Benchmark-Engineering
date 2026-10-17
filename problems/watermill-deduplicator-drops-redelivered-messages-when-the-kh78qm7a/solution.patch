@@ -1,0 +1,303 @@
+diff --git a/components/delay/delay.go b/components/delay/delay.go
+index 255419af..d66734db 100644
+--- a/components/delay/delay.go
++++ b/components/delay/delay.go
+@@ -63,6 +63,6 @@ const (
+ // IMPORTANT: Delay doesn't work with all Pub/Subs! Using it won't have any effect on Pub/Subs that don't support it.
+ // See the list of supported Pub/Subs in the documentation: https://watermill.io/advanced/delayed-messages/
+ func Message(msg *message.Message, delay Delay) {
+-	msg.Metadata.Set(DelayedUntilKey, delay.time.Format(time.RFC3339))
++	msg.Metadata.Set(DelayedUntilKey, delay.time.Format(time.RFC3339Nano))
+ 	msg.Metadata.Set(DelayedForKey, delay.duration.String())
+ }
+diff --git a/message/router/middleware/deduplicator.go b/message/router/middleware/deduplicator.go
+index 684c0e51..7d2351b2 100644
+--- a/message/router/middleware/deduplicator.go
++++ b/message/router/middleware/deduplicator.go
+@@ -7,7 +7,9 @@ import (
+ 	"fmt"
+ 	"hash/adler32"
+ 	"io"
++	"maps"
+ 	"math"
++	"slices"
+ 	"sync"
+ 	"time"
+ 
+@@ -65,6 +67,23 @@ type Deduplicator struct {
+ 	KeyFactory MessageHasher
+ 	Repository ExpiringKeyRepository
+ 	Timeout    time.Duration
++
++	mu       sync.Mutex
++	inflight map[string]*handling
++}
++
++// KeyForgetter can be implemented by an [ExpiringKeyRepository] so that a
++// [Deduplicator] can withdraw a key when the message was not handled
++// successfully. Without it, a failed message stays remembered.
++type KeyForgetter interface {
++	Forget(ctx context.Context, key string) error
++}
++
++// handling tracks the first copy of a message that is being handled.
++type handling struct {
++	done      chan struct{}
++	succeeded bool
++	abandoned bool
+ }
+ 
+ // IsDuplicate returns true if the message hash tag calculated
+@@ -101,25 +120,124 @@ func applyDefaultsToDeduplicator(d *Deduplicator) *Deduplicator {
+ 		}
+ 		d.Repository = kr
+ 	}
+-	if d.Timeout < time.Millisecond*5 {
++	if d.Timeout == 0 {
++		d.Timeout = time.Minute
++	} else if d.Timeout < time.Millisecond*5 {
+ 		d.Timeout = time.Millisecond * 5
+ 	}
+ 	return d
+ }
+ 
++// claim registers the message as being handled. It reports duplicate=true
++// when an earlier copy was handled successfully. A copy that arrives while the
++// earlier one is still being handled waits for its outcome. The returned
++// release function must be called once with the outcome of the handling.
++func (d *Deduplicator) claim(ctx context.Context, key string) (duplicate bool, release func(success bool), err error) {
++	// takeover is set when an earlier copy did not finish within the timeout:
++	// the key is already remembered, but this copy has to be handled as well.
++	takeover := false
++
++	for {
++		d.mu.Lock()
++		if d.inflight == nil {
++			d.inflight = map[string]*handling{}
++		}
++		other, ok := d.inflight[key]
++		if !ok {
++			own := &handling{done: make(chan struct{})}
++			d.inflight[key] = own
++			d.mu.Unlock()
++
++			release = func(success bool) {
++				d.mu.Lock()
++				abandoned := own.abandoned
++				if d.inflight[key] == own {
++					delete(d.inflight, key)
++				}
++				own.succeeded = success
++				d.mu.Unlock()
++
++				// The key belongs to the copy that took over from this one.
++				if !success && !abandoned {
++					d.forget(ctx, key)
++				}
++				close(own.done)
++			}
++
++			if takeover {
++				return false, release, nil
++			}
++
++			repoCtx, cancel := context.WithTimeout(ctx, d.Timeout)
++			seen, err := d.Repository.IsDuplicate(repoCtx, key)
++			cancel()
++			if err != nil {
++				release(false)
++				return false, nil, err
++			}
++			if seen {
++				release(true)
++				return true, nil, nil
++			}
++			return false, release, nil
++		}
++		d.mu.Unlock()
++
++		timer := time.NewTimer(d.Timeout)
++		select {
++		case <-other.done:
++			timer.Stop()
++		case <-ctx.Done():
++			timer.Stop()
++			return false, nil, ctx.Err()
++		case <-timer.C:
++			d.mu.Lock()
++			if d.inflight[key] == other {
++				other.abandoned = true
++				delete(d.inflight, key)
++				takeover = true
++			}
++			d.mu.Unlock()
++			continue
++		}
++		if other.succeeded {
++			return true, nil, nil
++		}
++		takeover = false
++	}
++}
++
++func (d *Deduplicator) forget(ctx context.Context, key string) {
++	if f, ok := d.Repository.(KeyForgetter); ok {
++		_ = f.Forget(ctx, key)
++	}
++}
++
+ // Middleware returns the [message.HandlerMiddleware]
+ // that drops similar messages in a given time window.
++//
++// A message is only remembered once it was handled without an error or panic.
+ func (d *Deduplicator) Middleware(h message.HandlerFunc) message.HandlerFunc {
+ 	d = applyDefaultsToDeduplicator(d)
+-	return func(msg *message.Message) ([]*message.Message, error) {
+-		isDuplicate, err := d.IsDuplicate(msg)
++	return func(msg *message.Message) (produced []*message.Message, err error) {
++		key, err := d.KeyFactory(msg)
++		if err != nil {
++			return nil, err
++		}
++		isDuplicate, release, err := d.claim(msg.Context(), key)
+ 		if err != nil {
+ 			return nil, err
+ 		}
+ 		if isDuplicate {
+ 			return nil, nil
+ 		}
+-		return h(msg)
++
++		succeeded := false
++		defer func() { release(succeeded) }()
++
++		produced, err = h(msg)
++		succeeded = err == nil
++		return produced, err
+ 	}
+ }
+ 
+@@ -177,6 +295,13 @@ func (kr *mapExpiringKeyRepository) IsDuplicate(
+ 	return false, nil
+ }
+ 
++func (kr *mapExpiringKeyRepository) Forget(_ context.Context, key string) error {
++	kr.mu.Lock()
++	delete(kr.tags, key)
++	kr.mu.Unlock()
++	return nil
++}
++
+ func (kr *mapExpiringKeyRepository) cleanOutLoop(ctx context.Context, ticker *time.Ticker) {
+ 	for {
+ 		select {
+@@ -276,21 +401,54 @@ func (d *deduplicatingPublisherDecorator) Publish(
+ 	topic string,
+ 	messages ...*message.Message,
+ ) (err error) {
+-	notRecent := make([]*message.Message, 0, len(messages))
+-	isDuplicate := false
++	keys := make([]string, len(messages))
++	first := map[string]*message.Message{}
++	for i, m := range messages {
++		keys[i], err = d.deduplicator.KeyFactory(m)
++		if err != nil {
++			return err
++		}
++		if _, ok := first[keys[i]]; !ok {
++			first[keys[i]] = m
++		}
++	}
+ 
+-	for _, m := range messages {
+-		isDuplicate, err = d.deduplicator.IsDuplicate(m)
++	var releases []func(bool)
++	succeeded := false
++	defer func() {
++		for _, release := range releases {
++			release(succeeded)
++		}
++	}()
++
++	// Keys are claimed in a fixed order, so that concurrent publishes
++	// of overlapping batches cannot wait for each other.
++	fresh := map[string]bool{}
++	for _, key := range slices.Sorted(maps.Keys(first)) {
++		isDuplicate, release, err := d.deduplicator.claim(first[key].Context(), key)
+ 		if err != nil {
+ 			return err
+ 		}
+-		if isDuplicate {
+-			m.Ack() // acknowledge and ignore
++		if !isDuplicate {
++			fresh[key] = true
++			releases = append(releases, release)
++		}
++	}
++
++	notRecent := make([]*message.Message, 0, len(messages))
++	for i, m := range messages {
++		if m == first[keys[i]] && fresh[keys[i]] {
++			notRecent = append(notRecent, m)
+ 			continue
+ 		}
+-		notRecent = append(notRecent, m)
++		m.Ack() // acknowledge and ignore
++	}
++
++	if err := d.Publisher.Publish(topic, notRecent...); err != nil {
++		return err
+ 	}
+-	return d.Publisher.Publish(topic, notRecent...)
++	succeeded = true
++	return nil
+ }
+ 
+ // PublisherDecorator returns a decorator that
+diff --git a/message/router/middleware/delay_on_error.go b/message/router/middleware/delay_on_error.go
+index 9b70370e..2204be55 100644
+--- a/message/router/middleware/delay_on_error.go
++++ b/message/router/middleware/delay_on_error.go
+@@ -32,16 +32,17 @@ func (d *DelayOnError) Middleware(h message.HandlerFunc) message.HandlerFunc {
+ }
+ 
+ func (d *DelayOnError) applyDelay(msg *message.Message) {
++	delayedFor := d.InitialInterval
++
+ 	delayedForStr := msg.Metadata.Get(delay.DelayedForKey)
+-	delayedFor, err := time.ParseDuration(delayedForStr)
++	previous, err := time.ParseDuration(delayedForStr)
+ 	if delayedForStr != "" && err == nil {
+-		delayedFor *= time.Duration(d.Multiplier)
+-		if delayedFor > d.MaxInterval {
+-			delayedFor = d.MaxInterval
+-		}
++		delayedFor = time.Duration(float64(previous) * d.Multiplier)
++	}
+ 
+-		delay.Message(msg, delay.For(delayedFor))
+-	} else {
+-		delay.Message(msg, delay.For(d.InitialInterval))
++	if d.MaxInterval > 0 && delayedFor > d.MaxInterval {
++		delayedFor = d.MaxInterval
+ 	}
++
++	delay.Message(msg, delay.For(delayedFor))
+ }
+diff --git a/message/router/middleware/throttle.go b/message/router/middleware/throttle.go
+index 4c4e2cb1..a24b7ec5 100644
+--- a/message/router/middleware/throttle.go
++++ b/message/router/middleware/throttle.go
+@@ -24,7 +24,11 @@ func NewThrottle(count int64, duration time.Duration) *Throttle {
+ func (t Throttle) Middleware(h message.HandlerFunc) message.HandlerFunc {
+ 	return func(message *message.Message) ([]*message.Message, error) {
+ 		// throttle is shared by multiple handlers, which will wait for their "tick"
+-		<-t.ticker.C
++		select {
++		case <-t.ticker.C:
++		case <-message.Context().Done():
++			return nil, message.Context().Err()
++		}
+ 
+ 		return h(message)
+ 	}

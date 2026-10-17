@@ -1,0 +1,1056 @@
+diff --git a/components/delay/delay_wm9d3k_test.go b/components/delay/delay_wm9d3k_test.go
+new file mode 100644
+index 00000000..ae014b45
+--- /dev/null
++++ b/components/delay/delay_wm9d3k_test.go
+@@ -0,0 +1,38 @@
++//go:build Wm9d3knew
++
++package delay_test
++
++import (
++	"testing"
++	"time"
++
++	"github.com/stretchr/testify/assert"
++	"github.com/stretchr/testify/require"
++
++	"github.com/ThreeDotsLabs/watermill/components/delay"
++	"github.com/ThreeDotsLabs/watermill/message"
++)
++
++func TestDelayUntilIsNotEarlierThanRequestedWm9d3k(t *testing.T) {
++	msg := message.NewMessage("1", nil)
++	before := time.Now()
++	delay.Message(msg, delay.For(1500*time.Millisecond))
++
++	until, err := time.Parse(time.RFC3339, msg.Metadata.Get(delay.DelayedUntilKey))
++	require.NoError(t, err)
++	assert.False(t, until.Before(before.Add(1500*time.Millisecond)),
++		"delayed until %s, earlier than requested", until.Format(time.RFC3339Nano))
++	assert.Equal(t, "1.5s", msg.Metadata.Get(delay.DelayedForKey))
++}
++
++func TestDelayUntilKeepsSubSecondTimeWm9d3k(t *testing.T) {
++	wanted := time.Now().Add(time.Hour).Truncate(time.Second).Add(250 * time.Millisecond).UTC()
++
++	msg := message.NewMessage("1", nil)
++	delay.Message(msg, delay.Until(wanted))
++
++	until, err := time.Parse(time.RFC3339, msg.Metadata.Get(delay.DelayedUntilKey))
++	require.NoError(t, err)
++	assert.True(t, until.Equal(wanted), "delayed until %s, wanted %s",
++		until.Format(time.RFC3339Nano), wanted.Format(time.RFC3339Nano))
++}
+diff --git a/message/router/middleware/base_wm9d3k_test.go b/message/router/middleware/base_wm9d3k_test.go
+new file mode 100644
+index 00000000..ef076c19
+--- /dev/null
++++ b/message/router/middleware/base_wm9d3k_test.go
+@@ -0,0 +1,82 @@
++//go:build Wm9d3kbas
++
++package middleware_test
++
++import (
++	"sync/atomic"
++	"testing"
++
++	"github.com/stretchr/testify/assert"
++	"github.com/stretchr/testify/require"
++
++	"github.com/ThreeDotsLabs/watermill/message"
++	"github.com/ThreeDotsLabs/watermill/message/router/middleware"
++)
++
++func TestDeduplicatorDropsCopyAfterSuccessWm9d3k(t *testing.T) {
++	var calls atomic.Int32
++	h := (&middleware.Deduplicator{}).Middleware(func(*message.Message) ([]*message.Message, error) {
++		calls.Add(1)
++		return nil, nil
++	})
++
++	for range 3 {
++		_, err := h(payloadMsgWm9d3k("order"))
++		require.NoError(t, err)
++	}
++	assert.EqualValues(t, 1, calls.Load())
++}
++
++func TestDeduplicatorDoesNotBlockOtherMessagesWm9d3k(t *testing.T) {
++	copies := newCopiesWm9d3k()
++	started, release := make(chan struct{}), make(chan struct{})
++	var calls atomic.Int32
++	h := (&middleware.Deduplicator{KeyFactory: copies.keyFactory}).Middleware(
++		func(m *message.Message) ([]*message.Message, error) {
++			calls.Add(1)
++			if string(m.Payload) == "slow" {
++				close(started)
++				<-release
++			}
++			return nil, nil
++		})
++
++	slow := deliverWm9d3k(h, payloadMsgWm9d3k("slow"))
++	<-started
++	copies.waitEntered(t, 1)
++
++	other := deliverWm9d3k(h, payloadMsgWm9d3k("other"))
++	require.NoError(t, expectResultWm9d3k(t, other, "unrelated message").err)
++
++	close(release)
++	require.NoError(t, expectResultWm9d3k(t, slow, "slow message").err)
++	assert.EqualValues(t, 2, calls.Load())
++}
++
++func TestDeduplicatorPublisherDropsPublishedCopyWm9d3k(t *testing.T) {
++	pub := &recordingPublisherWm9d3k{}
++	decorated, err := (&middleware.Deduplicator{}).PublisherDecorator()(pub)
++	require.NoError(t, err)
++
++	require.NoError(t, decorated.Publish("topic", payloadMsgWm9d3k("a")))
++	require.NoError(t, decorated.Publish("topic", payloadMsgWm9d3k("a"), payloadMsgWm9d3k("b")))
++
++	assert.Equal(t, []string{"a", "b"}, pub.published())
++}
++
++func TestDeduplicatorPublisherPublishesBatchDuplicatesOnceWm9d3k(t *testing.T) {
++	pub := &recordingPublisherWm9d3k{}
++	decorated, err := (&middleware.Deduplicator{}).PublisherDecorator()(pub)
++	require.NoError(t, err)
++
++	dropped := payloadMsgWm9d3k("a")
++	require.NoError(t, decorated.Publish("topic",
++		payloadMsgWm9d3k("a"), payloadMsgWm9d3k("b"), dropped, payloadMsgWm9d3k("b")))
++
++	assert.Equal(t, []string{"a", "b"}, pub.published())
++	select {
++	case <-dropped.Acked():
++	default:
++		t.Fatalf("the dropped duplicate must be acknowledged")
++	}
++}
+diff --git a/message/router/middleware/dedup_wm9d3k_test.go b/message/router/middleware/dedup_wm9d3k_test.go
+new file mode 100644
+index 00000000..84a319a8
+--- /dev/null
++++ b/message/router/middleware/dedup_wm9d3k_test.go
+@@ -0,0 +1,509 @@
++//go:build Wm9d3knew
++
++package middleware_test
++
++import (
++	"context"
++	"errors"
++	"sync"
++	"sync/atomic"
++	"testing"
++	"time"
++
++	"github.com/stretchr/testify/assert"
++	"github.com/stretchr/testify/require"
++
++	"github.com/ThreeDotsLabs/watermill"
++	"github.com/ThreeDotsLabs/watermill/message"
++	"github.com/ThreeDotsLabs/watermill/message/router/middleware"
++	"github.com/ThreeDotsLabs/watermill/pubsub/gochannel"
++)
++
++func TestDeduplicatorHandlesRedeliveryAfterErrorWm9d3k(t *testing.T) {
++	var calls atomic.Int32
++	h := (&middleware.Deduplicator{}).Middleware(func(*message.Message) ([]*message.Message, error) {
++		if calls.Add(1) == 1 {
++			return nil, errors.New("temporary failure")
++		}
++		return nil, nil
++	})
++
++	_, err := h(payloadMsgWm9d3k("order"))
++	require.Error(t, err)
++
++	_, err = h(payloadMsgWm9d3k("order"))
++	require.NoError(t, err)
++	assert.EqualValues(t, 2, calls.Load(), "the redelivered message must be handled again")
++
++	_, err = h(payloadMsgWm9d3k("order"))
++	require.NoError(t, err)
++	assert.EqualValues(t, 2, calls.Load(), "a message handled successfully is a duplicate")
++}
++
++func TestDeduplicatorHandlesRedeliveryAfterPanicWm9d3k(t *testing.T) {
++	var calls atomic.Int32
++	h := (&middleware.Deduplicator{}).Middleware(func(*message.Message) ([]*message.Message, error) {
++		if calls.Add(1) == 1 {
++			panic("handler crashed")
++		}
++		return nil, nil
++	})
++
++	assert.Panics(t, func() { _, _ = h(payloadMsgWm9d3k("order")) })
++
++	r := expectResultWm9d3k(t, deliverWm9d3k(h, payloadMsgWm9d3k("order")), "redelivered message")
++	require.NoError(t, r.err)
++	assert.EqualValues(t, 2, calls.Load(), "the redelivered message must be handled again")
++
++	r = expectResultWm9d3k(t, deliverWm9d3k(h, payloadMsgWm9d3k("order")), "third copy")
++	require.NoError(t, r.err)
++	assert.EqualValues(t, 2, calls.Load())
++}
++
++func TestDeduplicatorCopyWaitsForSuccessfulHandlingWm9d3k(t *testing.T) {
++	copies := newCopiesWm9d3k()
++	started, release := make(chan struct{}), make(chan struct{})
++	var calls atomic.Int32
++	h := (&middleware.Deduplicator{KeyFactory: copies.keyFactory}).Middleware(
++		func(*message.Message) ([]*message.Message, error) {
++			if calls.Add(1) == 1 {
++				close(started)
++				<-release
++			}
++			return nil, nil
++		})
++
++	first := deliverWm9d3k(h, payloadMsgWm9d3k("order"))
++	<-started
++	copies.waitEntered(t, 1)
++
++	second := deliverWm9d3k(h, payloadMsgWm9d3k("order"))
++	copies.waitEntered(t, 1)
++	expectPendingWm9d3k(t, second, "a copy of a message that is still being handled")
++
++	close(release)
++	require.NoError(t, expectResultWm9d3k(t, first, "first copy").err)
++	require.NoError(t, expectResultWm9d3k(t, second, "second copy").err)
++	assert.EqualValues(t, 1, calls.Load(), "the copy must be dropped once the first one succeeded")
++}
++
++func TestDeduplicatorCopyIsHandledAfterFailureWm9d3k(t *testing.T) {
++	copies := newCopiesWm9d3k()
++	started, release := make(chan struct{}), make(chan struct{})
++	var calls atomic.Int32
++	h := (&middleware.Deduplicator{KeyFactory: copies.keyFactory}).Middleware(
++		func(*message.Message) ([]*message.Message, error) {
++			if calls.Add(1) == 1 {
++				close(started)
++				<-release
++				return nil, errors.New("temporary failure")
++			}
++			return nil, nil
++		})
++
++	first := deliverWm9d3k(h, payloadMsgWm9d3k("order"))
++	<-started
++	copies.waitEntered(t, 1)
++
++	second := deliverWm9d3k(h, payloadMsgWm9d3k("order"))
++	third := deliverWm9d3k(h, payloadMsgWm9d3k("order"))
++	copies.waitEntered(t, 2)
++	expectPendingWm9d3k(t, second, "a copy of a message that is still being handled")
++	expectPendingWm9d3k(t, third, "a copy of a message that is still being handled")
++
++	close(release)
++	require.Error(t, expectResultWm9d3k(t, first, "first copy").err)
++	require.NoError(t, expectResultWm9d3k(t, second, "second copy").err)
++	require.NoError(t, expectResultWm9d3k(t, third, "third copy").err)
++	assert.EqualValues(t, 2, calls.Load(),
++		"exactly one waiting copy takes over after the first one failed")
++}
++
++func TestDeduplicatorWaitingCopyStopsWhenCancelledWm9d3k(t *testing.T) {
++	copies := newCopiesWm9d3k()
++	started, release := make(chan struct{}), make(chan struct{})
++	var calls atomic.Int32
++	h := (&middleware.Deduplicator{KeyFactory: copies.keyFactory}).Middleware(
++		func(*message.Message) ([]*message.Message, error) {
++			if calls.Add(1) == 1 {
++				close(started)
++				<-release
++			}
++			return nil, nil
++		})
++
++	first := deliverWm9d3k(h, payloadMsgWm9d3k("order"))
++	<-started
++	copies.waitEntered(t, 1)
++
++	ctx, cancel := context.WithCancel(context.Background())
++	waiting := payloadMsgWm9d3k("order")
++	waiting.SetContext(ctx)
++	second := deliverWm9d3k(h, waiting)
++	copies.waitEntered(t, 1)
++	expectPendingWm9d3k(t, second, "a copy of a message that is still being handled")
++
++	cancel()
++	r := expectResultWm9d3k(t, second, "cancelled copy")
++	assert.ErrorIs(t, r.err, context.Canceled)
++
++	close(release)
++	require.NoError(t, expectResultWm9d3k(t, first, "first copy").err)
++
++	_, err := h(payloadMsgWm9d3k("order"))
++	require.NoError(t, err)
++	assert.EqualValues(t, 1, calls.Load(), "the first copy was handled successfully")
++}
++
++func TestDeduplicatorRouterRedeliversAfterNackWm9d3k(t *testing.T) {
++	logger := watermill.NopLogger{}
++	pubSub := gochannel.NewGoChannel(gochannel.Config{}, logger)
++	defer func() { _ = pubSub.Close() }()
++
++	router, err := message.NewRouter(message.RouterConfig{}, logger)
++	require.NoError(t, err)
++	router.AddMiddleware((&middleware.Deduplicator{}).Middleware)
++
++	var attempts atomic.Int32
++	handled := make(chan struct{})
++	router.AddConsumerHandler("handler", "orders", pubSub, func(*message.Message) error {
++		if attempts.Add(1) == 1 {
++			return errors.New("temporary failure")
++		}
++		close(handled)
++		return nil
++	})
++
++	ctx, cancel := context.WithCancel(context.Background())
++	defer cancel()
++	go func() { _ = router.Run(ctx) }()
++	<-router.Running()
++
++	require.NoError(t, pubSub.Publish("orders", payloadMsgWm9d3k("order")))
++
++	select {
++	case <-handled:
++	case <-time.After(3 * time.Second):
++		t.Fatalf("the nacked message was never handled again (attempts: %d)", attempts.Load())
++	}
++}
++
++func TestDeduplicatorPublisherRetriesAfterFailedPublishWm9d3k(t *testing.T) {
++	pub := &recordingPublisherWm9d3k{failures: 1}
++	decorated, err := (&middleware.Deduplicator{}).PublisherDecorator()(pub)
++	require.NoError(t, err)
++
++	require.Error(t, decorated.Publish("topic", payloadMsgWm9d3k("a"), payloadMsgWm9d3k("b")))
++
++	require.NoError(t, decorated.Publish("topic", payloadMsgWm9d3k("a"), payloadMsgWm9d3k("b")))
++	assert.Equal(t, []string{"a", "b"}, pub.published())
++
++	require.NoError(t, decorated.Publish("topic", payloadMsgWm9d3k("a")))
++	assert.Equal(t, []string{"a", "b"}, pub.published(), "published messages are duplicates")
++}
++
++func TestDeduplicatorPublisherForgetsBatchWhenKeyingFailsWm9d3k(t *testing.T) {
++	hasher := middleware.NewMessageHasherSHA256(1024)
++	var failOnBad atomic.Bool
++	failOnBad.Store(true)
++	pub := &recordingPublisherWm9d3k{}
++	decorated, err := (&middleware.Deduplicator{
++		KeyFactory: func(m *message.Message) (string, error) {
++			if failOnBad.Load() && string(m.Payload) == "bad" {
++				return "", errors.New("cannot hash")
++			}
++			return hasher(m)
++		},
++	}).PublisherDecorator()(pub)
++	require.NoError(t, err)
++
++	require.Error(t, decorated.Publish("topic", payloadMsgWm9d3k("a"), payloadMsgWm9d3k("bad")))
++	assert.Empty(t, pub.published())
++
++	failOnBad.Store(false)
++	require.NoError(t, decorated.Publish("topic", payloadMsgWm9d3k("a"), payloadMsgWm9d3k("bad")))
++	assert.Equal(t, []string{"a", "bad"}, pub.published())
++}
++
++type captureRepositoryWm9d3k struct {
++	deadline time.Time
++}
++
++func (c *captureRepositoryWm9d3k) IsDuplicate(ctx context.Context, _ string) (bool, error) {
++	c.deadline, _ = ctx.Deadline()
++	return false, nil
++}
++
++func TestDeduplicatorDefaultTimeoutIsOneMinuteWm9d3k(t *testing.T) {
++	repo := &captureRepositoryWm9d3k{}
++	h := (&middleware.Deduplicator{Repository: repo}).Middleware(
++		func(*message.Message) ([]*message.Message, error) { return nil, nil })
++
++	_, err := h(payloadMsgWm9d3k("order"))
++	require.NoError(t, err)
++
++	left := time.Until(repo.deadline)
++	assert.Greater(t, left, 50*time.Second)
++	assert.LessOrEqual(t, left, time.Minute)
++}
++
++func publishAsyncWm9d3k(pub message.Publisher, msgs ...*message.Message) <-chan resultWm9d3k {
++	out := make(chan resultWm9d3k, 1)
++	go func() {
++		out <- resultWm9d3k{err: pub.Publish("topic", msgs...)}
++	}()
++	return out
++}
++
++func TestDeduplicatorPublisherCopyWaitsForPublishWm9d3k(t *testing.T) {
++	gated := newGatedPublisherWm9d3k()
++	decorated, err := (&middleware.Deduplicator{}).PublisherDecorator()(gated)
++	require.NoError(t, err)
++
++	first := publishAsyncWm9d3k(decorated, payloadMsgWm9d3k("a"))
++	<-gated.entered
++
++	second := publishAsyncWm9d3k(decorated, payloadMsgWm9d3k("a"))
++	expectPendingWm9d3k(t, second, "a publish of a message that is already being published")
++
++	close(gated.gate)
++	require.NoError(t, expectResultWm9d3k(t, first, "first publish").err)
++	require.NoError(t, expectResultWm9d3k(t, second, "second publish").err)
++	assert.Equal(t, []string{"a"}, gated.published())
++}
++
++func TestDeduplicatorPublisherCopyPublishesAfterFailureWm9d3k(t *testing.T) {
++	gated := newGatedPublisherWm9d3k(errors.New("broker down"))
++	decorated, err := (&middleware.Deduplicator{}).PublisherDecorator()(gated)
++	require.NoError(t, err)
++
++	first := publishAsyncWm9d3k(decorated, payloadMsgWm9d3k("a"))
++	<-gated.entered
++
++	second := publishAsyncWm9d3k(decorated, payloadMsgWm9d3k("a"))
++	expectPendingWm9d3k(t, second, "a publish of a message that is already being published")
++
++	close(gated.gate)
++	require.Error(t, expectResultWm9d3k(t, first, "first publish").err)
++	require.NoError(t, expectResultWm9d3k(t, second, "second publish").err)
++	assert.Equal(t, []string{"a"}, gated.published(),
++		"a publish that returned without an error must have put the message out")
++}
++
++func TestDeduplicatorPublisherOverlappingBatchesCompleteWm9d3k(t *testing.T) {
++	for round := range 25 {
++		var mu sync.Mutex
++		var out []string
++		pub := publisherFuncWm9d3k(func(_ string, msgs ...*message.Message) error {
++			time.Sleep(20 * time.Millisecond)
++			mu.Lock()
++			defer mu.Unlock()
++			for _, m := range msgs {
++				out = append(out, string(m.Payload))
++			}
++			return nil
++		})
++		decorated, err := (&middleware.Deduplicator{Repository: &slowRepositoryWm9d3k{}}).PublisherDecorator()(pub)
++		require.NoError(t, err)
++
++		first := publishAsyncWm9d3k(decorated, payloadMsgWm9d3k("a"), payloadMsgWm9d3k("b"))
++		second := publishAsyncWm9d3k(decorated, payloadMsgWm9d3k("b"), payloadMsgWm9d3k("a"))
++
++		require.NoError(t, expectResultWm9d3k(t, first, "first batch").err, "round %d", round)
++		mu.Lock()
++		assert.Subset(t, out, []string{"a", "b"}, "round %d: first batch returned early", round)
++		mu.Unlock()
++
++		require.NoError(t, expectResultWm9d3k(t, second, "second batch").err, "round %d", round)
++		mu.Lock()
++		assert.ElementsMatch(t, []string{"a", "b"}, out, "round %d", round)
++		mu.Unlock()
++	}
++}
++
++func TestDeduplicatorCopyIsHandledAfterPanicWm9d3k(t *testing.T) {
++	copies := newCopiesWm9d3k()
++	started, release := make(chan struct{}), make(chan struct{})
++	var calls atomic.Int32
++	h := (&middleware.Deduplicator{KeyFactory: copies.keyFactory}).Middleware(
++		func(*message.Message) ([]*message.Message, error) {
++			if calls.Add(1) == 1 {
++				close(started)
++				<-release
++				panic("handler crashed")
++			}
++			return nil, nil
++		})
++
++	panicked := make(chan any, 1)
++	go func() {
++		defer func() { panicked <- recover() }()
++		_, _ = h(payloadMsgWm9d3k("order"))
++	}()
++	<-started
++	copies.waitEntered(t, 1)
++
++	second := deliverWm9d3k(h, payloadMsgWm9d3k("order"))
++	copies.waitEntered(t, 1)
++	expectPendingWm9d3k(t, second, "a copy of a message that is still being handled")
++
++	close(release)
++	assert.NotNil(t, <-panicked)
++	require.NoError(t, expectResultWm9d3k(t, second, "second copy").err)
++	assert.EqualValues(t, 2, calls.Load())
++}
++
++func TestDeduplicatorRetryMiddlewareHandlesMessageAgainWm9d3k(t *testing.T) {
++	var calls atomic.Int32
++	handler := (&middleware.Deduplicator{}).Middleware(func(*message.Message) ([]*message.Message, error) {
++		if calls.Add(1) < 3 {
++			return nil, errors.New("temporary failure")
++		}
++		return nil, nil
++	})
++	h := middleware.Retry{MaxRetries: 3, InitialInterval: time.Millisecond}.Middleware(handler)
++
++	_, err := h(payloadMsgWm9d3k("order"))
++	require.NoError(t, err)
++	assert.EqualValues(t, 3, calls.Load(), "every retry must run the handler")
++}
++
++func TestDeduplicatorCopyStopsWaitingAfterTimeoutWm9d3k(t *testing.T) {
++	copies := newCopiesWm9d3k()
++	started, release := make(chan struct{}), make(chan struct{})
++	var calls atomic.Int32
++	h := (&middleware.Deduplicator{KeyFactory: copies.keyFactory, Timeout: 400 * time.Millisecond}).Middleware(
++		func(*message.Message) ([]*message.Message, error) {
++			if calls.Add(1) == 1 {
++				close(started)
++				<-release
++			}
++			return nil, nil
++		})
++
++	first := deliverWm9d3k(h, payloadMsgWm9d3k("order"))
++	<-started
++	copies.waitEntered(t, 1)
++
++	second := deliverWm9d3k(h, payloadMsgWm9d3k("order"))
++	copies.waitEntered(t, 1)
++	expectPendingWm9d3k(t, second, "a copy that has not waited for the whole timeout yet")
++
++	require.NoError(t, expectResultWm9d3k(t, second, "second copy").err)
++	assert.EqualValues(t, 2, calls.Load(), "after the timeout the copy is handled as well")
++
++	close(release)
++	require.NoError(t, expectResultWm9d3k(t, first, "first copy").err)
++
++	_, err := h(payloadMsgWm9d3k("order"))
++	require.NoError(t, err)
++	assert.EqualValues(t, 2, calls.Load(), "the message was handled successfully")
++}
++
++func TestDeduplicatorSlowCopyFailingLateKeepsLaterSuccessWm9d3k(t *testing.T) {
++	copies := newCopiesWm9d3k()
++	started, release := make(chan struct{}), make(chan struct{})
++	var calls atomic.Int32
++	h := (&middleware.Deduplicator{KeyFactory: copies.keyFactory, Timeout: 400 * time.Millisecond}).Middleware(
++		func(*message.Message) ([]*message.Message, error) {
++			if calls.Add(1) == 1 {
++				close(started)
++				<-release
++				return nil, errors.New("too slow")
++			}
++			return nil, nil
++		})
++
++	first := deliverWm9d3k(h, payloadMsgWm9d3k("order"))
++	<-started
++	copies.waitEntered(t, 1)
++
++	second := deliverWm9d3k(h, payloadMsgWm9d3k("order"))
++	copies.waitEntered(t, 1)
++	require.NoError(t, expectResultWm9d3k(t, second, "second copy").err)
++
++	close(release)
++	require.Error(t, expectResultWm9d3k(t, first, "first copy").err)
++
++	r := expectResultWm9d3k(t, deliverWm9d3k(h, payloadMsgWm9d3k("order")), "third copy")
++	require.NoError(t, r.err)
++	assert.EqualValues(t, 2, calls.Load(),
++		"the late failure of the first copy must not undo the success of the second")
++}
++
++func TestDeduplicatorPublisherStressWm9d3k(t *testing.T) {
++	const callers, keys = 8, 5
++
++	var mu sync.Mutex
++	published := map[string]int{}
++	var attempts atomic.Int32
++	pub := publisherFuncWm9d3k(func(_ string, msgs ...*message.Message) error {
++		time.Sleep(time.Millisecond)
++		if attempts.Add(1)%2 == 1 {
++			return errors.New("broker down")
++		}
++		mu.Lock()
++		defer mu.Unlock()
++		for _, m := range msgs {
++			published[string(m.Payload)]++
++		}
++		return nil
++	})
++	decorated, err := (&middleware.Deduplicator{}).PublisherDecorator()(pub)
++	require.NoError(t, err)
++
++	// The very first publish fails, as a broker that is not ready yet would.
++	var all []*message.Message
++	for k := range keys {
++		all = append(all, payloadMsgWm9d3k("key"+string(rune('0'+k))))
++	}
++	require.Error(t, decorated.Publish("topic", all...))
++
++	type call struct {
++		keys []string
++		err  error
++	}
++	results := make(chan call, callers*4)
++	var wg sync.WaitGroup
++	for c := range callers {
++		wg.Add(1)
++		go func() {
++			defer wg.Done()
++			for round := range 4 {
++				var batch []*message.Message
++				var names []string
++				for k := range keys {
++					if (c+round+k)%2 == 0 || k == (c+round)%keys {
++						name := "key" + string(rune('0'+(k+c*round)%keys))
++						names = append(names, name)
++						batch = append(batch, payloadMsgWm9d3k(name))
++					}
++				}
++				results <- call{names, decorated.Publish("topic", batch...)}
++			}
++		}()
++	}
++
++	done := make(chan struct{})
++	go func() { wg.Wait(); close(done) }()
++	select {
++	case <-done:
++	case <-time.After(15 * time.Second):
++		t.Fatalf("publishes never finished")
++	}
++	close(results)
++
++	mu.Lock()
++	defer mu.Unlock()
++	for name, n := range published {
++		assert.Equal(t, 1, n, "%s published more than once", name)
++	}
++	for r := range results {
++		if r.err != nil {
++			continue
++		}
++		for _, name := range r.keys {
++			assert.Contains(t, published, name, "a publish returned without an error but %s was never published", name)
++		}
++	}
++}
+diff --git a/message/router/middleware/helpers_wm9d3k_test.go b/message/router/middleware/helpers_wm9d3k_test.go
+new file mode 100644
+index 00000000..d4c6cc8e
+--- /dev/null
++++ b/message/router/middleware/helpers_wm9d3k_test.go
+@@ -0,0 +1,201 @@
++//go:build Wm9d3knew || Wm9d3kbas
++
++package middleware_test
++
++import (
++	"context"
++	"sync"
++	"sync/atomic"
++	"testing"
++	"time"
++
++	"github.com/ThreeDotsLabs/watermill/message"
++	"github.com/ThreeDotsLabs/watermill/message/router/middleware"
++)
++
++// copiesWm9d3k counts how many messages went through the key factory, so a
++// test can tell that a message has entered the deduplicator.
++type copiesWm9d3k struct {
++	entered chan struct{}
++	count   atomic.Int32
++	hasher  middleware.MessageHasher
++}
++
++func newCopiesWm9d3k() *copiesWm9d3k {
++	return &copiesWm9d3k{
++		entered: make(chan struct{}, 16),
++		hasher:  middleware.NewMessageHasherSHA256(1024),
++	}
++}
++
++func (c *copiesWm9d3k) keyFactory(m *message.Message) (string, error) {
++	c.count.Add(1)
++	c.entered <- struct{}{}
++	return c.hasher(m)
++}
++
++func (c *copiesWm9d3k) waitEntered(t *testing.T, n int) {
++	t.Helper()
++
++	for range n {
++		select {
++		case <-c.entered:
++		case <-time.After(5 * time.Second):
++			t.Fatalf("message never reached the deduplicator")
++		}
++	}
++}
++
++type resultWm9d3k struct {
++	produced []*message.Message
++	err      error
++}
++
++// deliverWm9d3k runs the handler for a message in the background.
++func deliverWm9d3k(h message.HandlerFunc, msg *message.Message) <-chan resultWm9d3k {
++	out := make(chan resultWm9d3k, 1)
++	go func() {
++		produced, err := h(msg)
++		out <- resultWm9d3k{produced, err}
++	}()
++	return out
++}
++
++func expectPendingWm9d3k(t *testing.T, ch <-chan resultWm9d3k, what string) {
++	t.Helper()
++
++	select {
++	case r := <-ch:
++		t.Fatalf("%s returned early (err: %v)", what, r.err)
++	case <-time.After(200 * time.Millisecond):
++	}
++}
++
++func expectResultWm9d3k(t *testing.T, ch <-chan resultWm9d3k, what string) resultWm9d3k {
++	t.Helper()
++
++	select {
++	case r := <-ch:
++		return r
++	case <-time.After(5 * time.Second):
++		t.Fatalf("%s never returned", what)
++		return resultWm9d3k{}
++	}
++}
++
++func payloadMsgWm9d3k(payload string) *message.Message {
++	return message.NewMessage(payload+"-uuid", []byte(payload))
++}
++
++// recordingPublisherWm9d3k stores the batches it was asked to publish and
++// fails the first failures publishes.
++type recordingPublisherWm9d3k struct {
++	mu       sync.Mutex
++	failures int
++	calls    int
++	payloads []string
++}
++
++func (p *recordingPublisherWm9d3k) Publish(_ string, msgs ...*message.Message) error {
++	p.mu.Lock()
++	defer p.mu.Unlock()
++
++	p.calls++
++	if p.failures > 0 {
++		p.failures--
++		return context.DeadlineExceeded
++	}
++	for _, m := range msgs {
++		p.payloads = append(p.payloads, string(m.Payload))
++	}
++	return nil
++}
++
++func (p *recordingPublisherWm9d3k) Close() error { return nil }
++
++func (p *recordingPublisherWm9d3k) published() []string {
++	p.mu.Lock()
++	defer p.mu.Unlock()
++
++	return append([]string(nil), p.payloads...)
++}
++
++// gatedPublisherWm9d3k blocks every Publish until released, then answers with
++// the next scripted result.
++type gatedPublisherWm9d3k struct {
++	mu       sync.Mutex
++	entered  chan struct{}
++	gate     chan struct{}
++	results  []error
++	payloads []string
++}
++
++func newGatedPublisherWm9d3k(results ...error) *gatedPublisherWm9d3k {
++	return &gatedPublisherWm9d3k{
++		entered: make(chan struct{}, 64),
++		gate:    make(chan struct{}),
++		results: results,
++	}
++}
++
++func (p *gatedPublisherWm9d3k) Publish(_ string, msgs ...*message.Message) error {
++	if len(msgs) == 0 {
++		return nil
++	}
++	p.entered <- struct{}{}
++	<-p.gate
++
++	p.mu.Lock()
++	defer p.mu.Unlock()
++
++	if len(p.results) > 0 {
++		err := p.results[0]
++		p.results = p.results[1:]
++		if err != nil {
++			return err
++		}
++	}
++	for _, m := range msgs {
++		p.payloads = append(p.payloads, string(m.Payload))
++	}
++	return nil
++}
++
++func (p *gatedPublisherWm9d3k) Close() error { return nil }
++
++func (p *gatedPublisherWm9d3k) published() []string {
++	p.mu.Lock()
++	defer p.mu.Unlock()
++
++	return append([]string(nil), p.payloads...)
++}
++
++// slowRepositoryWm9d3k is a minimal repository whose lookups take a while.
++type slowRepositoryWm9d3k struct {
++	mu   sync.Mutex
++	seen map[string]struct{}
++}
++
++func (r *slowRepositoryWm9d3k) IsDuplicate(_ context.Context, key string) (bool, error) {
++	time.Sleep(2 * time.Millisecond)
++
++	r.mu.Lock()
++	defer r.mu.Unlock()
++
++	if r.seen == nil {
++		r.seen = map[string]struct{}{}
++	}
++	if _, ok := r.seen[key]; ok {
++		return true, nil
++	}
++	r.seen[key] = struct{}{}
++	return false, nil
++}
++
++type publisherFuncWm9d3k func(topic string, msgs ...*message.Message) error
++
++func (f publisherFuncWm9d3k) Publish(topic string, msgs ...*message.Message) error {
++	return f(topic, msgs...)
++}
++
++func (f publisherFuncWm9d3k) Close() error { return nil }
+diff --git a/message/router/middleware/ops_wm9d3k_test.go b/message/router/middleware/ops_wm9d3k_test.go
+new file mode 100644
+index 00000000..7010b16a
+--- /dev/null
++++ b/message/router/middleware/ops_wm9d3k_test.go
+@@ -0,0 +1,123 @@
++//go:build Wm9d3knew
++
++package middleware_test
++
++import (
++	"context"
++	"errors"
++	"sync"
++	"testing"
++	"time"
++
++	"github.com/stretchr/testify/assert"
++	"github.com/stretchr/testify/require"
++
++	"github.com/ThreeDotsLabs/watermill/components/delay"
++	"github.com/ThreeDotsLabs/watermill/message"
++	"github.com/ThreeDotsLabs/watermill/message/router/middleware"
++)
++
++func TestDelayOnErrorAppliesFractionalMultiplierWm9d3k(t *testing.T) {
++	m := middleware.DelayOnError{
++		InitialInterval: time.Second,
++		MaxInterval:     4 * time.Second,
++		Multiplier:      1.5,
++	}
++	h := m.Middleware(func(*message.Message) ([]*message.Message, error) {
++		return nil, errors.New("error")
++	})
++
++	msg := message.NewMessage("1", []byte("test"))
++	var got []string
++	for range 5 {
++		_, _ = h(msg)
++		got = append(got, msg.Metadata.Get(delay.DelayedForKey))
++	}
++
++	assert.Equal(t, []string{"1s", "1.5s", "2.25s", "3.375s", "4s"}, got)
++}
++
++func TestThrottleStopsWaitingWhenMessageIsCancelledWm9d3k(t *testing.T) {
++	throttle := middleware.NewThrottle(1, time.Hour)
++	handled := false
++	h := throttle.Middleware(func(*message.Message) ([]*message.Message, error) {
++		handled = true
++		return nil, nil
++	})
++
++	ctx, cancel := context.WithCancel(context.Background())
++	msg := message.NewMessage("1", nil)
++	msg.SetContext(ctx)
++	result := deliverWm9d3k(h, msg)
++
++	expectPendingWm9d3k(t, result, "a throttled message")
++	cancel()
++
++	r := expectResultWm9d3k(t, result, "cancelled message")
++	require.ErrorIs(t, r.err, context.Canceled)
++	assert.False(t, handled)
++}
++
++func TestDeduplicatorConcurrentCopiesAreHandledOneAtATimeWm9d3k(t *testing.T) {
++	const keys, copies = 8, 6
++
++	var mu sync.Mutex
++	active := map[string]int{}
++	attempts := map[string]int{}
++	successes := map[string]int{}
++	overlapped := false
++
++	failures := func(key string) int { return int(key[len(key)-1]-'0') % 4 }
++
++	h := (&middleware.Deduplicator{}).Middleware(func(m *message.Message) ([]*message.Message, error) {
++		key := string(m.Payload)
++
++		mu.Lock()
++		attempts[key]++
++		attempt := attempts[key]
++		active[key]++
++		if active[key] > 1 {
++			overlapped = true
++		}
++		mu.Unlock()
++
++		time.Sleep(time.Millisecond)
++
++		mu.Lock()
++		defer mu.Unlock()
++		active[key]--
++		if attempt <= failures(key) {
++			return nil, errors.New("temporary failure")
++		}
++		successes[key]++
++		return nil, nil
++	})
++
++	var wg sync.WaitGroup
++	for k := range keys {
++		for range copies {
++			wg.Add(1)
++			go func() {
++				defer wg.Done()
++				_, _ = h(payloadMsgWm9d3k("key" + string(rune('0'+k))))
++			}()
++		}
++	}
++
++	done := make(chan struct{})
++	go func() { wg.Wait(); close(done) }()
++	select {
++	case <-done:
++	case <-time.After(10 * time.Second):
++		t.Fatalf("copies never finished")
++	}
++
++	mu.Lock()
++	defer mu.Unlock()
++	assert.False(t, overlapped, "two copies of one message were handled at the same time")
++	for k := range keys {
++		key := "key" + string(rune('0'+k))
++		assert.Equal(t, 1, successes[key], key)
++		assert.Equal(t, failures(key)+1, attempts[key], key)
++	}
++}
+diff --git a/test.sh b/test.sh
+new file mode 100755
+index 00000000..e1dcb36c
+--- /dev/null
++++ b/test.sh
+@@ -0,0 +1,67 @@
++#!/usr/bin/env bash
++# Usage: ./test.sh [--output_path <junit.xml>] [base|new]
++set -uo pipefail
++
++OUTPUT_PATH=""
++if [ "${1:-}" = "--output_path" ]; then
++  OUTPUT_PATH="$2"
++  shift 2
++  case "$OUTPUT_PATH" in
++    /*) ;;
++    *) OUTPUT_PATH="$PWD/$OUTPUT_PATH" ;;
++  esac
++fi
++
++[ -f go.mod ] || cd "$(dirname "$0")"
++
++MODE="${1:-}"
++
++if [ -n "$OUTPUT_PATH" ] && [ -z "$MODE" ]; then
++  echo "--output_path needs a mode: base or new" >&2
++  exit 2
++fi
++
++if [ -n "$MODE" ]; then
++  TEST_LOG="$(mktemp)"
++  STATUS=0
++
++  run_tests() {
++    go test -count=1 -v "$@" 2>&1 | tee -a "$TEST_LOG"
++    status=${PIPESTATUS[0]}
++    if [ "$status" -ne 0 ]; then
++      STATUS=$status
++    fi
++  }
++
++  case "$MODE" in
++    base)
++      # One existing test measures a 5ms expiry window and cannot be relied on under load.
++      run_tests -tags Wm9d3kbas -timeout 600s ./message/ ./components/delay/
++      existing=$(go test -tags Wm9d3kbas -list '.*' ./message/router/middleware/ | grep -E '^Test' \
++        | grep -v -E 'RepositoryCleanup' | paste -sd '|' -)
++      run_tests -tags Wm9d3kbas -timeout 600s -run "^(${existing})\$" ./message/router/middleware/
++      ;;
++    new)
++      run_tests -tags Wm9d3knew -run 'Wm9d3k' -timeout 600s ./message/router/middleware/ ./components/delay/
++      ;;
++    *)
++      echo "unknown mode: $MODE (expected base or new)" >&2
++      exit 2
++      ;;
++  esac
++
++  if [ -n "$OUTPUT_PATH" ]; then
++    go-junit-report < "$TEST_LOG" > "$OUTPUT_PATH"
++    junit_status=$?
++    if [ "$junit_status" -ne 0 ] && [ "$STATUS" -eq 0 ]; then
++      echo "go-junit-report failed (exit $junit_status)" >&2
++      STATUS=$junit_status
++    fi
++  fi
++
++  exit "$STATUS"
++fi
++
++set +u +o pipefail
++set -e
++go test -count=1 -timeout 600s ./message/... ./components/delay/

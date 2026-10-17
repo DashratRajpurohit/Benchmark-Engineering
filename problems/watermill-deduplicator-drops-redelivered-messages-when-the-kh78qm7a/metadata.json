@@ -1,0 +1,17 @@
+{
+  "problemId": "kh78qm7a335f5mrm0ddmg30txh8fdt0x",
+  "title": "Deduplicator drops redelivered messages when the handler fails",
+  "status": "draft",
+  "version": 0,
+  "versionId": "kd74t23szrv1f77m74z8gk2a1x8fcz12",
+  "isLocked": false,
+  "language": "go",
+  "difficulty": null,
+  "category": "bugfix",
+  "repoUrl": "https://github.com/threedotslabs/watermill",
+  "commitHash": "080d4b4e7fe6105ab880d1becd5cf91af0235d8c",
+  "githubIssueUrl": null,
+  "estimatedLOC": null,
+  "testOutputMode": null,
+  "downloadedAt": "2026-10-24T17:10:09.563Z"
+}
