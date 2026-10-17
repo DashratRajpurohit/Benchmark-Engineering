@@ -1,0 +1,774 @@
+diff --git a/server/lifecycle_conformance_k4x9_test.go b/server/lifecycle_conformance_k4x9_test.go
+new file mode 100644
+index 0000000..c47ff87
+--- /dev/null
++++ b/server/lifecycle_conformance_k4x9_test.go
+@@ -0,0 +1,687 @@
++//go:build mqttspec
++
++package server_test
++
++import (
++	"bytes"
++	"context"
++	"fmt"
++	"io"
++	"net"
++	"net/http"
++	"strings"
++	"testing"
++	"time"
++
++	"github.com/DrmagicE/gmqtt/config"
++	_ "github.com/DrmagicE/gmqtt/persistence"
++	"github.com/DrmagicE/gmqtt/pkg/packets"
++	"github.com/DrmagicE/gmqtt/plugin/admin"
++	"github.com/DrmagicE/gmqtt/server"
++	_ "github.com/DrmagicE/gmqtt/topicalias/fifo"
++)
++
++const (
++	v5  = packets.Version5
++	v31 = packets.Version311
++)
++
++type recvItem struct {
++	p   packets.Packet
++	err error
++}
++
++type mqttConn struct {
++	t  *testing.T
++	c  net.Conn
++	w  *packets.Writer
++	ch chan recvItem
++	v  packets.Version
++}
++
++func u16(v uint16) *uint16 { return &v }
++func u32(v uint32) *uint32 { return &v }
++
++// startBroker runs a broker on a loopback listener and returns its address.
++func startBroker(t *testing.T, mod func(*config.Config), plugins ...server.Plugin) string {
++	t.Helper()
++	ln, err := net.Listen("tcp", "127.0.0.1:0")
++	if err != nil {
++		t.Fatal(err)
++	}
++	cfg := config.DefaultConfig()
++	if mod != nil {
++		mod(&cfg)
++	}
++	opts := []server.Options{server.WithTCPListener(ln), server.WithConfig(cfg)}
++	for _, p := range plugins {
++		opts = append(opts, server.WithPlugin(p))
++	}
++	srv := server.New(opts...)
++	go func() { _ = srv.Run() }()
++	t.Cleanup(func() {
++		ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
++		defer cancel()
++		_ = srv.Stop(ctx)
++	})
++	time.Sleep(300 * time.Millisecond)
++	return ln.Addr().String()
++}
++
++func newMQTTConn(t *testing.T, addr string, v packets.Version) *mqttConn {
++	t.Helper()
++	nc, err := net.Dial("tcp", addr)
++	if err != nil {
++		t.Fatal(err)
++	}
++	c := &mqttConn{t: t, c: nc, w: packets.NewWriter(nc), ch: make(chan recvItem, 1024), v: v}
++	r := packets.NewReader(nc)
++	r.SetVersion(v)
++	go func() {
++		for {
++			p, err := r.ReadPacket()
++			c.ch <- recvItem{p, err}
++			if err != nil {
++				return
++			}
++		}
++	}()
++	t.Cleanup(func() { _ = nc.Close() })
++	return c
++}
++
++func (c *mqttConn) props() *packets.Properties {
++	if c.v == v5 {
++		return &packets.Properties{}
++	}
++	return nil
++}
++
++func (c *mqttConn) send(p packets.Packet) {
++	if err := c.w.WriteAndFlush(p); err != nil {
++		c.t.Logf("write error: %v", err)
++	}
++}
++
++func (c *mqttConn) recv(d time.Duration) (packets.Packet, error) {
++	select {
++	case it := <-c.ch:
++		return it.p, it.err
++	case <-time.After(d):
++		return nil, fmt.Errorf("timeout")
++	}
++}
++
++// publishes returns all PUBLISH packets that arrive until the connection is quiet for the given duration.
++func (c *mqttConn) publishes(quiet time.Duration) []*packets.Publish {
++	var out []*packets.Publish
++	for {
++		p, err := c.recv(quiet)
++		if err != nil {
++			return out
++		}
++		if pub, ok := p.(*packets.Publish); ok {
++			out = append(out, pub)
++		}
++	}
++}
++
++// connect performs the MQTT handshake and returns the CONNACK.
++func connect(t *testing.T, addr string, v packets.Version, id string, clean bool, mod func(*packets.Connect)) (*mqttConn, *packets.Connack) {
++	t.Helper()
++	c := newMQTTConn(t, addr, v)
++	pc := &packets.Connect{Version: v, ProtocolLevel: v, ProtocolName: []byte("MQTT"), CleanStart: clean, KeepAlive: 60, ClientID: []byte(id), Properties: c.props()}
++	if mod != nil {
++		mod(pc)
++	}
++	c.send(pc)
++	p, err := c.recv(3 * time.Second)
++	if err != nil {
++		t.Fatalf("no CONNACK for %q: %v", id, err)
++	}
++	ca, ok := p.(*packets.Connack)
++	if !ok {
++		t.Fatalf("expected CONNACK for %q, got %T", id, p)
++	}
++	return c, ca
++}
++
++func (c *mqttConn) subscribe(pid uint16, topics ...packets.Topic) packets.Packet {
++	c.t.Helper()
++	c.send(&packets.Subscribe{Version: c.v, PacketID: pid, Topics: topics, Properties: c.props()})
++	for {
++		p, err := c.recv(3 * time.Second)
++		if err != nil {
++			return nil
++		}
++		if _, ok := p.(*packets.Publish); ok {
++			continue
++		}
++		return p
++	}
++}
++
++func (c *mqttConn) publish(topic string, qos uint8, retain bool, payload string, pid uint16, pr *packets.Properties) {
++	if pr == nil {
++		pr = c.props()
++	}
++	c.send(&packets.Publish{Version: c.v, Qos: qos, Retain: retain, TopicName: []byte(topic), PacketID: pid, Payload: []byte(payload), Properties: pr})
++}
++
++func topic(name string, qos uint8) packets.Topic {
++	return packets.Topic{Name: name, SubOptions: packets.SubOptions{Qos: qos}}
++}
++
++func subscribeOK(t *testing.T, c *mqttConn, filter string, qos uint8) {
++	t.Helper()
++	p := c.subscribe(1, topic(filter, qos))
++	sa, ok := p.(*packets.Suback)
++	if !ok || len(sa.Payload) != 1 || sa.Payload[0] >= 0x80 {
++		t.Fatalf("subscribe to %q failed: %v", filter, p)
++	}
++}
++
++func disconnectCode(p packets.Packet) (byte, bool) {
++	if d, ok := p.(*packets.Disconnect); ok {
++		return d.Code, true
++	}
++	return 0, false
++}
++
++func eventually(t *testing.T, timeout time.Duration, what string, cond func() bool) {
++	t.Helper()
++	deadline := time.Now().Add(timeout)
++	for time.Now().Before(deadline) {
++		if cond() {
++			return
++		}
++		time.Sleep(100 * time.Millisecond)
++	}
++	t.Fatalf("timed out waiting for: %s", what)
++}
++
++func expiryOf(p *packets.Publish) (uint32, bool) {
++	if p.Properties == nil || p.Properties.MessageExpiry == nil {
++		return 0, false
++	}
++	return *p.Properties.MessageExpiry, true
++}
++
++// ---------------------------------------------------------------------------
++// Maximum QoS
++
++func TestAdvertisedMaximumQoSMatchesConfigK4x9(t *testing.T) {
++	// A server that supports QoS 2 leaves the property out.
++	addr := startBroker(t, nil)
++	_, ca := connect(t, addr, v5, "default", true, nil)
++	if ca.Properties != nil && ca.Properties.MaximumQoS != nil {
++		t.Fatalf("a server supporting QoS 2 advertised Maximum QoS %d", *ca.Properties.MaximumQoS)
++	}
++	for _, max := range []uint8{0, 1} {
++		max := max
++		addr := startBroker(t, func(c *config.Config) { c.MQTT.MaximumQoS = max })
++		_, ca := connect(t, addr, v5, "limited", true, nil)
++		if ca.Properties == nil || ca.Properties.MaximumQoS == nil {
++			t.Fatalf("maximum_qos=%d: no Maximum QoS property in CONNACK", max)
++		}
++		if got := *ca.Properties.MaximumQoS; got != max {
++			t.Fatalf("maximum_qos=%d: CONNACK advertised %d", max, got)
++		}
++	}
++}
++
++func TestSubscriptionsAreGrantedAtMostTheMaximumQoSK4x9(t *testing.T) {
++	addr := startBroker(t, func(c *config.Config) { c.MQTT.MaximumQoS = 1 })
++	for _, v := range []packets.Version{v5, v31} {
++		c, _ := connect(t, addr, v, fmt.Sprintf("sub%d", v), true, nil)
++		for requested, want := range map[uint8]uint8{0: 0, 1: 1, 2: 1} {
++			p := c.subscribe(uint16(requested)+1, topic(fmt.Sprintf("grant/%d", requested), requested))
++			sa, ok := p.(*packets.Suback)
++			if !ok || len(sa.Payload) != 1 {
++				t.Fatalf("v%d: no SUBACK for requested QoS %d: %v", v, requested, p)
++			}
++			if sa.Payload[0] != want {
++				t.Fatalf("v%d: requested QoS %d, granted %d, want %d", v, requested, sa.Payload[0], want)
++			}
++		}
++	}
++}
++
++func TestPublishAboveMaximumQoSIsRejectedK4x9(t *testing.T) {
++	addr := startBroker(t, func(c *config.Config) { c.MQTT.MaximumQoS = 1 })
++	c, _ := connect(t, addr, v5, "pub5", true, nil)
++	c.publish("max/qos", 1, false, "ok", 1, nil)
++	if p, err := c.recv(2 * time.Second); err != nil {
++		t.Fatalf("QoS 1 publish within the maximum was not answered: %v", err)
++	} else if _, ok := p.(*packets.Puback); !ok {
++		t.Fatalf("QoS 1 publish within the maximum: got %T, want PUBACK", p)
++	}
++	c.publish("max/qos", 2, false, "too much", 2, nil)
++	p, err := c.recv(2 * time.Second)
++	if err != nil {
++		t.Fatalf("QoS 2 publish above the maximum: no reaction: %v", err)
++	}
++	if code, ok := disconnectCode(p); !ok || code != 0x9b {
++		t.Fatalf("QoS 2 publish above the maximum: got %v, want DISCONNECT 0x9b", p)
++	}
++
++	c3, _ := connect(t, addr, v31, "pub3", true, nil)
++	c3.publish("max/qos", 2, false, "too much", 3, nil)
++	for {
++		p, err := c3.recv(2 * time.Second)
++		if err != nil {
++			if err.Error() == "timeout" {
++				t.Fatalf("v3.1.1 QoS 2 publish above the maximum: the connection stayed open")
++			}
++			return // the connection was closed
++		}
++		if _, ok := p.(*packets.Pubrec); ok {
++			t.Fatalf("v3.1.1 QoS 2 publish above the maximum was accepted")
++		}
++	}
++}
++
++// ---------------------------------------------------------------------------
++// Message Expiry Interval
++
++func TestForwardedMessageExpiryIsTheRemainingLifetimeK4x9(t *testing.T) {
++	addr := startBroker(t, nil)
++	sub, _ := connect(t, addr, v5, "sub", true, nil)
++	subscribeOK(t, sub, "fwd/#", 1)
++	pub, _ := connect(t, addr, v5, "pub", true, nil)
++	pub.publish("fwd/with", 0, false, "a", 0, &packets.Properties{MessageExpiry: u32(30)})
++	pub.publish("fwd/without", 0, false, "b", 0, nil)
++	got := map[string]*packets.Publish{}
++	for _, m := range sub.publishes(700 * time.Millisecond) {
++		got[string(m.TopicName)] = m
++	}
++	with, without := got["fwd/with"], got["fwd/without"]
++	if with == nil || without == nil {
++		t.Fatalf("expected both messages, got %d", len(got))
++	}
++	if v, ok := expiryOf(with); !ok || v < 27 || v > 30 {
++		t.Fatalf("forwarded message published with expiry 30 carried %d (present=%v), want 27..30", v, ok)
++	}
++	if v, ok := expiryOf(without); ok {
++		t.Fatalf("message published without an expiry was forwarded with expiry %d", v)
++	}
++}
++
++func TestQueuedMessageExpiryDecreasesWhileWaitingK4x9(t *testing.T) {
++	addr := startBroker(t, nil)
++	persistent := func(p *packets.Connect) { p.Properties.SessionExpiryInterval = u32(120) }
++	off, _ := connect(t, addr, v5, "offline", false, persistent)
++	subscribeOK(t, off, "queued/#", 1)
++	_ = off.c.Close()
++	time.Sleep(300 * time.Millisecond)
++
++	pub, _ := connect(t, addr, v5, "pub", true, nil)
++	pub.publish("queued/long", 1, false, "long", 1, &packets.Properties{MessageExpiry: u32(20)})
++	time.Sleep(3300 * time.Millisecond)
++
++	back, _ := connect(t, addr, v5, "offline", false, persistent)
++	got := map[string]*packets.Publish{}
++	for _, m := range back.publishes(900 * time.Millisecond) {
++		got[string(m.TopicName)] = m
++	}
++	long := got["queued/long"]
++	if long == nil {
++		t.Fatalf("the unexpired queued message was not delivered")
++	}
++	if v, ok := expiryOf(long); !ok || v < 14 || v > 17 {
++		t.Fatalf("queued message with expiry 20 waited about 3s but carried %d (present=%v), want 14..17", v, ok)
++	}
++}
++
++func TestExpiredRetainedMessageIsNotDeliveredK4x9(t *testing.T) {
++	addr := startBroker(t, nil)
++	pub, _ := connect(t, addr, v5, "pub", true, nil)
++	pub.publish("ret/short", 0, true, "short", 0, &packets.Properties{MessageExpiry: u32(2)})
++	pub.publish("ret/long", 0, true, "long", 0, &packets.Properties{MessageExpiry: u32(30)})
++	pub.publish("ret/none", 0, true, "none", 0, nil)
++	time.Sleep(3300 * time.Millisecond)
++
++	sub, _ := connect(t, addr, v5, "sub", true, nil)
++	subscribeOK(t, sub, "ret/#", 0)
++	got := map[string]*packets.Publish{}
++	for _, m := range sub.publishes(700 * time.Millisecond) {
++		got[string(m.TopicName)] = m
++	}
++	if _, ok := got["ret/short"]; ok {
++		t.Fatalf("a retained message was delivered after its Message Expiry Interval had passed")
++	}
++	if got["ret/long"] == nil || got["ret/none"] == nil {
++		t.Fatalf("unexpired retained messages must still be delivered, got %d messages", len(got))
++	}
++}
++
++func TestRetainedMessageExpiryIsTheRemainingLifetimeK4x9(t *testing.T) {
++	addr := startBroker(t, nil)
++	pub, _ := connect(t, addr, v5, "pub", true, nil)
++	pub.publish("rem/a", 0, true, "x", 0, &packets.Properties{MessageExpiry: u32(30)})
++	pub.publish("rem/b", 0, true, "y", 0, nil)
++	time.Sleep(3300 * time.Millisecond)
++
++	sub, _ := connect(t, addr, v5, "sub", true, nil)
++	subscribeOK(t, sub, "rem/#", 0)
++	got := map[string]*packets.Publish{}
++	for _, m := range sub.publishes(700 * time.Millisecond) {
++		got[string(m.TopicName)] = m
++	}
++	a, b := got["rem/a"], got["rem/b"]
++	if a == nil || b == nil {
++		t.Fatalf("expected both retained messages, got %d", len(got))
++	}
++	if v, ok := expiryOf(a); !ok || v < 24 || v > 27 {
++		t.Fatalf("retained message with expiry 30 stored for about 3s carried %d (present=%v), want 24..27", v, ok)
++	}
++	if v, ok := expiryOf(b); ok {
++		t.Fatalf("retained message stored without an expiry carried expiry %d", v)
++	}
++}
++
++// ---------------------------------------------------------------------------
++// Topic aliases
++
++func TestTopicAliasUpToTheAdvertisedMaximumIsAcceptedK4x9(t *testing.T) {
++	addr := startBroker(t, nil)
++	sub, _ := connect(t, addr, v5, "sub", true, nil)
++	subscribeOK(t, sub, "alias/#", 0)
++	pub, ca := connect(t, addr, v5, "pub", true, nil)
++	if ca.Properties == nil || ca.Properties.TopicAliasMaximum == nil {
++		t.Fatalf("CONNACK has no Topic Alias Maximum")
++	}
++	max := *ca.Properties.TopicAliasMaximum
++	pub.publish("alias/x", 0, false, "first", 0, &packets.Properties{TopicAlias: u16(max)})
++	pub.publish("", 0, false, "second", 0, &packets.Properties{TopicAlias: u16(max)})
++	var seen []string
++	for _, m := range sub.publishes(800 * time.Millisecond) {
++		seen = append(seen, string(m.TopicName)+"/"+string(m.Payload))
++	}
++	if got := strings.Join(seen, ","); got != "alias/x/first,alias/x/second" {
++		t.Fatalf("alias %d (the advertised maximum) delivered %q", max, got)
++	}
++}
++
++func TestTopicAliasMaximumIsIndependentOfReceiveMaximumK4x9(t *testing.T) {
++	addr := startBroker(t, func(c *config.Config) {
++		c.MQTT.ReceiveMax = 20
++		c.MQTT.TopicAliasMax = 200
++	})
++	sub, _ := connect(t, addr, v5, "sub", true, nil)
++	subscribeOK(t, sub, "alias/#", 0)
++	pub, _ := connect(t, addr, v5, "pub", true, nil)
++	pub.publish("alias/y", 0, false, "first", 0, &packets.Properties{TopicAlias: u16(150)})
++	pub.publish("", 0, false, "second", 0, &packets.Properties{TopicAlias: u16(150)})
++	if n := len(sub.publishes(800 * time.Millisecond)); n != 2 {
++		t.Fatalf("alias 150 with topic_alias_maximum=200 delivered %d messages, want 2", n)
++	}
++}
++
++func TestRetainedMessageCanBeClearedThroughATopicAliasK4x9(t *testing.T) {
++	addr := startBroker(t, nil)
++	pub, _ := connect(t, addr, v5, "pub", true, nil)
++	pub.publish("alias/ret", 0, true, "v1", 0, &packets.Properties{TopicAlias: u16(2)})
++	pub.publish("", 0, true, "v2", 0, &packets.Properties{TopicAlias: u16(2)})
++	time.Sleep(300 * time.Millisecond)
++
++	first, _ := connect(t, addr, v5, "first", true, nil)
++	subscribeOK(t, first, "alias/ret", 0)
++	got := first.publishes(600 * time.Millisecond)
++	if len(got) != 1 || string(got[0].Payload) != "v2" {
++		t.Fatalf("retained message set through an alias: got %d messages", len(got))
++	}
++
++	pub.publish("", 0, true, "", 0, &packets.Properties{TopicAlias: u16(2)})
++	time.Sleep(300 * time.Millisecond)
++	second, _ := connect(t, addr, v5, "second", true, nil)
++	subscribeOK(t, second, "alias/ret", 0)
++	if n := len(second.publishes(600 * time.Millisecond)); n != 0 {
++		t.Fatalf("an empty retained publish through an alias did not clear the retained message")
++	}
++}
++
++// ---------------------------------------------------------------------------
++// Topic filters and subscription options
++
++func TestWildcardsMustOccupyAWholeLevelK4x9(t *testing.T) {
++	addr := startBroker(t, nil)
++	pub, _ := connect(t, addr, v5, "pub", true, nil)
++	for _, v := range []packets.Version{v5, v31} {
++		for _, f := range []string{"+", "+/a", "a/+", "a/+/b", "#", "a/#"} {
++			c, _ := connect(t, addr, v, fmt.Sprintf("valid%d%s", v, strings.NewReplacer("/", "_", "+", "p", "#", "h").Replace(f)), true, nil)
++			p := c.subscribe(1, topic(f, 0))
++			if sa, ok := p.(*packets.Suback); !ok || sa.Payload[0] >= 0x80 {
++				t.Fatalf("v%d: valid filter %q was refused: %v", v, f, p)
++			}
++		}
++		for _, f := range []string{"+a", "+abc", "a+", "a/b+", "a/+b", "a#", "#/a"} {
++			c, _ := connect(t, addr, v, fmt.Sprintf("bad%d%s", v, strings.NewReplacer("/", "_", "+", "p", "#", "h").Replace(f)), true, nil)
++			p := c.subscribe(1, topic(f, 0))
++			if sa, ok := p.(*packets.Suback); ok && len(sa.Payload) == 1 && sa.Payload[0] < 0x80 {
++				t.Fatalf("v%d: invalid filter %q was accepted", v, f)
++			}
++			pub.publish("xa", 0, false, "m", 0, nil)
++			pub.publish("a/bx", 0, false, "m", 0, nil)
++			if n := len(c.publishes(300 * time.Millisecond)); n != 0 {
++				t.Fatalf("v%d: invalid filter %q delivered %d messages", v, f, n)
++			}
++		}
++	}
++}
++
++func TestNoLocalOnASharedSubscriptionIsAProtocolErrorK4x9(t *testing.T) {
++	addr := startBroker(t, nil)
++	c, _ := connect(t, addr, v5, "shared", true, nil)
++	p := c.subscribe(1, packets.Topic{Name: "$share/g/nl/t", SubOptions: packets.SubOptions{Qos: 0, NoLocal: true}})
++	if code, ok := disconnectCode(p); !ok || code != 0x82 {
++		t.Fatalf("no-local on a shared subscription: got %v, want DISCONNECT 0x82", p)
++	}
++	ok1, _ := connect(t, addr, v5, "plainnl", true, nil)
++	if sa, ok := ok1.subscribe(1, packets.Topic{Name: "nl/t", SubOptions: packets.SubOptions{Qos: 0, NoLocal: true}}).(*packets.Suback); !ok || sa.Payload[0] >= 0x80 {
++		t.Fatalf("no-local on a normal subscription was refused")
++	}
++	ok2, _ := connect(t, addr, v5, "plainshared", true, nil)
++	if sa, ok := ok2.subscribe(1, topic("$share/g/nl/t", 0)).(*packets.Suback); !ok || sa.Payload[0] >= 0x80 {
++		t.Fatalf("a shared subscription without no-local was refused")
++	}
++}
++
++// ---------------------------------------------------------------------------
++// Will message and session takeover
++
++func TestWillIsPublishedOnlyWhenTheClientAsksForItK4x9(t *testing.T) {
++	addr := startBroker(t, nil)
++	watch, _ := connect(t, addr, v5, "watch", true, nil)
++	subscribeOK(t, watch, "will/#", 0)
++	withWill := func(topic string) func(*packets.Connect) {
++		return func(p *packets.Connect) {
++			p.WillFlag, p.WillTopic, p.WillMsg = true, []byte(topic), []byte("bye")
++		}
++	}
++	plain, _ := connect(t, addr, v5, "plain", true, withWill("will/normal"))
++	plain.send(&packets.Disconnect{Version: v5, Code: 0x00, Properties: plain.props()})
++	if n := len(watch.publishes(700 * time.Millisecond)); n != 0 {
++		t.Fatalf("a normal DISCONNECT published the will message")
++	}
++	asking, _ := connect(t, addr, v5, "asking", true, withWill("will/asked"))
++	asking.send(&packets.Disconnect{Version: v5, Code: 0x04, Properties: asking.props()})
++	got := watch.publishes(900 * time.Millisecond)
++	if len(got) != 1 || string(got[0].TopicName) != "will/asked" {
++		t.Fatalf("DISCONNECT 0x04 must publish the will message, got %d messages", len(got))
++	}
++}
++
++func TestTakenOverClientIsToldWhyK4x9(t *testing.T) {
++	addr := startBroker(t, nil)
++	for i := 0; i < 6; i++ {
++		id := fmt.Sprintf("takeover-%d", i)
++		old, _ := connect(t, addr, v5, id, true, nil)
++		connect(t, addr, v5, id, true, nil)
++		var code byte
++		var found bool
++		for {
++			p, err := old.recv(2 * time.Second)
++			if err != nil {
++				break
++			}
++			if c, ok := disconnectCode(p); ok {
++				code, found = c, true
++				break
++			}
++		}
++		if !found || code != 0x8e {
++			t.Fatalf("round %d: the first connection was not sent DISCONNECT 0x8e (found=%v code=0x%02x)", i, found, code)
++		}
++	}
++}
++
++// ---------------------------------------------------------------------------
++// Configuration
++
++func TestExpiredSessionsAreCollectedAtTheConfiguredIntervalK4x9(t *testing.T) {
++	mq, base := startBrokerWithAdmin(t, func(c *config.Config) { c.MQTT.SessionExpiryCheckInterval = time.Second })
++	c, _ := connect(t, mq, v5, "short-lived", true, func(p *packets.Connect) { p.Properties.SessionExpiryInterval = u32(1) })
++	listed := func() bool {
++		_, body := httpDo("GET", base+"/v1/clients", "")
++		return strings.Contains(body, "short-lived")
++	}
++	eventually(t, 3*time.Second, "the client is listed", listed)
++	_ = c.c.Close()
++	eventually(t, 8*time.Second, "the expired session is removed with session_expiry_check_interval=1s", func() bool { return !listed() })
++}
++
++func TestEmptyClientIDRefusalUsesTheCodeOfTheProtocolVersionK4x9(t *testing.T) {
++	addr := startBroker(t, func(c *config.Config) { c.MQTT.AllowZeroLenClientID = false })
++	for _, tc := range []struct {
++		v    packets.Version
++		want byte
++	}{{v31, 0x02}} {
++		c := newMQTTConn(t, addr, tc.v)
++		c.send(&packets.Connect{Version: tc.v, ProtocolLevel: tc.v, ProtocolName: []byte("MQTT"), CleanStart: true, KeepAlive: 60, ClientID: []byte{}, Properties: c.props()})
++		p, err := c.recv(3 * time.Second)
++		if err != nil {
++			t.Fatalf("v%d: no answer to a CONNECT with an empty client id (%v)", tc.v, err)
++		}
++		ca, ok := p.(*packets.Connack)
++		if !ok || ca.Code != tc.want {
++			t.Fatalf("v%d: empty client id refused with %v, want CONNACK 0x%02x", tc.v, p, tc.want)
++		}
++	}
++}
++
++// ---------------------------------------------------------------------------
++// Admin API
++
++func freePort(t *testing.T) int {
++	l, err := net.Listen("tcp", "127.0.0.1:0")
++	if err != nil {
++		t.Fatal(err)
++	}
++	defer l.Close()
++	return l.Addr().(*net.TCPAddr).Port
++}
++
++func startBrokerWithAdmin(t *testing.T, mod func(*config.Config)) (mqttAddr, httpBase string) {
++	t.Helper()
++	grpcPort, httpPort := freePort(t), freePort(t)
++	mqttAddr = startBroker(t, func(c *config.Config) {
++		c.API = config.API{
++			GRPC: []*config.Endpoint{{Address: fmt.Sprintf("tcp://127.0.0.1:%d", grpcPort)}},
++			HTTP: []*config.Endpoint{{Address: fmt.Sprintf("tcp://127.0.0.1:%d", httpPort), Map: fmt.Sprintf("tcp://127.0.0.1:%d", grpcPort)}},
++		}
++		if mod != nil {
++			mod(c)
++		}
++	}, mustAdminPlugin(t))
++	httpBase = fmt.Sprintf("http://127.0.0.1:%d", httpPort)
++	eventually(t, 10*time.Second, "admin HTTP API", func() bool {
++		code, _ := httpDo("GET", httpBase+"/v1/clients", "")
++		return code == 200
++	})
++	return mqttAddr, httpBase
++}
++
++func mustAdminPlugin(t *testing.T) server.Plugin {
++	p, err := admin.New(config.DefaultConfig())
++	if err != nil {
++		t.Fatal(err)
++	}
++	return p
++}
++
++func httpDo(method, url, body string) (int, string) {
++	req, _ := http.NewRequest(method, url, bytes.NewBufferString(body))
++	req.Header.Set("Content-Type", "application/json")
++	resp, err := http.DefaultClient.Do(req)
++	if err != nil {
++		return 0, err.Error()
++	}
++	defer resp.Body.Close()
++	b, _ := io.ReadAll(resp.Body)
++	return resp.StatusCode, string(b)
++}
++
++func TestRetainedMessagePublishedThroughTheAdminAPIIsKeptK4x9(t *testing.T) {
++	mq, base := startBrokerWithAdmin(t, nil)
++	code, body := httpDo("POST", base+"/v1/publish", `{"topic_name":"adm/kept","payload":"hello","qos":1,"retained":true}`)
++	if code != 200 {
++		t.Fatalf("publish failed: %d %s", code, body)
++	}
++	code, body = httpDo("POST", base+"/v1/publish", `{"topic_name":"adm/plain","payload":"hello","qos":1}`)
++	if code != 200 {
++		t.Fatalf("publish failed: %d %s", code, body)
++	}
++	late, _ := connect(t, mq, v5, "late", true, nil)
++	subscribeOK(t, late, "adm/#", 1)
++	got := map[string]*packets.Publish{}
++	for _, m := range late.publishes(800 * time.Millisecond) {
++		got[string(m.TopicName)] = m
++	}
++	if got["adm/kept"] == nil || string(got["adm/kept"].Payload) != "hello" {
++		t.Fatalf("a retained message published through the admin API was not delivered to a later subscriber")
++	}
++	if got["adm/plain"] != nil {
++		t.Fatalf("a message published without the retain flag was kept")
++	}
++
++	code, body = httpDo("POST", base+"/v1/publish", `{"topic_name":"adm/kept","payload":"","qos":0,"retained":true}`)
++	if code != 200 {
++		t.Fatalf("publish failed: %d %s", code, body)
++	}
++	after, _ := connect(t, mq, v5, "after", true, nil)
++	subscribeOK(t, after, "adm/#", 1)
++	if n := len(after.publishes(700 * time.Millisecond)); n != 0 {
++		t.Fatalf("an empty retained publish through the admin API did not clear the retained message")
++	}
++}
++
++func TestAdminSubscriptionListFollowsTheSessionK4x9(t *testing.T) {
++	mq, base := startBrokerWithAdmin(t, func(c *config.Config) {
++		c.MQTT.SessionExpiryCheckInterval = time.Second
++	})
++	listed := func(topic string) bool {
++		_, body := httpDo("GET", base+"/v1/subscriptions", "")
++		return strings.Contains(body, topic)
++	}
++
++	live, _ := connect(t, mq, v5, "live", true, nil)
++	subscribeOK(t, live, "adm/live", 1)
++	eventually(t, 3*time.Second, "the subscription of a connected client is listed", func() bool { return listed("adm/live") })
++
++	ended, _ := connect(t, mq, v5, "ended", true, nil)
++	subscribeOK(t, ended, "adm/ended", 1)
++	eventually(t, 3*time.Second, "the subscription is listed", func() bool { return listed("adm/ended") })
++	ended.send(&packets.Disconnect{Version: v5, Properties: ended.props()})
++	_ = ended.c.Close()
++	eventually(t, 5*time.Second, "the subscription of an ended session is no longer listed", func() bool { return !listed("adm/ended") })
++	if !listed("adm/live") {
++		t.Fatalf("the subscription of a connected client disappeared")
++	}
++
++	exp, _ := connect(t, mq, v5, "expiring", true, func(p *packets.Connect) { p.Properties.SessionExpiryInterval = u32(1) })
++	subscribeOK(t, exp, "adm/expiring", 1)
++	eventually(t, 3*time.Second, "the subscription is listed", func() bool { return listed("adm/expiring") })
++	_ = exp.c.Close()
++	eventually(t, 15*time.Second, "the subscription of an expired session is no longer listed", func() bool { return !listed("adm/expiring") })
++}
+diff --git a/test.sh b/test.sh
+new file mode 100755
+index 0000000..5f845b2
+--- /dev/null
++++ b/test.sh
+@@ -0,0 +1,75 @@
++#!/bin/sh
++set -e
++
++# ./test.sh [--output_path <junit.xml>] base|new runs one test set and exits.
++# base runs the existing tests of the packages listed below; new runs only the
++# tests in files behind the mqttspec build tag.
++if [ "$#" -gt 0 ]; then
++    OUTPUT_PATH=""
++    MODE=""
++    while [ "$#" -gt 0 ]; do
++        case "$1" in
++            --output_path)
++                if [ "$#" -lt 2 ] || [ -z "$2" ]; then
++                    echo "--output_path needs a file path" >&2
++                    exit 2
++                fi
++                OUTPUT_PATH="$2"
++                shift 2
++                ;;
++            base|new)
++                if [ -n "$MODE" ]; then
++                    echo "mode given more than once: $MODE and $1" >&2
++                    exit 2
++                fi
++                MODE="$1"
++                shift
++                ;;
++            *)
++                echo "usage: ./test.sh [--output_path <junit.xml>] [base|new]" >&2
++                exit 2
++                ;;
++        esac
++    done
++    if [ -z "$MODE" ]; then
++        echo "a mode is required: base or new" >&2
++        exit 2
++    fi
++    case "$OUTPUT_PATH" in
++        "" | /*) ;;
++        *) OUTPUT_PATH="$PWD/$OUTPUT_PATH" ;;
++    esac
++    [ -f go.mod ] || cd "$(dirname "$0")"
++
++    case "$MODE" in
++        base)
++            set -- -timeout 600s . ./server/... ./retained/... ./pkg/... ./plugin/admin/... \
++                ./config/... ./persistence/queue/... ./persistence/subscription/... \
++                ./topicalias/...
++            ;;
++        new)
++            files=$(grep -rl --include='*_test.go' '^//go:build mqttspec$' .)
++            tests=$(sed -n 's/^func \(Test[A-Za-z0-9_]*\)(t \*testing\.T) {$/\1/p' $files | paste -sd '|' -)
++            set -- -tags mqttspec -timeout 600s -run "^($tests)\$" \
++                $(for f in $files; do dirname "$f"; done | sort -u)
++            ;;
++    esac
++
++    TEST_LOG="$(mktemp)"
++    STATUS=0
++    go test -count=1 -v "$@" >"$TEST_LOG" 2>&1 || STATUS=$?
++    cat "$TEST_LOG"
++
++    if [ -n "$OUTPUT_PATH" ]; then
++        junit_status=0
++        go-junit-report <"$TEST_LOG" >"$OUTPUT_PATH" || junit_status=$?
++        if [ "$junit_status" -ne 0 ] && [ "$STATUS" -eq 0 ]; then
++            echo "go-junit-report failed to convert the test log (exit $junit_status)" >&2
++            STATUS=$junit_status
++        fi
++    fi
++    exit "$STATUS"
++fi
++
++go test -count=1 -timeout 600s . ./server/... ./retained/... ./pkg/... ./plugin/admin/... \
++    ./config/... ./persistence/queue/... ./persistence/subscription/... ./topicalias/...

@@ -1,0 +1,17 @@
+{
+  "problemId": "kh7aybzea6agc1h17j21fpyn1h8ev6fd",
+  "title": "Follow the MQTT spec for expiry, aliases, wills and takeover",
+  "status": "draft",
+  "version": 0,
+  "versionId": "kd73448ag8wmx4j976a58sgbbs8etht1",
+  "isLocked": false,
+  "language": "go",
+  "difficulty": null,
+  "category": "bugfix",
+  "repoUrl": "https://github.com/drmagice/gmqtt",
+  "commitHash": "92ed7d60915519f60c3d3cdb6420b1e11eb824e2",
+  "githubIssueUrl": null,
+  "estimatedLOC": null,
+  "testOutputMode": null,
+  "downloadedAt": "2026-10-24T17:10:19.892Z"
+}

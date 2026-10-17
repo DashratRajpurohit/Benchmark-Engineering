@@ -1,0 +1,396 @@
+diff --git a/pkg/packets/packets.go b/pkg/packets/packets.go
+index beea3d1..e57413c 100644
+--- a/pkg/packets/packets.go
++++ b/pkg/packets/packets.go
+@@ -532,9 +532,9 @@ func ValidTopicFilter(mustUTF8 bool, p []byte) bool {
+ 		if p[0] == byte('#') && plen != 1 { // #一定是最后一个字符
+ 			return false
+ 		}
+-		if size == 1 && isSetPrevByte {
++		if size == 1 {
+ 			// + 前（如果有前后字节）,一定是'/' [MQTT-4.7.1-2]  [MQTT-4.7.1-3]
+-			if (p[0] == byte('+') || p[0] == byte('#')) && prevByte != byte('/') {
++			if isSetPrevByte && (p[0] == byte('+') || p[0] == byte('#')) && prevByte != byte('/') {
+ 				return false
+ 			}
+ 
+diff --git a/plugin/admin/hooks.go b/plugin/admin/hooks.go
+index 4635807..c15d085 100644
+--- a/plugin/admin/hooks.go
++++ b/plugin/admin/hooks.go
+@@ -43,6 +43,7 @@ func (a *Admin) OnSessionTerminatedWrapper(pre server.OnSessionTerminated) serve
+ 	return func(ctx context.Context, clientID string, reason server.SessionTerminatedReason) {
+ 		pre(ctx, clientID, reason)
+ 		a.store.removeClient(clientID)
++		a.store.removeClientSubscriptions(clientID)
+ 	}
+ }
+ 
+diff --git a/plugin/admin/store.go b/plugin/admin/store.go
+index 0f988af..9e401ac 100644
+--- a/plugin/admin/store.go
++++ b/plugin/admin/store.go
+@@ -54,6 +54,21 @@ func (s *store) removeSubscription(clientID string, topicName string) {
+ 	s.subIndexer.Remove(clientID + "_" + topicName)
+ }
+ 
++// removeClientSubscriptions removes all subscriptions of the given client.
++func (s *store) removeClientSubscriptions(clientID string) {
++	s.subMu.Lock()
++	defer s.subMu.Unlock()
++	var keys []string
++	s.subIndexer.Iterate(func(elem *list.Element) {
++		if sub := elem.Value.(*Subscription); sub.ClientId == clientID {
++			keys = append(keys, clientID+"_"+sub.TopicName)
++		}
++	}, 0, uint(s.subIndexer.Len()))
++	for _, key := range keys {
++		s.subIndexer.Remove(key)
++	}
++}
++
+ func (s *store) addClient(client server.Client) {
+ 	c := newClientInfo(client, uint32(s.config.MQTT.MaxQueuedMsg))
+ 	s.clientMu.Lock()
+diff --git a/retained/trie/retain_trie.go b/retained/trie/retain_trie.go
+index 89e318b..8a5b3ed 100644
+--- a/retained/trie/retain_trie.go
++++ b/retained/trie/retain_trie.go
+@@ -2,6 +2,7 @@ package trie
+ 
+ import (
+ 	"strings"
++	"time"
+ 
+ 	"github.com/DrmagicE/gmqtt"
+ 	"github.com/DrmagicE/gmqtt/retained"
+@@ -17,6 +18,7 @@ type children = map[string]*topicNode
+ type topicNode struct {
+ 	children  children
+ 	msg       *gmqtt.Message
++	storedAt  time.Time
+ 	parent    *topicNode // pointer of parent node
+ 	topicName string
+ }
+@@ -41,6 +43,21 @@ func (t *topicNode) newChild() *topicNode {
+ 	}
+ }
+ 
++// live returns the retained message with its Message Expiry Interval reduced by the time it has been stored.
++// It returns nil if the node has no message or the message has expired.
++func (t *topicNode) live() *gmqtt.Message {
++	if t.msg == nil || t.msg.MessageExpiry == 0 {
++		return t.msg
++	}
++	stored := uint32(time.Since(t.storedAt).Seconds())
++	if stored >= t.msg.MessageExpiry {
++		return nil
++	}
++	msg := t.msg.Copy()
++	msg.MessageExpiry -= stored
++	return msg
++}
++
+ // find walk through the tire and return the node that represent the topicName
+ // return nil if not found
+ func (t *topicTrie) find(topicName string) *topicNode {
+@@ -53,7 +70,7 @@ func (t *topicTrie) find(topicName string) *topicNode {
+ 			return nil
+ 		}
+ 	}
+-	if pNode.msg != nil {
++	if pNode.live() != nil {
+ 		return pNode
+ 	}
+ 	return nil
+@@ -69,8 +86,8 @@ func (t *topicTrie) matchTopic(topicSlice []string, fn retained.IterateFn) {
+ 		// 当前层的所有
+ 		for _, v := range t.children {
+ 			if endFlag {
+-				if v.msg != nil {
+-					fn(v.msg)
++				if msg := v.live(); msg != nil {
++					fn(msg)
+ 				}
+ 			} else {
+ 				v.matchTopic(topicSlice[1:], fn)
+@@ -79,8 +96,8 @@ func (t *topicTrie) matchTopic(topicSlice []string, fn retained.IterateFn) {
+ 	default:
+ 		if n := t.children[topicSlice[0]]; n != nil {
+ 			if endFlag {
+-				if n.msg != nil {
+-					fn(n.msg)
++				if msg := n.live(); msg != nil {
++					fn(msg)
+ 				}
+ 			} else {
+ 				n.matchTopic(topicSlice[1:], fn)
+@@ -114,6 +131,7 @@ func (t *topicTrie) addRetainMsg(topicName string, message *gmqtt.Message) {
+ 		pNode = pNode.children[lv]
+ 	}
+ 	pNode.msg = message
++	pNode.storedAt = time.Now()
+ 	pNode.topicName = topicName
+ }
+ 
+@@ -138,8 +156,8 @@ func (t *topicTrie) preOrderTraverse(fn retained.IterateFn) bool {
+ 	if t == nil {
+ 		return false
+ 	}
+-	if t.msg != nil {
+-		if !fn(t.msg) {
++	if msg := t.live(); msg != nil {
++		if !fn(msg) {
+ 			return false
+ 		}
+ 	}
+diff --git a/retained/trie/trie_db.go b/retained/trie/trie_db.go
+index a07c76f..e71f2f8 100644
+--- a/retained/trie/trie_db.go
++++ b/retained/trie/trie_db.go
+@@ -37,7 +37,7 @@ func (t *trieDB) GetRetainedMessage(topicName string) *gmqtt.Message {
+ 	defer t.RUnlock()
+ 	node := t.getTrie(topicName).find(topicName)
+ 	if node != nil {
+-		return node.msg.Copy()
++		return node.live().Copy()
+ 	}
+ 	return nil
+ }
+diff --git a/server/client.go b/server/client.go
+index 9fc4973..786fe44 100644
+--- a/server/client.go
++++ b/server/client.go
+@@ -148,6 +148,8 @@ type ClientOptions struct {
+ 	// SubIDAvailable indicates whether the client is permitted to set Subscription Identifiers.
+ 	// See: https://docs.oasis-open.org/mqtt/mqtt/v5.0/os/mqtt-v5.0-os.html#_Toc3901092
+ 	SubIDAvailable bool
++	// MaximumQoS is the highest QoS level the server accepts and grants for this client.
++	MaximumQoS uint8
+ 	// SharedSubAvailable indicates whether the client is permitted to subscribe Shared Subscriptions.
+ 	// See: https://docs.oasis-open.org/mqtt/mqtt/v5.0/os/mqtt-v5.0-os.html#_Toc3901093
+ 	SharedSubAvailable bool
+@@ -309,6 +311,19 @@ func (client *client) writeLoop() {
+ 	for {
+ 		select {
+ 		case <-client.close:
++			// Deliver the CONNACK or DISCONNECT queued by the error path before the connection goes away.
++			for pending := true; pending; {
++				select {
++				case packet := <-client.out:
++					switch packet.(type) {
++					case *packets.Connack, *packets.Disconnect:
++						_ = client.writePacket(packet)
++					}
++				default:
++					pending = false
++				}
++			}
++			_ = client.rwc.Close()
+ 			return
+ 		case packet := <-client.out:
+ 			switch p := packet.(type) {
+@@ -508,8 +523,12 @@ func convertUint32(u *uint32, defaultValue uint32) uint32 {
+ func sendErrConnack(cli *client, err error) {
+ 	codeErr := converError(err)
+ 	// Override the error code if it is invalid for V3 client.
+-	if packets.IsVersion3X(cli.version) && codeErr.Code > codes.V3NotAuthorized {
+-		codeErr.Code = codes.NotAuthorized
++	if packets.IsVersion3X(cli.version) {
++		if codeErr.Code == codes.ClientIdentifierNotValid {
++			codeErr.Code = codes.V3IdentifierRejected
++		} else if codeErr.Code > codes.V3NotAuthorized {
++			codeErr.Code = codes.NotAuthorized
++		}
+ 	}
+ 	cli.out <- &packets.Connack{
+ 		Version:    cli.version,
+@@ -617,6 +636,7 @@ func (client *client) connectWithTimeOut() (ok bool) {
+ 			client.opts.RetainAvailable = authOpts.RetainAvailable
+ 			client.opts.WildcardSubAvailable = authOpts.WildcardSubAvailable
+ 			client.opts.SubIDAvailable = authOpts.SubIDAvailable
++			client.opts.MaximumQoS = authOpts.MaximumQoS
+ 			client.opts.SharedSubAvailable = authOpts.SharedSubAvailable
+ 			client.opts.SessionExpiry = authOpts.SessionExpiry
+ 			client.opts.MaxInflight = authOpts.MaxInflight
+@@ -644,20 +664,19 @@ func (client *client) connectWithTimeOut() (ok bool) {
+ 				client.opts.ClientTopicAliasMax = convertUint16(conn.Properties.TopicAliasMaximum, client.opts.ClientTopicAliasMax)
+ 				client.opts.AuthMethod = conn.Properties.AuthMethod
+ 				client.serverReceiveMaximumQuota = client.opts.ReceiveMax
+-				client.aliasMapper = make([][]byte, client.opts.ReceiveMax+1)
++				client.aliasMapper = make([][]byte, client.opts.ServerTopicAliasMax+1)
+ 				client.opts.KeepAlive = authOpts.KeepAlive
+ 
+-				var maxQoS byte
+-				if authOpts.MaximumQoS >= 2 {
+-					maxQoS = byte(1)
+-				} else {
+-					maxQoS = byte(0)
++				// An absent Maximum QoS property means that the server supports QoS 2.
++				var maxQoS *byte
++				if authOpts.MaximumQoS < packets.Qos2 {
++					maxQoS = &authOpts.MaximumQoS
+ 				}
+ 
+ 				connackPpt = &packets.Properties{
+ 					SessionExpiryInterval: &authOpts.SessionExpiry,
+ 					ReceiveMaximum:        &authOpts.ReceiveMax,
+-					MaximumQoS:            &maxQoS,
++					MaximumQoS:            maxQoS,
+ 					RetainAvailable:       bool2Byte(authOpts.RetainAvailable),
+ 					TopicAliasMaximum:     &authOpts.TopicAliasMax,
+ 					WildcardSubAvailable:  bool2Byte(authOpts.WildcardSubAvailable),
+@@ -725,13 +744,13 @@ func (client *client) enhancedAuth(conn *packets.Connect, authOpts *AuthOptions)
+ }
+ 
+ func (client *client) connectHandler(conn *packets.Connect) (authOpts *AuthOptions, enhancedResp *EnhancedAuthResponse, err error) {
++	client.version = conn.Version
+ 	if !client.config.MQTT.AllowZeroLenClientID && len(conn.ClientID) == 0 {
+ 		err = &codes.Error{
+ 			Code: codes.ClientIdentifierNotValid,
+ 		}
+ 		return
+ 	}
+-	client.version = conn.Version
+ 	// default auth options
+ 	authOpts = client.defaultAuthOptions(conn)
+ 
+@@ -845,6 +864,13 @@ func (client *client) subscribeHandler(sub *packets.Subscribe) *codes.Error {
+ 			}
+ 		}
+ 	}
++	for _, v := range sub.Topics {
++		if shareName, _ := subscription.SplitTopic(v.Name); shareName != "" && v.NoLocal {
++			return &codes.Error{
++				Code: codes.ProtocolError,
++			}
++		}
++	}
+ 	subReq := &SubscribeRequest{
+ 		Subscribe: sub,
+ 		Subscriptions: make(map[string]*struct {
+@@ -880,6 +906,9 @@ func (client *client) subscribeHandler(sub *packets.Subscribe) *codes.Error {
+ 		sub := subReq.Subscriptions[v.Name].Sub
+ 		subErr := converError(subReq.Subscriptions[v.Name].Error)
+ 		var isShared bool
++		if sub.QoS > client.opts.MaximumQoS {
++			sub.QoS = client.opts.MaximumQoS
++		}
+ 		code := sub.QoS
+ 		if client.version == packets.Version5 {
+ 			if sub.ShareName != "" {
+@@ -988,6 +1017,11 @@ func (client *client) publishHandler(pub *packets.Publish) *codes.Error {
+ 	srv := client.server
+ 	var dup bool
+ 
++	if pub.Qos > client.opts.MaximumQoS {
++		return &codes.Error{
++			Code: codes.QoSNotSupported,
++		}
++	}
+ 	// check retain available
+ 	if !client.opts.RetainAvailable && pub.Retain {
+ 		return &codes.Error{
+@@ -998,7 +1032,7 @@ func (client *client) publishHandler(pub *packets.Publish) *codes.Error {
+ 	msg = gmqtt.MessageFromPublish(pub)
+ 
+ 	if client.version == packets.Version5 && pub.Properties.TopicAlias != nil {
+-		if *pub.Properties.TopicAlias >= client.opts.ServerTopicAliasMax {
++		if *pub.Properties.TopicAlias > client.opts.ServerTopicAliasMax {
+ 			return &codes.Error{
+ 				Code: codes.TopicAliasInvalid,
+ 			}
+@@ -1030,7 +1064,7 @@ func (client *client) publishHandler(pub *packets.Publish) *codes.Error {
+ 
+ 	if pub.Retain {
+ 		if len(pub.Payload) == 0 {
+-			srv.retainedDB.Remove(string(pub.TopicName))
++			srv.retainedDB.Remove(msg.Topic)
+ 		} else {
+ 			srv.retainedDB.AddOrReplace(msg.Copy())
+ 		}
+@@ -1284,8 +1318,8 @@ func (client *client) disconnectHandler(dis *packets.Disconnect) *codes.Error {
+ 		}
+ 	}
+ 	client.disconnect = dis
+-	// 不发送will message
+-	client.cleanWillFlag = true
++	// The will message is discarded unless the client asks for it to be published.
++	client.cleanWillFlag = dis.Code != codes.DisconnectWithWillMessage
+ 	return nil
+ }
+ 
+@@ -1400,8 +1434,12 @@ func (client *client) pollNewMessages(ids []packets.PacketID) (unused []packets.
+ 				ids = ids[1:]
+ 			}
+ 			if client.version == packets.Version5 && m.Message.MessageExpiry != 0 {
+-				d := uint32(now.Sub(v.At).Seconds())
+-				m.Message.MessageExpiry = d
++				// Forward the original lifetime minus the time the message has been waiting.
++				if waited := uint32(now.Sub(v.At).Seconds()); waited < m.Message.MessageExpiry {
++					m.Message.MessageExpiry -= waited
++				} else {
++					m.Message.MessageExpiry = 1
++				}
+ 			}
+ 			client.write(gmqtt.MessageToPublish(m.Message, client.version))
+ 		case *queue.Pubrel:
+diff --git a/server/publish_service.go b/server/publish_service.go
+index fd5cb57..7cf1649 100644
+--- a/server/publish_service.go
++++ b/server/publish_service.go
+@@ -8,6 +8,13 @@ type publishService struct {
+ 
+ func (p *publishService) Publish(message *gmqtt.Message) {
+ 	p.server.mu.Lock()
++	if message.Retained {
++		if len(message.Payload) == 0 {
++			p.server.retainedDB.Remove(message.Topic)
++		} else {
++			p.server.retainedDB.AddOrReplace(message.Copy())
++		}
++	}
+ 	p.server.deliverMessage("", message, defaultIterateOptions(message.Topic))
+ 	p.server.mu.Unlock()
+ }
+diff --git a/server/server.go b/server/server.go
+index 07018f0..10c478b 100644
+--- a/server/server.go
++++ b/server/server.go
+@@ -331,8 +331,12 @@ func (srv *server) lockDuplicatedID(c *client) (oldSession *gmqtt.Session, err e
+ 				zap.String("client_id", oldSession.ClientID),
+ 			)
+ 			oldClient.setError(codes.NewError(codes.SessionTakenOver))
+-			oldClient.Close()
+-			<-oldClient.closed
++			select {
++			case <-oldClient.closed:
++			case <-time.After(time.Second):
++				oldClient.Close()
++				<-oldClient.closed
++			}
+ 			continue
+ 		}
+ 		break
+@@ -809,7 +813,11 @@ func (srv *server) sessionExpireCheck() {
+ 
+ // server event loop
+ func (srv *server) eventLoop() {
+-	sessionExpireTimer := time.NewTicker(time.Second * 20)
++	checkInterval := srv.config.MQTT.SessionExpiryCheckInterval
++	if checkInterval <= 0 {
++		checkInterval = 20 * time.Second
++	}
++	sessionExpireTimer := time.NewTicker(checkInterval)
+ 	defer func() {
+ 		sessionExpireTimer.Stop()
+ 		srv.wg.Done()
+@@ -1099,7 +1107,7 @@ func (srv *server) newClient(c net.Conn) (*client, error) {
+ 		in:            make(chan packets.Packet, 8),
+ 		out:           make(chan packets.Packet, 8),
+ 		status:        Connecting,
+-		opts:          &ClientOptions{},
++		opts:          &ClientOptions{MaximumQoS: cfg.MQTT.MaximumQoS},
+ 		cleanWillFlag: false,
+ 		config:        cfg,
+ 		register:      srv.registerClient,
