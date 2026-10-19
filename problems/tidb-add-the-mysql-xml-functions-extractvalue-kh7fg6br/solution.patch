@@ -1,0 +1,2015 @@
+diff --git a/pkg/expression/BUILD.bazel b/pkg/expression/BUILD.bazel
+index a45afdb928..f264307ec7 100644
+--- a/pkg/expression/BUILD.bazel
++++ b/pkg/expression/BUILD.bazel
+@@ -49,6 +49,7 @@ go_library(
+         "builtin_time_vec.go",
+         "builtin_time_vec_generated.go",
+         "builtin_vec.go",
++        "builtin_xml.go",
+         "builtin_vec_vec.go",
+         "builtin_vectorized.go",
+         "chunk_executor.go",
+@@ -140,6 +141,7 @@ go_library(
+         "//pkg/util/stringutil",
+         "//pkg/util/timeutil",
+         "//pkg/util/vitess",
++        "//pkg/util/xpath",
+         "//pkg/util/zeropool",
+         "@com_github_gogo_protobuf//proto",
+         "@com_github_google_uuid//:uuid",
+diff --git a/pkg/expression/builtin.go b/pkg/expression/builtin.go
+index 9683de6ad2..bc5c8f9f8b 100644
+--- a/pkg/expression/builtin.go
++++ b/pkg/expression/builtin.go
+@@ -970,6 +970,10 @@ var funcs = map[string]functionClass{
+ 	ast.JSONKeys:          &jsonKeysFunctionClass{baseFunctionClass{ast.JSONKeys, 1, 2}},
+ 	ast.JSONLength:        &jsonLengthFunctionClass{baseFunctionClass{ast.JSONLength, 1, 2}},
+ 
++	// xml functions
++	ast.ExtractValue: &extractValueFunctionClass{baseFunctionClass{ast.ExtractValue, 2, 2}},
++	ast.UpdateXML:    &updateXMLFunctionClass{baseFunctionClass{ast.UpdateXML, 3, 3}},
++
+ 	// vector functions (TiDB extension)
+ 	ast.VecDims:                 &vecDimsFunctionClass{baseFunctionClass{ast.VecDims, 1, 1}},
+ 	ast.VecL1Distance:           &vecL1DistanceFunctionClass{baseFunctionClass{ast.VecL1Distance, 2, 2}},
+diff --git a/pkg/expression/builtin_threadunsafe_generated.go b/pkg/expression/builtin_threadunsafe_generated.go
+index e3795d41eb..55eef430c7 100644
+--- a/pkg/expression/builtin_threadunsafe_generated.go
++++ b/pkg/expression/builtin_threadunsafe_generated.go
+@@ -465,3 +465,13 @@ func (s *builtinTiDBBoundedStalenessSig) SafeToShareAcrossSession() bool {
+ func (s *builtinTiDBCurrentTsoSig) SafeToShareAcrossSession() bool {
+ 	return false
+ }
++
++// SafeToShareAcrossSession implements BuiltinFunc.SafeToShareAcrossSession.
++func (s *builtinExtractValueSig) SafeToShareAcrossSession() bool {
++	return false
++}
++
++// SafeToShareAcrossSession implements BuiltinFunc.SafeToShareAcrossSession.
++func (s *builtinUpdateXMLSig) SafeToShareAcrossSession() bool {
++	return false
++}
+diff --git a/pkg/expression/builtin_xml.go b/pkg/expression/builtin_xml.go
+new file mode 100644
+index 0000000000..cd7d4b4563
+--- /dev/null
++++ b/pkg/expression/builtin_xml.go
+@@ -0,0 +1,234 @@
++// Copyright 2026 PingCAP, Inc.
++//
++// Licensed under the Apache License, Version 2.0 (the "License");
++// you may not use this file except in compliance with the License.
++// You may obtain a copy of the License at
++//
++//     http://www.apache.org/licenses/LICENSE-2.0
++//
++// Unless required by applicable law or agreed to in writing, software
++// distributed under the License is distributed on an "AS IS" BASIS,
++// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++// See the License for the specific language governing permissions and
++// limitations under the License.
++
++package expression
++
++import (
++	"strings"
++
++	"github.com/pingcap/tidb/pkg/parser/mysql"
++	"github.com/pingcap/tidb/pkg/types"
++	"github.com/pingcap/tidb/pkg/util/chunk"
++	"github.com/pingcap/tidb/pkg/util/collate"
++	"github.com/pingcap/tidb/pkg/util/xpath"
++)
++
++var (
++	_ functionClass = &extractValueFunctionClass{}
++	_ functionClass = &updateXMLFunctionClass{}
++)
++
++var (
++	_ builtinFunc = &builtinExtractValueSig{}
++	_ builtinFunc = &builtinUpdateXMLSig{}
++)
++
++// constXPath compiles the XPath argument when it is a plain constant, so a
++// syntax error is reported while the statement is built and the compiled
++// expression is shared by every row. It returns nil when the argument is not
++// constant or is NULL.
++func constXPath(ctx BuildContext, arg Expression) (*xpath.Expr, error) {
++	c, ok := arg.(*Constant)
++	if !ok || c.ParamMarker != nil || c.DeferredExpr != nil {
++		return nil, nil
++	}
++	s, isNull, err := c.EvalString(ctx.GetEvalCtx(), chunk.Row{})
++	if err != nil || isNull {
++		return nil, err
++	}
++	return compileXPath(s)
++}
++
++func compileXPath(s string) (*xpath.Expr, error) {
++	e, err := xpath.Compile(s)
++	if err != nil {
++		if se, ok := err.(*xpath.SyntaxError); ok {
++			return nil, errXPathSyntax.GenWithStackByArgs(se.Near)
++		}
++		return nil, err
++	}
++	return e, nil
++}
++
++// xmlEnv builds the evaluation environment of a call: string comparisons and
++// contains() follow the collation of the call, and $@name reads the user
++// variable at execution time.
++func xmlEnv(ctx EvalContext, collation string) xpath.Env {
++	collator := collate.GetCollator(collation)
++	return xpath.Env{
++		Equal: func(a, b string) bool { return collator.Compare(a, b) == 0 },
++		Contains: func(s, sub string) bool {
++			if sub == "" {
++				return true
++			}
++			var sb strings.Builder
++			sb.WriteByte('%')
++			for i := 0; i < len(sub); i++ {
++				if c := sub[i]; c == '%' || c == '_' || c == '\\' {
++					sb.WriteByte('\\')
++				}
++				sb.WriteByte(sub[i])
++			}
++			sb.WriteByte('%')
++			pattern := collator.Pattern()
++			pattern.Compile(sb.String(), '\\')
++			return pattern.DoMatch(s)
++		},
++		Lookup: func(name string) (xpath.Variable, bool) {
++			d, ok := ctx.GetUserVarsReader().GetUserVarVal(strings.ToLower(name))
++			if !ok || d.IsNull() {
++				return xpath.Variable{}, false
++			}
++			switch d.Kind() {
++			case types.KindInt64, types.KindUint64, types.KindFloat32, types.KindFloat64, types.KindMysqlDecimal:
++				f, err := d.ToFloat64(typeCtx(ctx))
++				if err == nil {
++					return xpath.Variable{IsNumber: true, Number: f}, true
++				}
++			}
++			s, err := d.ToString()
++			if err != nil {
++				return xpath.Variable{}, false
++			}
++			return xpath.Variable{String: s}, true
++		},
++	}
++}
++
++// evalXMLArgs evaluates the XML and XPath arguments. A malformed XML value
++// makes the result NULL with a warning, like MySQL.
++func evalXMLArgs(ctx EvalContext, row chunk.Row, xmlArg, pathArg Expression, compiled *xpath.Expr) (*xpath.Document, *xpath.Expr, bool, error) {
++	path := compiled
++	if path == nil {
++		s, isNull, err := pathArg.EvalString(ctx, row)
++		if err != nil || isNull {
++			return nil, nil, true, err
++		}
++		if path, err = compileXPath(s); err != nil {
++			return nil, nil, true, err
++		}
++	}
++	src, isNull, err := xmlArg.EvalString(ctx, row)
++	if err != nil || isNull {
++		return nil, nil, true, err
++	}
++	doc, err := xpath.Parse(src)
++	if err != nil {
++		tc := typeCtx(ctx)
++		tc.AppendWarning(errIncorrectXMLValue.FastGenByArgs("XML", err.Error()))
++		return nil, nil, true, nil
++	}
++	return doc, path, false, nil
++}
++
++type extractValueFunctionClass struct {
++	baseFunctionClass
++}
++
++func (c *extractValueFunctionClass) getFunction(ctx BuildContext, args []Expression) (builtinFunc, error) {
++	if err := c.verifyArgs(args); err != nil {
++		return nil, err
++	}
++	bf, err := newBaseBuiltinFuncWithTp(ctx, c.funcName, args, types.ETString, types.ETString, types.ETString)
++	if err != nil {
++		return nil, err
++	}
++	bf.tp.SetFlen(mysql.MaxLongBlobWidth)
++	path, err := constXPath(ctx, args[1])
++	if err != nil {
++		return nil, err
++	}
++	return &builtinExtractValueSig{baseBuiltinFunc: bf, path: path}, nil
++}
++
++type builtinExtractValueSig struct {
++	baseBuiltinFunc
++	// path is the compiled constant XPath argument, nil when it is not
++	// constant. It is immutable after the function is built.
++	path *xpath.Expr
++}
++
++func (b *builtinExtractValueSig) Clone() builtinFunc {
++	newSig := &builtinExtractValueSig{path: b.path}
++	newSig.cloneFrom(&b.baseBuiltinFunc)
++	return newSig
++}
++
++// evalString evals EXTRACTVALUE(xml_frag, xpath_expr).
++// See https://dev.mysql.com/doc/refman/8.4/en/xml-functions.html#function_extractvalue
++func (b *builtinExtractValueSig) evalString(ctx EvalContext, row chunk.Row) (string, bool, error) {
++	doc, path, isNull, err := evalXMLArgs(ctx, row, b.args[0], b.args[1], b.path)
++	if isNull || err != nil {
++		return "", true, err
++	}
++	res, ok := path.Evaluate(doc, xmlEnv(ctx, b.collation)).Text()
++	return res, !ok, nil
++}
++
++type updateXMLFunctionClass struct {
++	baseFunctionClass
++}
++
++func (c *updateXMLFunctionClass) getFunction(ctx BuildContext, args []Expression) (builtinFunc, error) {
++	if err := c.verifyArgs(args); err != nil {
++		return nil, err
++	}
++	bf, err := newBaseBuiltinFuncWithTp(ctx, c.funcName, args, types.ETString, types.ETString, types.ETString, types.ETString)
++	if err != nil {
++		return nil, err
++	}
++	bf.tp.SetFlen(mysql.MaxLongBlobWidth)
++	path, err := constXPath(ctx, args[1])
++	if err != nil {
++		return nil, err
++	}
++	return &builtinUpdateXMLSig{baseBuiltinFunc: bf, path: path}, nil
++}
++
++type builtinUpdateXMLSig struct {
++	baseBuiltinFunc
++	// path is the compiled constant XPath argument, nil when it is not
++	// constant. It is immutable after the function is built.
++	path *xpath.Expr
++}
++
++func (b *builtinUpdateXMLSig) Clone() builtinFunc {
++	newSig := &builtinUpdateXMLSig{path: b.path}
++	newSig.cloneFrom(&b.baseBuiltinFunc)
++	return newSig
++}
++
++// evalString evals UPDATEXML(xml_target, xpath_expr, new_xml).
++// See https://dev.mysql.com/doc/refman/8.4/en/xml-functions.html#function_updatexml
++func (b *builtinUpdateXMLSig) evalString(ctx EvalContext, row chunk.Row) (string, bool, error) {
++	doc, path, isNull, err := evalXMLArgs(ctx, row, b.args[0], b.args[1], b.path)
++	if isNull || err != nil {
++		return "", true, err
++	}
++	replacement, isNull, err := b.args[2].EvalString(ctx, row)
++	if isNull || err != nil {
++		return "", true, err
++	}
++	nodes, ok := path.Evaluate(doc, xmlEnv(ctx, b.collation)).Nodes()
++	if !ok {
++		return "", true, nil
++	}
++	src := doc.Source()
++	// Only a single match is replaced; otherwise the target is returned as is.
++	if len(nodes) != 1 {
++		return src, false, nil
++	}
++	start, end := doc.Span(nodes[0])
++	return src[:start] + replacement + src[end:], false, nil
++}
+diff --git a/pkg/expression/collation.go b/pkg/expression/collation.go
+index 3b3ba17474..4f4d841e46 100644
+--- a/pkg/expression/collation.go
++++ b/pkg/expression/collation.go
+@@ -244,7 +244,8 @@ func deriveCoercibilityForColumn(c *Column) Coercibility {
+ 
+ func deriveCollation(ctx BuildContext, funcName string, args []Expression, retType types.EvalType, argTps ...types.EvalType) (ec *ExprCollation, err error) {
+ 	switch funcName {
+-	case ast.Concat, ast.ConcatWS, ast.Lower, ast.Lcase, ast.Reverse, ast.Upper, ast.Ucase, ast.Quote, ast.Coalesce, ast.Greatest, ast.Least:
++	case ast.Concat, ast.ConcatWS, ast.Lower, ast.Lcase, ast.Reverse, ast.Upper, ast.Ucase, ast.Quote, ast.Coalesce, ast.Greatest, ast.Least,
++		ast.ExtractValue, ast.UpdateXML:
+ 		return CheckAndDeriveCollationFromExprs(ctx, funcName, retType, args...)
+ 	case ast.Left, ast.Right, ast.Repeat, ast.Trim, ast.LTrim, ast.RTrim, ast.Substr, ast.SubstringIndex, ast.Replace, ast.Substring, ast.Mid, ast.Translate:
+ 		return CheckAndDeriveCollationFromExprs(ctx, funcName, retType, args[0])
+diff --git a/pkg/expression/errors.go b/pkg/expression/errors.go
+index 55e2c6b16f..23ed9a7026 100644
+--- a/pkg/expression/errors.go
++++ b/pkg/expression/errors.go
+@@ -60,6 +60,8 @@ var (
+ 	errUserLockWrongName             = dbterror.ClassExpression.NewStd(mysql.ErrUserLockWrongName)
+ 	errJSONInBooleanContext          = dbterror.ClassExpression.NewStd(mysql.ErrJSONInBooleanContext)
+ 	errBadNull                       = dbterror.ClassExpression.NewStd(mysql.ErrBadNull)
++	errXPathSyntax                   = dbterror.ClassExpression.NewStdErr(mysql.ErrUnknown, pmysql.Message("XPATH syntax error: '%-.64s'", nil))
++	errIncorrectXMLValue             = dbterror.ClassExpression.NewStd(mysql.ErrWrongValue)
+ 
+ 	// Sequence usage privilege check.
+ 	errSequenceAccessDenied      = dbterror.ClassExpression.NewStd(mysql.ErrTableaccessDenied)
+diff --git a/pkg/expression/function_traits.go b/pkg/expression/function_traits.go
+index 86104fe879..ea6844657d 100644
+--- a/pkg/expression/function_traits.go
++++ b/pkg/expression/function_traits.go
+@@ -65,6 +65,9 @@ var unFoldableFunctions = map[string]struct{}{
+ 	ast.SetVal:    {},
+ 	ast.AnyValue:  {},
+ 	ast.EmbedText: {},
++	// XPath expressions may read user variables ($@name) at execution time.
++	ast.ExtractValue: {},
++	ast.UpdateXML:    {},
+ }
+ 
+ // DisableFoldFunctions stores functions which prevent child scope functions from being constant folded.
+@@ -133,6 +136,7 @@ var IllegalFunctions4GeneratedColumns = map[string]struct{}{
+ 	ast.TiDBRowChecksum:      {},
+ 	ast.TiDBVersion:          {},
+ 	ast.UnixTimestamp:        {},
++	ast.UpdateXML:            {},
+ 	ast.User:                 {},
+ 	ast.UTCDate:              {},
+ 	ast.UTCTime:              {},
+diff --git a/pkg/expression/function_traits_test.go b/pkg/expression/function_traits_test.go
+index 50768d6db2..b14c38cceb 100644
+--- a/pkg/expression/function_traits_test.go
++++ b/pkg/expression/function_traits_test.go
+@@ -100,6 +100,7 @@ func TestIllegalFunctions4GeneratedColumns(t *testing.T) {
+ 		"exp",
+ 		"export_set",
+ 		"extract",
++		"extractvalue",
+ 		"field",
+ 		"find_in_set",
+ 		"floor",
+diff --git a/pkg/parser/ast/functions.go b/pkg/parser/ast/functions.go
+index e199a81aef..5a0d882045 100644
+--- a/pkg/parser/ast/functions.go
++++ b/pkg/parser/ast/functions.go
+@@ -361,6 +361,10 @@ const (
+ 	JSONKeys          = "json_keys"
+ 	JSONLength        = "json_length"
+ 
++	// xml functions
++	ExtractValue = "extractvalue"
++	UpdateXML    = "updatexml"
++
+ 	// vector functions (tidb extension)
+ 	VecDims                 = "vec_dims"
+ 	VecL1Distance           = "vec_l1_distance"
+diff --git a/pkg/util/xpath/BUILD.bazel b/pkg/util/xpath/BUILD.bazel
+new file mode 100644
+index 0000000000..35c6d568bf
+--- /dev/null
++++ b/pkg/util/xpath/BUILD.bazel
+@@ -0,0 +1,12 @@
++load("@io_bazel_rules_go//go:def.bzl", "go_library")
++
++go_library(
++    name = "xpath",
++    srcs = [
++        "compile.go",
++        "document.go",
++        "eval.go",
++    ],
++    importpath = "github.com/pingcap/tidb/pkg/util/xpath",
++    visibility = ["//visibility:public"],
++)
+diff --git a/pkg/util/xpath/compile.go b/pkg/util/xpath/compile.go
+new file mode 100644
+index 0000000000..f264bfbd97
+--- /dev/null
++++ b/pkg/util/xpath/compile.go
+@@ -0,0 +1,667 @@
++// Copyright 2026 PingCAP, Inc.
++//
++// Licensed under the Apache License, Version 2.0 (the "License");
++// you may not use this file except in compliance with the License.
++// You may obtain a copy of the License at
++//
++//     http://www.apache.org/licenses/LICENSE-2.0
++//
++// Unless required by applicable law or agreed to in writing, software
++// distributed under the License is distributed on an "AS IS" BASIS,
++// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++// See the License for the specific language governing permissions and
++// limitations under the License.
++
++package xpath
++
++import (
++	"strconv"
++	"strings"
++)
++
++// SyntaxError reports an XPath expression that cannot be compiled. Near holds
++// the part of the expression starting at the offending token.
++type SyntaxError struct {
++	Near string
++}
++
++func (e *SyntaxError) Error() string {
++	return "XPATH syntax error: '" + e.Near + "'"
++}
++
++type tokKind uint8
++
++const (
++	tEOF tokKind = iota
++	tSlash
++	tDSlash
++	tLParen
++	tRParen
++	tLBracket
++	tRBracket
++	tDot
++	tDDot
++	tAt
++	tComma
++	tAxis // "::"
++	tPipe
++	tPlus
++	tMinus
++	tEq
++	tNe
++	tLt
++	tLe
++	tGt
++	tGe
++	tStar // name test "*"
++	tMul  // multiply operator "*"
++	tAnd
++	tOr
++	tDiv
++	tMod
++	tNumber
++	tLiteral
++	tName
++	tUserVar
++)
++
++type token struct {
++	kind tokKind
++	text string
++	num  float64
++	pos  int
++}
++
++type lexer struct {
++	src  string
++	pos  int
++	toks []token
++}
++
++// operatorFollows reports whether the previous token lets the next "*" or
++// NCName be read as an operator, following XPath 1.0 section 3.7.
++func operatorFollows(prev tokKind) bool {
++	switch prev {
++	case tEOF, tAt, tAxis, tLParen, tLBracket, tComma,
++		tAnd, tOr, tDiv, tMod, tMul, tSlash, tDSlash, tPipe,
++		tPlus, tMinus, tEq, tNe, tLt, tLe, tGt, tGe:
++		return false
++	}
++	return true
++}
++
++func isNameStart(c byte) bool {
++	return c >= 0x80 || c == '_' || (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z')
++}
++
++func (l *lexer) err(pos int) error {
++	return &SyntaxError{Near: l.src[pos:]}
++}
++
++func (l *lexer) scanName() string {
++	start := l.pos
++	for l.pos < len(l.src) {
++		c := l.src[l.pos]
++		if isNameByte(c) && c != ':' {
++			l.pos++
++			continue
++		}
++		// A single colon joins a prefix to a local name; "::" is an axis separator.
++		if c == ':' && l.pos+1 < len(l.src) && l.src[l.pos+1] != ':' && isNameStart(l.src[l.pos+1]) {
++			l.pos++
++			continue
++		}
++		break
++	}
++	return l.src[start:l.pos]
++}
++
++func (l *lexer) run() error {
++	prev := tEOF
++	for {
++		for l.pos < len(l.src) && isSpace(l.src[l.pos]) {
++			l.pos++
++		}
++		if l.pos >= len(l.src) {
++			l.toks = append(l.toks, token{kind: tEOF, pos: l.pos})
++			return nil
++		}
++		start := l.pos
++		c := l.src[l.pos]
++		tok := token{pos: start}
++		two := ""
++		if l.pos+1 < len(l.src) {
++			two = l.src[l.pos : l.pos+2]
++		}
++		switch {
++		case two == "//":
++			tok.kind, l.pos = tDSlash, l.pos+2
++		case two == "::":
++			tok.kind, l.pos = tAxis, l.pos+2
++		case two == "!=":
++			tok.kind, l.pos = tNe, l.pos+2
++		case two == "<=":
++			tok.kind, l.pos = tLe, l.pos+2
++		case two == ">=":
++			tok.kind, l.pos = tGe, l.pos+2
++		case two == "..":
++			tok.kind, l.pos = tDDot, l.pos+2
++		case c == '.' && (l.pos+1 >= len(l.src) || l.src[l.pos+1] < '0' || l.src[l.pos+1] > '9'):
++			tok.kind, l.pos = tDot, l.pos+1
++		case c == '.' || (c >= '0' && c <= '9'):
++			for l.pos < len(l.src) && l.src[l.pos] >= '0' && l.src[l.pos] <= '9' {
++				l.pos++
++			}
++			if l.pos < len(l.src) && l.src[l.pos] == '.' {
++				l.pos++
++				for l.pos < len(l.src) && l.src[l.pos] >= '0' && l.src[l.pos] <= '9' {
++					l.pos++
++				}
++			}
++			tok.kind, tok.text = tNumber, l.src[start:l.pos]
++			n, err := strconv.ParseFloat(tok.text, 64)
++			if err != nil {
++				return l.err(start)
++			}
++			tok.num = n
++		case c == '"' || c == '\'':
++			end := strings.IndexByte(l.src[l.pos+1:], c)
++			if end < 0 {
++				return l.err(start)
++			}
++			tok.kind, tok.text = tLiteral, l.src[l.pos+1:l.pos+1+end]
++			l.pos += end + 2
++		case c == '$':
++			// Only user variables ($@name) exist outside stored programs.
++			if l.pos+1 >= len(l.src) || l.src[l.pos+1] != '@' {
++				return l.err(start)
++			}
++			l.pos += 2
++			name := l.scanName()
++			if name == "" {
++				return l.err(start)
++			}
++			tok.kind, tok.text = tUserVar, name
++		case c == '/':
++			tok.kind, l.pos = tSlash, l.pos+1
++		case c == '(':
++			tok.kind, l.pos = tLParen, l.pos+1
++		case c == ')':
++			tok.kind, l.pos = tRParen, l.pos+1
++		case c == '[':
++			tok.kind, l.pos = tLBracket, l.pos+1
++		case c == ']':
++			tok.kind, l.pos = tRBracket, l.pos+1
++		case c == '@':
++			tok.kind, l.pos = tAt, l.pos+1
++		case c == ',':
++			tok.kind, l.pos = tComma, l.pos+1
++		case c == '|':
++			tok.kind, l.pos = tPipe, l.pos+1
++		case c == '+':
++			tok.kind, l.pos = tPlus, l.pos+1
++		case c == '-':
++			tok.kind, l.pos = tMinus, l.pos+1
++		case c == '=':
++			tok.kind, l.pos = tEq, l.pos+1
++		case c == '<':
++			tok.kind, l.pos = tLt, l.pos+1
++		case c == '>':
++			tok.kind, l.pos = tGt, l.pos+1
++		case c == '*':
++			l.pos++
++			if operatorFollows(prev) {
++				tok.kind = tMul
++			} else {
++				tok.kind = tStar
++			}
++		case isNameStart(c):
++			name := l.scanName()
++			tok.kind, tok.text = tName, name
++			if operatorFollows(prev) {
++				switch name {
++				case "and":
++					tok.kind = tAnd
++				case "or":
++					tok.kind = tOr
++				case "div":
++					tok.kind = tDiv
++				case "mod":
++					tok.kind = tMod
++				default:
++					return l.err(start)
++				}
++			}
++		default:
++			return l.err(start)
++		}
++		l.toks = append(l.toks, tok)
++		prev = tok.kind
++	}
++}
++
++type axisKind uint8
++
++const (
++	axisChild axisKind = iota
++	axisDescendant
++	axisDescendantOrSelf
++	axisParent
++	axisAncestor
++	axisAncestorOrSelf
++	axisSelf
++	axisAttribute
++	axisFollowingSibling
++	axisPrecedingSibling
++	axisFollowing
++	axisPreceding
++)
++
++var axisNames = map[string]axisKind{
++	"child":              axisChild,
++	"descendant":         axisDescendant,
++	"descendant-or-self": axisDescendantOrSelf,
++	"parent":             axisParent,
++	"ancestor":           axisAncestor,
++	"ancestor-or-self":   axisAncestorOrSelf,
++	"self":               axisSelf,
++	"attribute":          axisAttribute,
++	"following-sibling":  axisFollowingSibling,
++	"preceding-sibling":  axisPrecedingSibling,
++	"following":          axisFollowing,
++	"preceding":          axisPreceding,
++}
++
++func (a axisKind) reverse() bool {
++	switch a {
++	case axisParent, axisAncestor, axisAncestorOrSelf, axisPrecedingSibling, axisPreceding:
++		return true
++	}
++	return false
++}
++
++type testKind uint8
++
++const (
++	testName testKind = iota
++	testAny           // "*"
++	testText          // text()
++	testNode          // node()
++	testNone          // comment() and processing-instruction(), which never match
++)
++
++type step struct {
++	axis  axisKind
++	test  testKind
++	name  string
++	preds []expr
++}
++
++type expr interface{}
++
++type (
++	numberExpr  float64
++	literalExpr string
++	userVarExpr string
++	negExpr     struct{ arg expr }
++	binaryExpr  struct {
++		op   tokKind
++		l, r expr
++	}
++	unionExpr struct{ l, r expr }
++	pathExpr  struct {
++		absolute bool
++		steps    []step
++	}
++	funcExpr struct {
++		name string
++		args []expr
++	}
++)
++
++// unsupportedFunctions are XPath 1.0 functions MySQL documents as not
++// supported; using them is a syntax error.
++var unsupportedFunctions = map[string]struct{}{
++	"id": {}, "lang": {}, "local-name": {}, "name": {}, "namespace-uri": {},
++	"normalize-space": {}, "starts-with": {}, "string": {}, "substring-after": {},
++	"substring-before": {}, "translate": {},
++}
++
++// functionArity holds the minimum and maximum argument count of each
++// supported function; -1 means unbounded.
++var functionArity = map[string][2]int{
++	"last": {0, 0}, "position": {0, 0}, "count": {1, 1}, "sum": {1, 1},
++	"not": {1, 1}, "true": {0, 0}, "false": {0, 0}, "boolean": {1, 1},
++	"number": {1, 1}, "floor": {1, 1}, "ceiling": {1, 1}, "round": {1, 1},
++	"concat": {2, -1}, "contains": {2, 2}, "substring": {2, 3}, "string-length": {1, 1},
++}
++
++var nodeTypes = map[string]testKind{
++	"text": testText, "node": testNode, "comment": testNone, "processing-instruction": testNone,
++}
++
++// Expr is a compiled XPath expression. It is immutable and safe for
++// concurrent use.
++type Expr struct {
++	root expr
++}
++
++// Compile compiles an XPath expression.
++func Compile(src string) (*Expr, error) {
++	l := &lexer{src: src}
++	if err := l.run(); err != nil {
++		return nil, err
++	}
++	p := &parser{src: src, toks: l.toks}
++	e, err := p.orExpr()
++	if err != nil {
++		return nil, err
++	}
++	if p.peek().kind != tEOF {
++		return nil, p.errAt()
++	}
++	return &Expr{root: e}, nil
++}
++
++type parser struct {
++	src  string
++	toks []token
++	i    int
++}
++
++func (p *parser) peek() token { return p.toks[p.i] }
++func (p *parser) peekAt(n int) token {
++	if p.i+n < len(p.toks) {
++		return p.toks[p.i+n]
++	}
++	return p.toks[len(p.toks)-1]
++}
++func (p *parser) next() token {
++	t := p.toks[p.i]
++	if t.kind != tEOF {
++		p.i++
++	}
++	return t
++}
++func (p *parser) errAt() error { return &SyntaxError{Near: p.src[p.peek().pos:]} }
++
++func (p *parser) expect(k tokKind) error {
++	if p.peek().kind != k {
++		return p.errAt()
++	}
++	p.next()
++	return nil
++}
++
++func (p *parser) binary(sub func() (expr, error), ops ...tokKind) (expr, error) {
++	l, err := sub()
++	if err != nil {
++		return nil, err
++	}
++	for {
++		k := p.peek().kind
++		matched := false
++		for _, op := range ops {
++			if k == op {
++				matched = true
++				break
++			}
++		}
++		if !matched {
++			return l, nil
++		}
++		p.next()
++		r, err := sub()
++		if err != nil {
++			return nil, err
++		}
++		l = &binaryExpr{op: k, l: l, r: r}
++	}
++}
++
++func (p *parser) orExpr() (expr, error)  { return p.binary(p.andExpr, tOr) }
++func (p *parser) andExpr() (expr, error) { return p.binary(p.eqExpr, tAnd) }
++func (p *parser) eqExpr() (expr, error)  { return p.binary(p.relExpr, tEq, tNe) }
++func (p *parser) relExpr() (expr, error) { return p.binary(p.addExpr, tLt, tLe, tGt, tGe) }
++func (p *parser) addExpr() (expr, error) { return p.binary(p.mulExpr, tPlus, tMinus) }
++func (p *parser) mulExpr() (expr, error) { return p.binary(p.unaryExpr, tMul, tDiv, tMod) }
++
++func (p *parser) unaryExpr() (expr, error) {
++	if p.peek().kind == tMinus {
++		p.next()
++		e, err := p.unaryExpr()
++		if err != nil {
++			return nil, err
++		}
++		return &negExpr{arg: e}, nil
++	}
++	return p.unionExpr()
++}
++
++func (p *parser) unionExpr() (expr, error) {
++	l, err := p.pathOrPrimary()
++	if err != nil {
++		return nil, err
++	}
++	for p.peek().kind == tPipe {
++		p.next()
++		r, err := p.pathOrPrimary()
++		if err != nil {
++			return nil, err
++		}
++		if !isNodeSetExpr(l) || !isNodeSetExpr(r) {
++			return nil, p.errAt()
++		}
++		l = &unionExpr{l: l, r: r}
++	}
++	return l, nil
++}
++
++func isNodeSetExpr(e expr) bool {
++	switch e.(type) {
++	case *pathExpr, *unionExpr:
++		return true
++	}
++	return false
++}
++
++func (p *parser) startsStep(t token) bool {
++	switch t.kind {
++	case tDot, tDDot, tAt, tStar:
++		return true
++	case tName:
++		next := p.peekAt(1).kind
++		if next == tAxis {
++			return true
++		}
++		if next == tLParen {
++			_, isType := nodeTypes[t.text]
++			return isType
++		}
++		return true
++	}
++	return false
++}
++
++func (p *parser) pathOrPrimary() (expr, error) {
++	t := p.peek()
++	switch t.kind {
++	case tSlash, tDSlash:
++		return p.locationPath()
++	}
++	if p.startsStep(t) {
++		return p.locationPath()
++	}
++	e, err := p.primary()
++	if err != nil {
++		return nil, err
++	}
++	// A locator cannot start from a scalar expression, and a primary
++	// expression cannot be filtered with a predicate.
++	switch p.peek().kind {
++	case tSlash, tDSlash, tLBracket:
++		return nil, p.errAt()
++	}
++	return e, nil
++}
++
++func (p *parser) primary() (expr, error) {
++	t := p.peek()
++	switch t.kind {
++	case tUserVar:
++		p.next()
++		return userVarExpr(t.text), nil
++	case tLiteral:
++		p.next()
++		return literalExpr(t.text), nil
++	case tNumber:
++		p.next()
++		return numberExpr(t.num), nil
++	case tLParen:
++		p.next()
++		e, err := p.orExpr()
++		if err != nil {
++			return nil, err
++		}
++		if err := p.expect(tRParen); err != nil {
++			return nil, err
++		}
++		return e, nil
++	case tName:
++		if p.peekAt(1).kind == tLParen {
++			return p.function()
++		}
++	}
++	return nil, p.errAt()
++}
++
++func (p *parser) function() (expr, error) {
++	name := p.next().text
++	if _, ok := unsupportedFunctions[name]; ok {
++		return nil, p.errAt()
++	}
++	arity, ok := functionArity[name]
++	if !ok {
++		return nil, p.errAt()
++	}
++	argsAt := p.peek().pos
++	p.next() // '('
++	f := &funcExpr{name: name}
++	if p.peek().kind != tRParen {
++		for {
++			a, err := p.orExpr()
++			if err != nil {
++				return nil, err
++			}
++			f.args = append(f.args, a)
++			if p.peek().kind != tComma {
++				break
++			}
++			p.next()
++		}
++	}
++	if err := p.expect(tRParen); err != nil {
++		return nil, err
++	}
++	if len(f.args) < arity[0] || (arity[1] >= 0 && len(f.args) > arity[1]) {
++		return nil, &SyntaxError{Near: p.src[argsAt:]}
++	}
++	if (name == "count" || name == "sum") && !isNodeSetExpr(f.args[0]) {
++		return nil, &SyntaxError{Near: p.src[argsAt:]}
++	}
++	return f, nil
++}
++
++func (p *parser) locationPath() (expr, error) {
++	path := &pathExpr{}
++	switch p.peek().kind {
++	case tSlash:
++		p.next()
++		path.absolute = true
++		if !p.startsStep(p.peek()) {
++			return path, nil
++		}
++	case tDSlash:
++		p.next()
++		path.absolute = true
++		path.steps = append(path.steps, step{axis: axisDescendantOrSelf, test: testNode})
++	}
++	for {
++		s, err := p.step()
++		if err != nil {
++			return nil, err
++		}
++		path.steps = append(path.steps, s)
++		switch p.peek().kind {
++		case tSlash:
++			p.next()
++		case tDSlash:
++			p.next()
++			path.steps = append(path.steps, step{axis: axisDescendantOrSelf, test: testNode})
++		default:
++			return path, nil
++		}
++	}
++}
++
++func (p *parser) step() (step, error) {
++	t := p.peek()
++	switch t.kind {
++	case tDot:
++		p.next()
++		return step{axis: axisSelf, test: testNode}, nil
++	case tDDot:
++		p.next()
++		return step{axis: axisParent, test: testNode}, nil
++	}
++	s := step{axis: axisChild}
++	if t.kind == tAt {
++		p.next()
++		s.axis = axisAttribute
++	} else if t.kind == tName && p.peekAt(1).kind == tAxis {
++		axis, ok := axisNames[t.text]
++		if !ok {
++			return s, p.errAt()
++		}
++		p.next()
++		p.next()
++		s.axis = axis
++	}
++	t = p.peek()
++	switch {
++	case t.kind == tStar:
++		p.next()
++		s.test = testAny
++	case t.kind == tName && p.peekAt(1).kind == tLParen:
++		kind, ok := nodeTypes[t.text]
++		if !ok {
++			return s, p.errAt()
++		}
++		p.next()
++		p.next()
++		if kind == testNone && p.peek().kind == tLiteral {
++			p.next()
++		}
++		if err := p.expect(tRParen); err != nil {
++			return s, err
++		}
++		s.test = kind
++	case t.kind == tName:
++		p.next()
++		s.test, s.name = testName, t.text
++	default:
++		return s, p.errAt()
++	}
++	for p.peek().kind == tLBracket {
++		p.next()
++		e, err := p.orExpr()
++		if err != nil {
++			return s, err
++		}
++		if err := p.expect(tRBracket); err != nil {
++			return s, err
++		}
++		s.preds = append(s.preds, e)
++	}
++	return s, nil
++}
+diff --git a/pkg/util/xpath/document.go b/pkg/util/xpath/document.go
+new file mode 100644
+index 0000000000..144ab2ed52
+--- /dev/null
++++ b/pkg/util/xpath/document.go
+@@ -0,0 +1,349 @@
++// Copyright 2026 PingCAP, Inc.
++//
++// Licensed under the Apache License, Version 2.0 (the "License");
++// you may not use this file except in compliance with the License.
++// You may obtain a copy of the License at
++//
++//     http://www.apache.org/licenses/LICENSE-2.0
++//
++// Unless required by applicable law or agreed to in writing, software
++// distributed under the License is distributed on an "AS IS" BASIS,
++// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++// See the License for the specific language governing permissions and
++// limitations under the License.
++
++// Package xpath implements the XML fragment model and the XPath subset used by
++// the MySQL compatible ExtractValue() and UpdateXML() functions.
++package xpath
++
++import (
++	"fmt"
++	"strings"
++)
++
++// NodeKind is the kind of a node in a parsed XML fragment.
++type NodeKind uint8
++
++const (
++	// RootNode is the document root. It is always the first node.
++	RootNode NodeKind = iota
++	// ElementNode is an XML element.
++	ElementNode
++	// AttributeNode is an attribute of an element.
++	AttributeNode
++	// TextNode is a run of character data or a CDATA section.
++	TextNode
++)
++
++// node is one node of a parsed fragment. Nodes are stored in document order,
++// so a node's index is also its document position.
++type node struct {
++	kind NodeKind
++	name string
++	// value is the raw text of a text node or the raw value of an attribute.
++	// Entity references are kept as written, like MySQL does.
++	value  string
++	parent int
++	// start and end delimit the source text of the node: the whole element
++	// from its start tag to its end tag, the whole attribute, or the text.
++	start, end int
++	children   []int // child elements and text nodes
++	attrs      []int
++}
++
++// Document is a parsed XML fragment.
++type Document struct {
++	src   string
++	nodes []node
++}
++
++// XMLError reports why a fragment is not well formed.
++type XMLError struct {
++	Line int
++	Pos  int
++	Msg  string
++}
++
++func (e *XMLError) Error() string {
++	return fmt.Sprintf("parse error at line %d pos %d: %s", e.Line, e.Pos, e.Msg)
++}
++
++// Parse parses an XML fragment. A fragment may hold several top level
++// elements and text outside any element. Comments, processing instructions
++// and declarations are skipped.
++func Parse(src string) (*Document, error) {
++	p := &xmlParser{src: src}
++	p.doc = &Document{src: src}
++	p.doc.nodes = append(p.doc.nodes, node{kind: RootNode, parent: -1, start: 0, end: len(src)})
++	p.stack = []int{0}
++	if err := p.parse(); err != nil {
++		return nil, err
++	}
++	return p.doc, nil
++}
++
++type xmlParser struct {
++	src   string
++	pos   int
++	doc   *Document
++	stack []int
++}
++
++func (p *xmlParser) errorf(at int, format string, args ...any) error {
++	// Positions are counted from 1, like MySQL reports them.
++	line, col := 1, 1
++	for i := 0; i < at && i < len(p.src); i++ {
++		if p.src[i] == '\n' {
++			line++
++			col = 1
++		} else {
++			col++
++		}
++	}
++	return &XMLError{Line: line, Pos: col, Msg: fmt.Sprintf(format, args...)}
++}
++
++func (p *xmlParser) add(n node) int {
++	idx := len(p.doc.nodes)
++	p.doc.nodes = append(p.doc.nodes, n)
++	return idx
++}
++
++func (p *xmlParser) top() int {
++	return p.stack[len(p.stack)-1]
++}
++
++func (p *xmlParser) addText(start, end, valStart, valEnd int) {
++	parent := p.top()
++	idx := p.add(node{kind: TextNode, value: p.src[valStart:valEnd], parent: parent, start: start, end: end})
++	p.doc.nodes[parent].children = append(p.doc.nodes[parent].children, idx)
++}
++
++func (p *xmlParser) parse() error {
++	src := p.src
++	for p.pos < len(src) {
++		if src[p.pos] != '<' {
++			end := strings.IndexByte(src[p.pos:], '<')
++			if end < 0 {
++				end = len(src)
++			} else {
++				end += p.pos
++			}
++			p.addText(p.pos, end, p.pos, end)
++			p.pos = end
++			continue
++		}
++		rest := src[p.pos:]
++		var err error
++		switch {
++		case strings.HasPrefix(rest, "<!--"):
++			err = p.skipTo(p.pos+4, "-->")
++		case strings.HasPrefix(rest, "<![CDATA["):
++			err = p.cdata()
++		case strings.HasPrefix(rest, "<?"):
++			err = p.skipTo(p.pos+2, "?>")
++		case strings.HasPrefix(rest, "<!"):
++			err = p.declaration()
++		case strings.HasPrefix(rest, "</"):
++			err = p.endTag()
++		default:
++			err = p.startTag()
++		}
++		if err != nil {
++			return err
++		}
++	}
++	if len(p.stack) > 1 {
++		return p.errorf(len(src), "unexpected END-OF-INPUT")
++	}
++	return nil
++}
++
++func (p *xmlParser) skipTo(from int, terminator string) error {
++	end := strings.Index(p.src[from:], terminator)
++	if end < 0 {
++		return p.errorf(len(p.src), "unexpected END-OF-INPUT")
++	}
++	p.pos = from + end + len(terminator)
++	return nil
++}
++
++func (p *xmlParser) cdata() error {
++	valStart := p.pos + len("<![CDATA[")
++	end := strings.Index(p.src[valStart:], "]]>")
++	if end < 0 {
++		return p.errorf(len(p.src), "unexpected END-OF-INPUT")
++	}
++	valEnd := valStart + end
++	p.addText(p.pos, valEnd+3, valStart, valEnd)
++	p.pos = valEnd + 3
++	return nil
++}
++
++// declaration skips a <!DOCTYPE ...> style declaration, including an
++// internal subset in square brackets.
++func (p *xmlParser) declaration() error {
++	depth := 0
++	for i := p.pos + 2; i < len(p.src); i++ {
++		switch p.src[i] {
++		case '[':
++			depth++
++		case ']':
++			depth--
++		case '>':
++			if depth <= 0 {
++				p.pos = i + 1
++				return nil
++			}
++		}
++	}
++	return p.errorf(len(p.src), "unexpected END-OF-INPUT")
++}
++
++func isNameByte(c byte) bool {
++	return c >= 0x80 || c == '_' || c == '-' || c == '.' || c == ':' ||
++		(c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') || (c >= '0' && c <= '9')
++}
++
++func isSpace(c byte) bool {
++	return c == ' ' || c == '\t' || c == '\n' || c == '\r'
++}
++
++func (p *xmlParser) skipSpaces() {
++	for p.pos < len(p.src) && isSpace(p.src[p.pos]) {
++		p.pos++
++	}
++}
++
++func (p *xmlParser) name() string {
++	start := p.pos
++	for p.pos < len(p.src) && isNameByte(p.src[p.pos]) {
++		p.pos++
++	}
++	return p.src[start:p.pos]
++}
++
++func (p *xmlParser) expect(c byte, what string) error {
++	if p.pos >= len(p.src) {
++		return p.errorf(p.pos, "END-OF-INPUT unexpected (%s wanted)", what)
++	}
++	if p.src[p.pos] != c {
++		return p.errorf(p.pos, "'%c' unexpected (%s wanted)", p.src[p.pos], what)
++	}
++	p.pos++
++	return nil
++}
++
++func (p *xmlParser) startTag() error {
++	start := p.pos
++	p.pos++ // '<'
++	name := p.name()
++	if name == "" {
++		return p.errorf(p.pos, "unknown token unexpected (ident wanted)")
++	}
++	parent := p.top()
++	elem := p.add(node{kind: ElementNode, name: name, parent: parent, start: start})
++	p.doc.nodes[parent].children = append(p.doc.nodes[parent].children, elem)
++	for {
++		p.skipSpaces()
++		if p.pos >= len(p.src) {
++			return p.errorf(p.pos, "END-OF-INPUT unexpected ('>' wanted)")
++		}
++		switch c := p.src[p.pos]; {
++		case c == '>':
++			p.pos++
++			p.stack = append(p.stack, elem)
++			return nil
++		case c == '/':
++			p.pos++
++			if err := p.expect('>', "'>'"); err != nil {
++				return err
++			}
++			p.doc.nodes[elem].end = p.pos
++			return nil
++		case isNameByte(c):
++			if err := p.attribute(elem); err != nil {
++				return err
++			}
++		default:
++			return p.errorf(p.pos, "'%c' unexpected ('>' wanted)", c)
++		}
++	}
++}
++
++func (p *xmlParser) attribute(elem int) error {
++	start := p.pos
++	name := p.name()
++	p.skipSpaces()
++	if err := p.expect('=', "'='"); err != nil {
++		return err
++	}
++	p.skipSpaces()
++	if p.pos >= len(p.src) {
++		return p.errorf(p.pos, "END-OF-INPUT unexpected (string wanted)")
++	}
++	quote := p.src[p.pos]
++	if quote != '"' && quote != '\'' {
++		return p.errorf(p.pos, "unknown token unexpected (ident or string wanted)")
++	}
++	valStart := p.pos + 1
++	end := strings.IndexByte(p.src[valStart:], quote)
++	if end < 0 {
++		return p.errorf(len(p.src), "unexpected END-OF-INPUT")
++	}
++	valEnd := valStart + end
++	p.pos = valEnd + 1
++	idx := p.add(node{kind: AttributeNode, name: name, value: p.src[valStart:valEnd], parent: elem, start: start, end: p.pos})
++	p.doc.nodes[elem].attrs = append(p.doc.nodes[elem].attrs, idx)
++	return nil
++}
++
++// endTag closes the innermost open element. Like MySQL, the name in the end
++// tag is not required to match the start tag.
++func (p *xmlParser) endTag() error {
++	p.pos += 2
++	p.name()
++	p.skipSpaces()
++	if err := p.expect('>', "'>'"); err != nil {
++		return err
++	}
++	if len(p.stack) == 1 {
++		return p.errorf(p.pos, "end tag unexpected (END-OF-INPUT wanted)")
++	}
++	elem := p.top()
++	p.doc.nodes[elem].end = p.pos
++	p.stack = p.stack[:len(p.stack)-1]
++	return nil
++}
++
++// Source returns the text the document was parsed from.
++func (d *Document) Source() string {
++	return d.src
++}
++
++// Span returns the source range of node n.
++func (d *Document) Span(n int) (start, end int) {
++	return d.nodes[n].start, d.nodes[n].end
++}
++
++// Kind returns the kind of node n.
++func (d *Document) Kind(n int) NodeKind {
++	return d.nodes[n].kind
++}
++
++// textOf appends the text a node contributes to an ExtractValue() result: the
++// node itself for text and attribute nodes, the direct text children for
++// elements and the root.
++func (d *Document) textOf(n int, dst []int) []int {
++	switch d.nodes[n].kind {
++	case TextNode, AttributeNode:
++		return append(dst, n)
++	default:
++		for _, c := range d.nodes[n].children {
++			if d.nodes[c].kind == TextNode {
++				dst = append(dst, c)
++			}
++		}
++		return dst
++	}
++}
+diff --git a/pkg/util/xpath/eval.go b/pkg/util/xpath/eval.go
+new file mode 100644
+index 0000000000..a45b39be79
+--- /dev/null
++++ b/pkg/util/xpath/eval.go
+@@ -0,0 +1,594 @@
++// Copyright 2026 PingCAP, Inc.
++//
++// Licensed under the Apache License, Version 2.0 (the "License");
++// you may not use this file except in compliance with the License.
++// You may obtain a copy of the License at
++//
++//     http://www.apache.org/licenses/LICENSE-2.0
++//
++// Unless required by applicable law or agreed to in writing, software
++// distributed under the License is distributed on an "AS IS" BASIS,
++// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++// See the License for the specific language governing permissions and
++// limitations under the License.
++
++package xpath
++
++import (
++	"math"
++	"slices"
++	"strconv"
++	"strings"
++	"unicode/utf8"
++)
++
++// Variable is the value of a user variable referenced as $@name.
++type Variable struct {
++	IsNumber bool
++	Number   float64
++	String   string
++}
++
++// Env supplies the session dependent parts of an evaluation.
++type Env struct {
++	// Equal compares two strings under the collation of the call.
++	Equal func(a, b string) bool
++	// Contains reports whether s contains sub under the collation of the call.
++	Contains func(s, sub string) bool
++	// Lookup returns the user variable with the given name. ok is false when
++	// the variable is unset or NULL.
++	Lookup func(name string) (v Variable, ok bool)
++}
++
++type valueKind uint8
++
++const (
++	vNodes valueKind = iota
++	vNumber
++	vString
++	vBool
++)
++
++type value struct {
++	kind  valueKind
++	nodes []int
++	num   float64
++	str   string
++	b     bool
++}
++
++// Result is the value of an expression evaluated against a document.
++type Result struct {
++	doc *Document
++	v   value
++}
++
++// Nodes returns the selected nodes in document order. ok is false when the
++// expression does not produce a node set.
++func (r Result) Nodes() (nodes []int, ok bool) {
++	return r.v.nodes, r.v.kind == vNodes
++}
++
++// Text renders the result the way ExtractValue() returns it. For a node set
++// it is the text of every selected text or attribute node and of the direct
++// text children of every selected element, in document order, separated by
++// single spaces. ok is false when the result is SQL NULL.
++func (r Result) Text() (s string, ok bool) {
++	switch r.v.kind {
++	case vNodes:
++		return r.doc.render(r.v.nodes), true
++	case vNumber:
++		if math.IsNaN(r.v.num) || math.IsInf(r.v.num, 0) {
++			return "", false
++		}
++		return formatNumber(r.v.num), true
++	case vBool:
++		if r.v.b {
++			return "1", true
++		}
++		return "0", true
++	default:
++		return r.v.str, true
++	}
++}
++
++func (d *Document) render(nodes []int) string {
++	var texts []int
++	for _, n := range nodes {
++		texts = d.textOf(n, texts)
++	}
++	slices.Sort(texts)
++	texts = slices.Compact(texts)
++	var sb strings.Builder
++	for i, t := range texts {
++		if i > 0 {
++			sb.WriteByte(' ')
++		}
++		sb.WriteString(d.nodes[t].value)
++	}
++	return sb.String()
++}
++
++func formatNumber(f float64) string {
++	if f == math.Trunc(f) && math.Abs(f) < 1e18 {
++		return strconv.FormatInt(int64(f), 10)
++	}
++	// Print at most 15 significant digits, so 0.1+0.2 shows as 0.3.
++	rounded, err := strconv.ParseFloat(strconv.FormatFloat(f, 'g', 15, 64), 64)
++	if err != nil {
++		rounded = f
++	}
++	return strconv.FormatFloat(rounded, 'f', -1, 64)
++}
++
++// Evaluate evaluates the expression with the document root as context node.
++func (e *Expr) Evaluate(doc *Document, env Env) Result {
++	if env.Equal == nil {
++		env.Equal = func(a, b string) bool { return a == b }
++	}
++	if env.Contains == nil {
++		env.Contains = strings.Contains
++	}
++	if env.Lookup == nil {
++		env.Lookup = func(string) (Variable, bool) { return Variable{}, false }
++	}
++	ev := &evaluator{doc: doc, env: env}
++	return Result{doc: doc, v: ev.eval(e.root, evalCtx{node: 0, pos: 1, size: 1})}
++}
++
++type evalCtx struct {
++	node      int
++	pos, size int
++}
++
++type evaluator struct {
++	doc *Document
++	env Env
++}
++
++func (ev *evaluator) eval(e expr, c evalCtx) value {
++	switch x := e.(type) {
++	case numberExpr:
++		return value{kind: vNumber, num: float64(x)}
++	case literalExpr:
++		return value{kind: vString, str: string(x)}
++	case userVarExpr:
++		v, ok := ev.env.Lookup(string(x))
++		if !ok {
++			// An unset variable gives an empty result.
++			return value{kind: vString}
++		}
++		if v.IsNumber {
++			return value{kind: vNumber, num: v.Number}
++		}
++		return value{kind: vString, str: v.String}
++	case *negExpr:
++		return value{kind: vNumber, num: -ev.number(ev.eval(x.arg, c))}
++	case *pathExpr:
++		return value{kind: vNodes, nodes: ev.path(x, c.node)}
++	case *unionExpr:
++		l := ev.eval(x.l, c).nodes
++		r := ev.eval(x.r, c).nodes
++		nodes := append(slices.Clone(l), r...)
++		slices.Sort(nodes)
++		return value{kind: vNodes, nodes: slices.Compact(nodes)}
++	case *funcExpr:
++		return ev.call(x, c)
++	case *binaryExpr:
++		return ev.binary(x, c)
++	}
++	return value{kind: vString}
++}
++
++func (ev *evaluator) binary(x *binaryExpr, c evalCtx) value {
++	switch x.op {
++	case tOr:
++		return value{kind: vBool, b: ev.boolean(ev.eval(x.l, c)) || ev.boolean(ev.eval(x.r, c))}
++	case tAnd:
++		return value{kind: vBool, b: ev.boolean(ev.eval(x.l, c)) && ev.boolean(ev.eval(x.r, c))}
++	case tEq, tNe, tLt, tLe, tGt, tGe:
++		return value{kind: vBool, b: ev.compare(x.op, ev.eval(x.l, c), ev.eval(x.r, c))}
++	}
++	l, r := ev.number(ev.eval(x.l, c)), ev.number(ev.eval(x.r, c))
++	var n float64
++	switch x.op {
++	case tPlus:
++		n = l + r
++	case tMinus:
++		n = l - r
++	case tMul:
++		n = l * r
++	case tDiv:
++		n = l / r
++		if r == 0 {
++			n = math.NaN()
++		}
++	case tMod:
++		n = math.Mod(l, r)
++	}
++	return value{kind: vNumber, num: n}
++}
++
++// nodeString is the string value of a single node. Like MySQL it is the text
++// the node contributes to an ExtractValue() result.
++func (ev *evaluator) nodeString(n int) string {
++	return ev.doc.render([]int{n})
++}
++
++func (ev *evaluator) str(v value) string {
++	switch v.kind {
++	case vNodes:
++		return ev.doc.render(v.nodes)
++	case vNumber:
++		if math.IsNaN(v.num) {
++			return "NaN"
++		}
++		return formatNumber(v.num)
++	case vBool:
++		if v.b {
++			return "1"
++		}
++		return "0"
++	}
++	return v.str
++}
++
++// strToNumber converts the leading numeric part of s, or 0 when there is
++// none, like a SQL string to number conversion.
++func strToNumber(s string) float64 {
++	s = strings.TrimLeft(s, " \t\n\r")
++	end := 0
++	if end < len(s) && (s[end] == '-' || s[end] == '+') {
++		end++
++	}
++	digits := false
++	for end < len(s) && s[end] >= '0' && s[end] <= '9' {
++		end++
++		digits = true
++	}
++	if end < len(s) && s[end] == '.' {
++		end++
++		for end < len(s) && s[end] >= '0' && s[end] <= '9' {
++			end++
++			digits = true
++		}
++	}
++	if !digits {
++		return 0
++	}
++	n, err := strconv.ParseFloat(strings.TrimSuffix(s[:end], "."), 64)
++	if err != nil {
++		return 0
++	}
++	return n
++}
++
++func (ev *evaluator) number(v value) float64 {
++	switch v.kind {
++	case vNumber:
++		return v.num
++	case vBool:
++		if v.b {
++			return 1
++		}
++		return 0
++	}
++	return strToNumber(ev.str(v))
++}
++
++func (ev *evaluator) boolean(v value) bool {
++	switch v.kind {
++	case vNodes:
++		return len(v.nodes) > 0
++	case vNumber:
++		return v.num != 0 && !math.IsNaN(v.num)
++	case vBool:
++		return v.b
++	}
++	return v.str != ""
++}
++
++func compareNumbers(op tokKind, a, b float64) bool {
++	switch op {
++	case tEq:
++		return a == b
++	case tNe:
++		return a != b
++	case tLt:
++		return a < b
++	case tLe:
++		return a <= b
++	case tGt:
++		return a > b
++	case tGe:
++		return a >= b
++	}
++	return false
++}
++
++// flip returns the operator that gives the same result with swapped operands.
++func flip(op tokKind) tokKind {
++	switch op {
++	case tLt:
++		return tGt
++	case tLe:
++		return tGe
++	case tGt:
++		return tLt
++	case tGe:
++		return tLe
++	}
++	return op
++}
++
++func (ev *evaluator) compareStrings(op tokKind, a, b string) bool {
++	switch op {
++	case tEq:
++		return ev.env.Equal(a, b)
++	case tNe:
++		return !ev.env.Equal(a, b)
++	}
++	return compareNumbers(op, strToNumber(a), strToNumber(b))
++}
++
++// compare implements the XPath 1.0 comparison rules: a node set compares
++// true when any of its nodes does.
++func (ev *evaluator) compare(op tokKind, l, r value) bool {
++	if l.kind != vNodes && r.kind == vNodes {
++		return ev.compare(flip(op), r, l)
++	}
++	if l.kind == vNodes {
++		switch r.kind {
++		case vNodes:
++			for _, a := range l.nodes {
++				for _, b := range r.nodes {
++					if ev.compareStrings(op, ev.nodeString(a), ev.nodeString(b)) {
++						return true
++					}
++				}
++			}
++			return false
++		case vBool:
++			return compareNumbers(op, ev.number(value{kind: vBool, b: len(l.nodes) > 0}), ev.number(r))
++		case vNumber:
++			for _, a := range l.nodes {
++				if compareNumbers(op, strToNumber(ev.nodeString(a)), r.num) {
++					return true
++				}
++			}
++			return false
++		default:
++			for _, a := range l.nodes {
++				if ev.compareStrings(op, ev.nodeString(a), r.str) {
++					return true
++				}
++			}
++			return false
++		}
++	}
++	if op == tEq || op == tNe {
++		switch {
++		case l.kind == vBool || r.kind == vBool:
++			return compareNumbers(op, ev.number(value{kind: vBool, b: ev.boolean(l)}), ev.number(value{kind: vBool, b: ev.boolean(r)}))
++		case l.kind == vNumber || r.kind == vNumber:
++			return compareNumbers(op, ev.number(l), ev.number(r))
++		default:
++			return ev.compareStrings(op, ev.str(l), ev.str(r))
++		}
++	}
++	return compareNumbers(op, ev.number(l), ev.number(r))
++}
++
++func (ev *evaluator) call(f *funcExpr, c evalCtx) value {
++	arg := func(i int) value { return ev.eval(f.args[i], c) }
++	num := func(n float64) value { return value{kind: vNumber, num: n} }
++	switch f.name {
++	case "last":
++		return num(float64(c.size))
++	case "position":
++		return num(float64(c.pos))
++	case "count":
++		return num(float64(len(arg(0).nodes)))
++	case "sum":
++		total := 0.0
++		for _, n := range arg(0).nodes {
++			total += strToNumber(ev.nodeString(n))
++		}
++		return num(total)
++	case "not":
++		return value{kind: vBool, b: !ev.boolean(arg(0))}
++	case "true":
++		return value{kind: vBool, b: true}
++	case "false":
++		return value{kind: vBool}
++	case "boolean":
++		return value{kind: vBool, b: ev.boolean(arg(0))}
++	case "number":
++		return num(ev.number(arg(0)))
++	case "floor":
++		return num(math.Floor(ev.number(arg(0))))
++	case "ceiling":
++		return num(math.Ceil(ev.number(arg(0))))
++	case "round":
++		return num(math.RoundToEven(ev.number(arg(0))))
++	case "concat":
++		var sb strings.Builder
++		for i := range f.args {
++			sb.WriteString(ev.str(arg(i)))
++		}
++		return value{kind: vString, str: sb.String()}
++	case "contains":
++		return value{kind: vBool, b: ev.env.Contains(ev.str(arg(0)), ev.str(arg(1)))}
++	case "string-length":
++		return num(float64(utf8.RuneCountInString(ev.str(arg(0)))))
++	case "substring":
++		s := []rune(ev.str(arg(0)))
++		start := math.Round(ev.number(arg(1)))
++		end := math.Inf(1)
++		if len(f.args) == 3 {
++			end = start + math.Round(ev.number(arg(2)))
++		}
++		var sb strings.Builder
++		for i, r := range s {
++			p := float64(i + 1)
++			if p >= start && p < end {
++				sb.WriteRune(r)
++			}
++		}
++		return value{kind: vString, str: sb.String()}
++	}
++	return value{kind: vString}
++}
++
++// path evaluates a location path from the given context node and returns the
++// selected nodes in document order without duplicates.
++func (ev *evaluator) path(p *pathExpr, ctxNode int) []int {
++	cur := []int{ctxNode}
++	if p.absolute {
++		cur = []int{0}
++	}
++	for i := range p.steps {
++		s := &p.steps[i]
++		var next []int
++		for _, n := range cur {
++			cand := ev.axis(s, n)
++			for _, pred := range s.preds {
++				cand = ev.filter(cand, pred)
++			}
++			next = append(next, cand...)
++		}
++		slices.Sort(next)
++		cur = slices.Compact(next)
++	}
++	return cur
++}
++
++// filter keeps the candidates for which the predicate holds. Candidates are
++// in axis order, so positions count from the context node.
++func (ev *evaluator) filter(cand []int, pred expr) []int {
++	kept := cand[:0:0]
++	for i, n := range cand {
++		v := ev.eval(pred, evalCtx{node: n, pos: i + 1, size: len(cand)})
++		if v.kind == vNumber {
++			if v.num == float64(i+1) {
++				kept = append(kept, n)
++			}
++		} else if ev.boolean(v) {
++			kept = append(kept, n)
++		}
++	}
++	return kept
++}
++
++func (ev *evaluator) matches(s *step, n int) bool {
++	nd := &ev.doc.nodes[n]
++	principal := ElementNode
++	if s.axis == axisAttribute {
++		principal = AttributeNode
++	}
++	switch s.test {
++	case testName:
++		return nd.kind == principal && nd.name == s.name
++	case testAny:
++		return nd.kind == principal
++	case testText:
++		return nd.kind == TextNode
++	case testNode:
++		return true
++	}
++	return false
++}
++
++func (ev *evaluator) descendants(n int, dst []int) []int {
++	for _, c := range ev.doc.nodes[n].children {
++		dst = append(dst, c)
++		dst = ev.descendants(c, dst)
++	}
++	return dst
++}
++
++// axis returns the nodes on the step's axis that pass its node test, in axis
++// order (reverse document order for reverse axes).
++func (ev *evaluator) axis(s *step, n int) []int {
++	nodes := ev.doc.nodes
++	var all []int
++	switch s.axis {
++	case axisChild:
++		all = nodes[n].children
++	case axisAttribute:
++		all = nodes[n].attrs
++	case axisSelf:
++		all = []int{n}
++	case axisDescendant:
++		all = ev.descendants(n, nil)
++	case axisDescendantOrSelf:
++		all = ev.descendants(n, []int{n})
++	case axisParent:
++		if nodes[n].parent >= 0 {
++			all = []int{nodes[n].parent}
++		}
++	case axisAncestor, axisAncestorOrSelf:
++		if s.axis == axisAncestorOrSelf {
++			all = append(all, n)
++		}
++		for p := nodes[n].parent; p >= 0; p = nodes[p].parent {
++			all = append(all, p)
++		}
++	case axisFollowingSibling, axisPrecedingSibling:
++		if nodes[n].kind == AttributeNode || nodes[n].parent < 0 {
++			break
++		}
++		siblings := nodes[nodes[n].parent].children
++		at := slices.Index(siblings, n)
++		if s.axis == axisFollowingSibling {
++			all = siblings[at+1:]
++		} else {
++			for i := at - 1; i >= 0; i-- {
++				all = append(all, siblings[i])
++			}
++		}
++	case axisFollowing:
++		if nodes[n].kind == AttributeNode {
++			n = nodes[n].parent
++		}
++		_, end := ev.lastDescendant(n)
++		for i := end + 1; i < len(nodes); i++ {
++			if nodes[i].kind != AttributeNode {
++				all = append(all, i)
++			}
++		}
++	case axisPreceding:
++		ancestors := map[int]bool{}
++		for p := nodes[n].parent; p >= 0; p = nodes[p].parent {
++			ancestors[p] = true
++		}
++		for i := n - 1; i > 0; i-- {
++			if nodes[i].kind != AttributeNode && !ancestors[i] {
++				all = append(all, i)
++			}
++		}
++	}
++	var out []int
++	for _, c := range all {
++		if ev.matches(s, c) {
++			out = append(out, c)
++		}
++	}
++	return out
++}
++
++// lastDescendant returns n and the index of the last node in its subtree.
++func (ev *evaluator) lastDescendant(n int) (int, int) {
++	last := n
++	for {
++		nd := &ev.doc.nodes[last]
++		switch {
++		case len(nd.children) > 0:
++			last = nd.children[len(nd.children)-1]
++		case len(nd.attrs) > 0:
++			return n, nd.attrs[len(nd.attrs)-1]
++		default:
++			return n, last
++		}
++	}
++}

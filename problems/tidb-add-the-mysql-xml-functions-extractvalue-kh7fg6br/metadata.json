@@ -1,0 +1,17 @@
+{
+  "problemId": "kh7fg6brq26dbrb26me205sbjn8ggw5c",
+  "title": "Add the MySQL XML functions ExtractValue() and UpdateXML()",
+  "status": "draft",
+  "version": 0,
+  "versionId": "kd75g6mq0zdn2s2z14wnzjny218ggyma",
+  "isLocked": false,
+  "language": "go",
+  "difficulty": null,
+  "category": "feature_request",
+  "repoUrl": "https://github.com/pingcap/tidb",
+  "commitHash": "0a4db0d86bb53a011097c26730127d1737bcc125",
+  "githubIssueUrl": null,
+  "estimatedLOC": null,
+  "testOutputMode": null,
+  "downloadedAt": "2026-10-24T17:09:52.808Z"
+}

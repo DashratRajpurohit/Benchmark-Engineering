@@ -1,0 +1,509 @@
+diff --git a/pkg/expression/test/xmlfunctions/extract_value_test.go b/pkg/expression/test/xmlfunctions/extract_value_test.go
+new file mode 100644
+index 0000000000..9f94b9e673
+--- /dev/null
++++ b/pkg/expression/test/xmlfunctions/extract_value_test.go
+@@ -0,0 +1,282 @@
++// Copyright 2026 PingCAP, Inc.
++//
++// Licensed under the Apache License, Version 2.0 (the "License");
++// you may not use this file except in compliance with the License.
++// You may obtain a copy of the License at
++//
++//     http://www.apache.org/licenses/LICENSE-2.0
++//
++// Unless required by applicable law or agreed to in writing, software
++// distributed under the License is distributed on an "AS IS" BASIS,
++// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++// See the License for the specific language governing permissions and
++// limitations under the License.
++
++//go:build xmlfuncs
++
++package xmlfunctions
++
++import (
++	"strings"
++	"testing"
++
++	"github.com/pingcap/tidb/pkg/errno"
++	"github.com/pingcap/tidb/pkg/testkit"
++	"github.com/stretchr/testify/require"
++)
++
++// The expected values below are what MySQL 8.4 returns for the same queries.
++
++func newTestKit(t *testing.T) *testkit.TestKit {
++	store := testkit.CreateMockStore(t)
++	tk := testkit.NewTestKit(t, store)
++	tk.MustExec("use test")
++	return tk
++}
++
++// checkValue runs a single-column query and compares it with want, where
++// NULL is written as <nil>.
++func checkValue(t *testing.T, tk *testkit.TestKit, query, want string) {
++	t.Helper()
++	tk.MustQuery(query).Check(testkit.RowsWithSep("|", want))
++}
++
++func TestExtractValueReturnsTextOfMatchedElements(t *testing.T) {
++	tk := newTestKit(t)
++	cases := []struct{ xml, path, want string }{
++		{`<a>ccc<b>ddd</b></a>`, `/a`, `ccc`},
++		{`<a>ccc<b>ddd</b></a>`, `/a/b`, `ddd`},
++		{`<a>ccc<b>ddd</b></a>`, `//b`, `ddd`},
++		{`<a>ccc<b>ddd</b></a>`, `/a/b/text()`, `ddd`},
++		{`<a><b>ddd</b><b>eee</b></a>`, `//b`, `ddd eee`},
++		{`<a><b><c>1</c></b><c>2</c></a>`, `/a//c`, `1 2`},
++		{`<a><![CDATA[x<y]]></a>`, `/a`, `x<y`},
++		{`<a><b c="q">1</b></a>`, `/a/b/@c`, `q`},
++		{`<a b=''1''>t</a>`, `/a/@b`, `1`},
++		{`<?xml version="1.0"?><a>t</a>`, `/a`, `t`},
++		{`<a><!-- c -->t</a>`, `/a`, `t`},
++		{`<a>1</a><a>2</a>`, `/a`, `1 2`},
++	}
++	for _, c := range cases {
++		checkValue(t, tk, "select ExtractValue('"+c.xml+"', '"+c.path+"')", c.want)
++	}
++
++	// An empty element and a path that matches nothing both give an empty string.
++	checkValue(t, tk, "select concat('[', ExtractValue('<a><b/></a>', '/a/b'), ']')", "[]")
++	checkValue(t, tk, "select concat('[', ExtractValue('<a><c>x</c></a>', '/a/b'), ']')", "[]")
++	checkValue(t, tk, "select concat('[', ExtractValue('<a>ccc<b>ddd</b></a>', '/b'), ']')", "[]")
++	// Text is returned as written, including surrounding white space.
++	checkValue(t, tk, "select concat('[', ExtractValue('<a> x </a>', '/a'), ']')", "[ x ]")
++}
++
++func TestExtractValueLocationPaths(t *testing.T) {
++	tk := newTestKit(t)
++	cases := []struct{ xml, path, want string }{
++		// Relative locators are resolved from the root.
++		{`<a><b>1</b></a>`, `a/b`, `1`},
++		{`<a><b>1</b><c>2</c></a>`, `/a/*`, `1 2`},
++		{`<a><b>1</b><c>2</c></a>`, `/*/c`, `2`},
++		// A union lists its matches in document order.
++		{`<a><c>2</c><b>1</b></a>`, `//b|//c`, `2 1`},
++		{`<a><e:f>1</e:f><b:c>2</b:c></a>`, `//e:f`, `1`},
++		{`<a><e:f>1</e:f><b:c>2</b:c></a>`, `/a/b:c`, `2`},
++		{`<a><b>1</b><b>2</b><b>3</b></a>`, `//b[1]`, `1`},
++		{`<a><b>1</b><b>2</b><b>3</b></a>`, `//b[2]`, `2`},
++		{`<a><b>1</b><b>2</b><b>3</b></a>`, `//b[last()]`, `3`},
++		{`<a><b>1</b><b>2</b><b>3</b></a>`, `//b[position()>1]`, `2 3`},
++		{`<a><b>1</b><b>2</b><b>3</b></a>`, `//b[. > 1]`, `2 3`},
++		{`<a><b id="idA">x</b><b id="idB">y</b></a>`, `//b[@id="idB"]`, `y`},
++		{`<a><b c="x" d="y">1</b><b c="x" d="z">2</b></a>`, `//b[@c="x"][@d="z"]`, `2`},
++		{`<a><b c="23">1</b><b c="17">2</b><b c="5">3</b></a>`, `//b[@c="23" or @c="17"]`, `1 2`},
++		{`<a><b c="23" d="1">1</b><b c="23" d="2">2</b></a>`, `//b[@c="23" and @d=2]`, `2`},
++		{`<a c="1"><d>X</d></a>`, `a/d[../@c="1"]`, `X`},
++		{`<a><b attr="value">1</b><c attr="value">2</c><d attr="no">3</d></a>`, `//*[@attr="value"]`, `1 2`},
++		{`<a><b c="1">x</b><b>z</b></a>`, `//b[not(@c)]`, `z`},
++		{`<a><b c="1">x</b><b c="2">y</b></a>`, `//b[@c>1]`, `y`},
++		{`<a><b><c>1</c></b><d>2</d></a>`, `//*[c]`, ``},
++		{`<a>0<b>9<c>1</c></b></a>`, `//*[c]`, `9`},
++	}
++	for _, c := range cases {
++		checkValue(t, tk, "select ExtractValue('"+c.xml+"', '"+c.path+"')", c.want)
++	}
++}
++
++func TestExtractValueAxes(t *testing.T) {
++	tk := newTestKit(t)
++	cases := []struct{ xml, path, want string }{
++		{`<a><b>1</b><c>2</c></a>`, `child::a/child::b`, `1`},
++		{`<a><b>1</b><c>2</c></a>`, `/a/child::*`, `1 2`},
++		{`<a><b><c>1</c></b><c>2</c></a>`, `/a/descendant::c`, `1 2`},
++		{`<a><b>1</b><c><b>2</b></c></a>`, `/descendant-or-self::b`, `1 2`},
++		{`<a>0<b>9<c>1</c></b></a>`, `//c/parent::*`, `9`},
++		{`<a>0<b>9<c>1</c></b></a>`, `//c/ancestor::*`, `0 9`},
++		{`<a>0<b>9<c>1</c></b></a>`, `//c/ancestor-or-self::*`, `0 9 1`},
++		{`<a>0<b>9<c>1</c></b></a>`, `//c/..`, `9`},
++		{`<a>0<b>9<c>1</c></b></a>`, `//c/../..`, `0`},
++		{`<a><b>1</b></a>`, `/a/b/self::b`, `1`},
++		{`<a><b c="5">1</b></a>`, `/a/b/attribute::c`, `5`},
++	}
++	for _, c := range cases {
++		checkValue(t, tk, "select ExtractValue('"+c.xml+"', '"+c.path+"')", c.want)
++	}
++}
++
++func TestExtractValueScalarExpressions(t *testing.T) {
++	tk := newTestKit(t)
++	cases := []struct{ xml, path, want string }{
++		{`<a><b>1</b><b>2</b></a>`, `count(/a/b)`, `2`},
++		{`<a><b>1</b><b>2</b></a>`, `count(/a/c)`, `0`},
++		{`<a><b>1</b><b>2</b><b>3</b></a>`, `sum(//b)`, `6`},
++		{`<a/>`, `1 + 2 * 3`, `7`},
++		{`<a/>`, `(1 + 2) * 3`, `9`},
++		{`<a/>`, `7 mod 3`, `1`},
++		{`<a/>`, `-3 - -2`, `-1`},
++		{`<a/>`, `6 div 3`, `2`},
++		{`<a/>`, `1.5 + 1`, `2.5`},
++		{`<a><b>3</b></a>`, `/a/b * 2`, `6`},
++		{`<a/>`, `1 = 1`, `1`},
++		{`<a/>`, `1 < 2 and 2 < 1`, `0`},
++		{`<a/>`, `2 >= 2 or 0`, `1`},
++		{`<a/>`, `true()`, `1`},
++		{`<a/>`, `false()`, `0`},
++		{`<a/>`, `not(1)`, `0`},
++		{`<a/>`, `floor(2.7)`, `2`},
++		{`<a/>`, `ceiling(2.1)`, `3`},
++		{`<a/>`, `number("12")`, `12`},
++		{`<a>x</a>`, `boolean(/a)`, `1`},
++		{`<a>hello</a>`, `substring(/a, 2, 3)`, `ell`},
++		{`<a>hello</a>`, `string-length(/a)`, `5`},
++		{`<a>hello</a>`, `concat(/a, "!")`, `hello!`},
++		{`<a>héllo</a>`, `string-length(/a)`, `5`},
++		{`<a>héllo</a>`, `substring(/a, 2, 2)`, `él`},
++		// A node set compares true when any of its nodes does.
++		{`<a>12</a>`, `/a = "12"`, `1`},
++		{`<a><b>1</b><b>2</b></a>`, `/a/b = 2`, `1`},
++		{`<a><b>1</b><b>2</b></a>`, `/a/b != 2`, `1`},
++		{`<a><b>1</b></a>`, `/a/b/c = 1`, `0`},
++		{`<a><b>1</b></a>`, `not(/a/c)`, `1`},
++	}
++	for _, c := range cases {
++		checkValue(t, tk, "select ExtractValue('"+c.xml+"', '"+c.path+"')", c.want)
++	}
++}
++
++func TestXPathComparisonsFollowTheCollation(t *testing.T) {
++	tk := newTestKit(t)
++	checks := []struct{ query, want string }{
++		{`select ExtractValue('<a>hello</a>' collate utf8mb4_general_ci, 'contains(/a, "ELL")')`, `1`},
++		{`select ExtractValue('<a>hello</a>' collate utf8mb4_bin, 'contains(/a, "ELL")')`, `0`},
++		{`select ExtractValue('<a>hello</a>' collate utf8mb4_bin, 'contains(/a, "ell")')`, `1`},
++		{`select ExtractValue('<a>X</a>' collate utf8mb4_general_ci, '/a = "x"')`, `1`},
++		{`select ExtractValue('<a>X</a>' collate utf8mb4_bin, '/a = "x"')`, `0`},
++		{`select ExtractValue('<a>Ünïcode</a>' collate utf8mb4_0900_ai_ci, '/a = "unicode"')`, `1`},
++		{`select ExtractValue('<a>Ünïcode</a>' collate utf8mb4_bin, '/a = "unicode"')`, `0`},
++		{`select ExtractValue('<a><b>X</b><b>Y</b></a>' collate utf8mb4_general_ci, 'count(//b[. = "x" or . = "y"])')`, `2`},
++		{`select ExtractValue('<a><b>X</b><b>Y</b></a>' collate utf8mb4_bin, 'count(//b[. = "x" or . = "y"])')`, `0`},
++		{`select ExtractValue('<a b="Q">t</a>' collate utf8mb4_general_ci, '/a[@b = "q"]')`, `t`},
++		{`select concat('[', ExtractValue('<a b="Q">t</a>' collate utf8mb4_bin, '/a[@b = "q"]'), ']')`, `[]`},
++		{`select ExtractValue('<a>50%</a>' collate utf8mb4_bin, 'contains(/a, "%")')`, `1`},
++		{`select ExtractValue('<a>a_b</a>' collate utf8mb4_bin, 'contains(/a, "x_")')`, `0`},
++		{`select UpdateXML('<a><b>X</b><b>Y</b></a>' collate utf8mb4_general_ci, '//b[. = "y"]', '<c/>')`, `<a><b>X</b><c/></a>`},
++		{`select UpdateXML('<a><b>X</b><b>Y</b></a>' collate utf8mb4_bin, '//b[. = "y"]', '<c/>')`, `<a><b>X</b><b>Y</b></a>`},
++	}
++	for _, c := range checks {
++		checkValue(t, tk, c.query, c.want)
++	}
++
++	// The collation is aggregated from the arguments like CONCAT() does, so
++	// an explicit collation on the XPath argument wins over the column's.
++	tk.MustExec("create table docs (id int primary key, doc text collate utf8mb4_bin, cdoc text collate utf8mb4_general_ci)")
++	tk.MustExec("insert into docs values (1, '<r><tag>Red</tag></r>', '<r><tag>Red</tag></r>'), (2, '<r><tag>blue</tag></r>', '<r><tag>blue</tag></r>')")
++	tk.MustQuery(`select id, ExtractValue(cdoc, 'contains(/r/tag, "RE")' collate utf8mb4_bin), ExtractValue(cdoc, 'contains(/r/tag, "RE")'), ` +
++		`ExtractValue(doc, 'contains(/r/tag, "RE")'), ExtractValue(doc, 'contains(/r/tag, "RE")' collate utf8mb4_general_ci) from docs order by id`).
++		Check(testkit.Rows("1 0 1 0 1", "2 0 0 0 0"))
++	tk.MustQuery(`select id from docs where ExtractValue(cdoc, '/r/tag = "RED"') = 1 order by id`).Check(testkit.Rows("1"))
++	tk.MustQuery(`select id, ExtractValue(cdoc, '//tag[. = "BLUE"]'), concat('[', ExtractValue(doc, '//tag[. = "BLUE"]'), ']') from docs order by id`).
++		Check(testkit.Rows("1  []", "2 blue []"))
++}
++
++func TestXPathUserVariables(t *testing.T) {
++	tk := newTestKit(t)
++	tk.MustExec("set @i = 2, @s = 'y', @MixedCase = 1")
++	checkValue(t, tk, `select ExtractValue('<a><b>x</b><b>y</b></a>', '/a/b[$@i]')`, `y`)
++	checkValue(t, tk, `select ExtractValue('<a><b>x</b><b>y</b></a>', '/a/b[. = $@s]')`, `y`)
++	checkValue(t, tk, `select ExtractValue('<a><b>x</b><b>y</b></a>', '/a/b[$@mixedcase]')`, `x`)
++	checkValue(t, tk, `select ExtractValue('<a><b>x</b><b>y</b></a>', '/a/b[$@MIXEDCASE + 1]')`, `y`)
++	// An unset variable matches nothing and raises no error.
++	checkValue(t, tk, `select concat('[', ExtractValue('<a><b>x</b><b>y</b></a>', '/a/b[$@nosuch]'), ']')`, `[]`)
++
++	// The variable is read when the statement runs, also for a prepared
++	// statement executed again after the variable changed.
++	tk.MustExec(`prepare ps from 'select ExtractValue(''<a><b>x</b><b>y</b><b>z</b></a>'', ''/a/b[$@i]'')'`)
++	tk.MustQuery("execute ps").Check(testkit.Rows("y"))
++	tk.MustExec("set @i = 3")
++	tk.MustQuery("execute ps").Check(testkit.Rows("z"))
++	tk.MustExec("set @i = 1")
++	tk.MustQuery("execute ps").Check(testkit.Rows("x"))
++	checkValue(t, tk, `select ExtractValue('<a><b>x</b><b>y</b><b>z</b></a>', '/a/b[$@i]')`, `x`)
++	tk.MustExec("set @i = 2")
++	checkValue(t, tk, `select ExtractValue('<a><b>x</b><b>y</b><b>z</b></a>', '/a/b[$@i]')`, `y`)
++
++	tk.MustExec("create table docs (id int primary key, doc text)")
++	tk.MustExec("insert into docs values (1, '<r><n>3</n></r>'), (2, '<r><n>5</n></r>'), (3, '<r/>'), (4, null)")
++	tk.MustQuery(`select id, ExtractValue(doc, '/r/n + $@i') from docs order by id`).
++		Check(testkit.Rows("1 5", "2 7", "3 2", "4 <nil>"))
++	tk.MustExec("set @i = 10")
++	tk.MustQuery(`select id from docs where ExtractValue(doc, '/r/n + $@i') > 14 order by id`).Check(testkit.Rows("2"))
++}
++
++// checkXMLWarning checks that the last statement raised exactly one
++// "Incorrect XML value" warning.
++func checkXMLWarning(t *testing.T, tk *testkit.TestKit) {
++	t.Helper()
++	rows := tk.MustQuery("show warnings").Rows()
++	require.Len(t, rows, 1)
++	require.Equal(t, "Warning", rows[0][0])
++	require.Equal(t, "1525", rows[0][1])
++	require.True(t, strings.HasPrefix(rows[0][2].(string), "Incorrect XML value: "), rows[0][2])
++}
++
++func TestXMLFunctionsNullAndMalformedInput(t *testing.T) {
++	tk := newTestKit(t)
++	tk.MustQuery(`select ExtractValue(null, '/a'), ExtractValue('<a/>', null), UpdateXML(null, '/a', '<b/>'), UpdateXML('<a/>', null, '<b/>'), UpdateXML('<a/>', '/a', null)`).
++		Check(testkit.Rows("<nil> <nil> <nil> <nil> <nil>"))
++
++	for _, xml := range []string{`<a>c</a><b`, `<a>`, `<a b=1/>`, `<a><b>x</b></a`} {
++		tk.MustQuery("select ExtractValue('" + xml + "', '/a')").Check(testkit.Rows("<nil>"))
++		checkXMLWarning(t, tk)
++	}
++	tk.MustQuery("select UpdateXML('<a><b>1</b>', '/a/b', '<c/>')").Check(testkit.Rows("<nil>"))
++	checkXMLWarning(t, tk)
++
++	// Only the row holding the malformed value is NULL.
++	tk.MustExec("create table docs (id int primary key, doc text)")
++	tk.MustExec("insert into docs values (1, '<r><id>A1</id></r>'), (2, '<r><id>B2</id'), (3, '<r><id>C3</id></r>')")
++	tk.MustQuery("select id, ExtractValue(doc, '/r/id'), UpdateXML(doc, '/r/id', '<id/>') from docs order by id").
++		Check(testkit.Rows("1 A1 <r><id/></r>", "2 <nil> <nil>", "3 C3 <r><id/></r>"))
++}
++
++func TestXMLFunctionsRejectInvalidXPath(t *testing.T) {
++	tk := newTestKit(t)
++	tk.MustExec("create table docs (doc text)")
++	tk.MustExec("insert into docs values ('<a>c</a>')")
++	queries := []string{
++		`select ExtractValue('<a>c</a>', '/&a')`,
++		`select ExtractValue('<a>c</a>', '/a[')`,
++		`select ExtractValue('<a>c</a>', 'name(/a)')`,
++		`select ExtractValue('<a>c</a>', 'starts-with(/a, "c")')`,
++		`select ExtractValue(doc, '/a/b[') from docs`,
++		`select UpdateXML('<a><b>1</b></a>', '/a/b[', '<c/>')`,
++		`select UpdateXML(doc, '//', '<c/>') from docs`,
++	}
++	for _, q := range queries {
++		err := tk.ExecToErr(q)
++		require.Error(t, err, q)
++		require.Contains(t, err.Error(), "XPATH syntax error", q)
++		tk.MustGetErrCode(q, errno.ErrUnknown)
++	}
++
++	// A statement with an invalid XPath fails as a whole and changes nothing.
++	tk.MustGetErrCode("update docs set doc = UpdateXML(doc, '/a[', '<b/>')", errno.ErrUnknown)
++	tk.MustQuery("select doc from docs").Check(testkit.Rows("<a>c</a>"))
++}
+diff --git a/pkg/expression/test/xmlfunctions/main_test.go b/pkg/expression/test/xmlfunctions/main_test.go
+new file mode 100644
+index 0000000000..ec45873b10
+--- /dev/null
++++ b/pkg/expression/test/xmlfunctions/main_test.go
+@@ -0,0 +1,57 @@
++// Copyright 2026 PingCAP, Inc.
++//
++// Licensed under the Apache License, Version 2.0 (the "License");
++// you may not use this file except in compliance with the License.
++// You may obtain a copy of the License at
++//
++//     http://www.apache.org/licenses/LICENSE-2.0
++//
++// Unless required by applicable law or agreed to in writing, software
++// distributed under the License is distributed on an "AS IS" BASIS,
++// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++// See the License for the specific language governing permissions and
++// limitations under the License.
++
++package xmlfunctions
++
++import (
++	"testing"
++
++	"github.com/pingcap/tidb/pkg/config"
++	"github.com/pingcap/tidb/pkg/testkit/testmain"
++	"github.com/pingcap/tidb/pkg/testkit/testsetup"
++	"github.com/pingcap/tidb/pkg/util/timeutil"
++	"github.com/tikv/client-go/v2/tikv"
++	"go.uber.org/goleak"
++)
++
++func TestMain(m *testing.M) {
++	testsetup.SetupForCommonTest()
++	testmain.ShortCircuitForBench(m)
++
++	config.UpdateGlobal(func(conf *config.Config) {
++		conf.TiKVClient.AsyncCommit.SafeWindow = 0
++		conf.TiKVClient.AsyncCommit.AllowedClockDrift = 0
++		conf.Experimental.AllowsExpressionIndex = true
++	})
++	tikv.EnableFailpoints()
++
++	// Some test depends on the values of timeutil.SystemLocation()
++	// If we don't SetSystemTZ() here, the value would change unpredictable.
++	// Affected by the order whether a testsuite runs before or after integration test.
++	// Note, SetSystemTZ() is a sync.Once operation.
++	timeutil.SetSystemTZ("system")
++
++	opts := []goleak.Option{
++		goleak.IgnoreTopFunction("github.com/golang/glog.(*fileSink).flushDaemon"),
++		goleak.IgnoreTopFunction("github.com/bazelbuild/rules_go/go/tools/bzltestutil.RegisterTimeoutHandler.func1"),
++		goleak.IgnoreTopFunction("github.com/lestrrat-go/httprc.runFetchWorker"),
++		goleak.IgnoreTopFunction("go.etcd.io/etcd/client/pkg/v3/logutil.(*MergeLogger).outputLoop"),
++		goleak.IgnoreTopFunction("go.opencensus.io/stats/view.(*worker).start"),
++		goleak.IgnoreTopFunction("github.com/pingcap/tidb/pkg/ttl/ttlworker.(*ttlScanWorker).loop"),
++		goleak.IgnoreTopFunction("github.com/pingcap/tidb/pkg/ttl/client.(*mockClient).WatchCommand.func1"),
++		goleak.IgnoreTopFunction("github.com/pingcap/tidb/pkg/ttl/ttlworker.(*JobManager).jobLoop"),
++	}
++
++	goleak.VerifyTestMain(m, opts...)
++}
+diff --git a/pkg/expression/test/xmlfunctions/update_xml_test.go b/pkg/expression/test/xmlfunctions/update_xml_test.go
+new file mode 100644
+index 0000000000..6f51ae6927
+--- /dev/null
++++ b/pkg/expression/test/xmlfunctions/update_xml_test.go
+@@ -0,0 +1,81 @@
++// Copyright 2026 PingCAP, Inc.
++//
++// Licensed under the Apache License, Version 2.0 (the "License");
++// you may not use this file except in compliance with the License.
++// You may obtain a copy of the License at
++//
++//     http://www.apache.org/licenses/LICENSE-2.0
++//
++// Unless required by applicable law or agreed to in writing, software
++// distributed under the License is distributed on an "AS IS" BASIS,
++// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++// See the License for the specific language governing permissions and
++// limitations under the License.
++
++//go:build xmlfuncs
++
++package xmlfunctions
++
++import (
++	"testing"
++
++	"github.com/pingcap/tidb/pkg/errno"
++	"github.com/pingcap/tidb/pkg/testkit"
++)
++
++func TestUpdateXMLReplacesASingleMatch(t *testing.T) {
++	tk := newTestKit(t)
++	cases := []struct{ xml, path, replacement, want string }{
++		{`<a><b>ccc</b><d></d></a>`, `/a`, `<e>fff</e>`, `<e>fff</e>`},
++		{`<a><b>ccc</b><d></d></a>`, `//b`, `<e>fff</e>`, `<a><e>fff</e><d></d></a>`},
++		{`<a><d><b>ccc</b></d></a>`, `/a/d/b`, `<e>fff</e>`, `<a><d><e>fff</e></d></a>`},
++		// No match, or more than one match, leaves the value unchanged.
++		{`<a><b>ccc</b><d></d></a>`, `/b`, `<e>fff</e>`, `<a><b>ccc</b><d></d></a>`},
++		{`<a><d></d><b>ccc</b><d></d></a>`, `/a/d`, `<e>fff</e>`, `<a><d></d><b>ccc</b><d></d></a>`},
++		// The rest of the value is kept exactly as written.
++		{`<a>  <b x="1">t</b>  </a>`, `/a/b`, `<c/>`, `<a>  <c/>  </a>`},
++		{`<a><b/><c/></a>`, `/a/b`, `<z>9</z>`, `<a><z>9</z><c/></a>`},
++		{`<a><b>1</b><c/></a>`, `/a/b`, ``, `<a><c/></a>`},
++		{`<a><b n="1">x</b><b n="2">y</b></a>`, `/a/b[@n="2"]`, `<b n="2">Y</b>`, `<a><b n="1">x</b><b n="2">Y</b></a>`},
++		// The replacement is not checked for well-formedness.
++		{`<a><b>1</b></a>`, `/a/b`, `<unclosed`, `<a><unclosed</a>`},
++	}
++	for _, c := range cases {
++		checkValue(t, tk, "select UpdateXML('"+c.xml+"', '"+c.path+"', '"+c.replacement+"')", c.want)
++	}
++}
++
++func TestXMLFunctionsOnTableRows(t *testing.T) {
++	tk := newTestKit(t)
++	tk.MustExec("create table docs (id int primary key, doc text)")
++	tk.MustExec(`insert into docs values (1, '<r><id>A1</id><tag>Red</tag><n>3</n></r>'), (2, '<r><id>B2</id><tag>blue</tag><n>5</n></r>'), ` +
++		`(3, '<r><id>C3</id></r>'), (4, null)`)
++	tk.MustQuery("select id, UpdateXML(doc, '/r/tag', '<tag>green</tag>') from docs order by id").Check(testkit.Rows(
++		"1 <r><id>A1</id><tag>green</tag><n>3</n></r>",
++		"2 <r><id>B2</id><tag>green</tag><n>5</n></r>",
++		"3 <r><id>C3</id></r>",
++		"4 <nil>",
++	))
++	tk.MustQuery("select id from docs where ExtractValue(doc, '/r/n') > 4 order by id").Check(testkit.Rows("2"))
++	tk.MustQuery("select id from docs where ExtractValue(doc, 'count(/r/tag)') = 0 order by id").Check(testkit.Rows("3"))
++	tk.MustExec("update docs set doc = UpdateXML(doc, '/r/id', concat('<id>', lower(ExtractValue(doc, '/r/id')), '</id>')) where id <= 3")
++	tk.MustQuery("select id, doc from docs order by id").Check(testkit.Rows(
++		"1 <r><id>a1</id><tag>Red</tag><n>3</n></r>",
++		"2 <r><id>b2</id><tag>blue</tag><n>5</n></r>",
++		"3 <r><id>c3</id></r>",
++		"4 <nil>",
++	))
++}
++
++func TestXMLFunctionsInGeneratedColumns(t *testing.T) {
++	tk := newTestKit(t)
++	tk.MustExec("create table g (doc text, k varchar(20) as (ExtractValue(doc, '/r/k')) stored, v varchar(20) as (ExtractValue(doc, '/r/v')) virtual)")
++	tk.MustExec("insert into g (doc) values ('<r><k>one</k><v>1</v></r>'), ('<r><k>two</k></r>')")
++	tk.MustQuery("select k, v from g order by k").Check(testkit.Rows("one 1", "two "))
++	tk.MustExec("update g set doc = '<r><k>three</k><v>3</v></r>' where k = 'two'")
++	tk.MustQuery("select k, v from g order by k").Check(testkit.Rows("one 1", "three 3"))
++
++	// UpdateXML() is not allowed in a generated column.
++	tk.MustGetErrCode("create table g2 (doc text, u text as (UpdateXML(doc, '/r', '<r/>')))", errno.ErrGeneratedColumnFunctionIsNotAllowed)
++	tk.MustGetErrCode("alter table g add column u text as (UpdateXML(doc, '/r', '<r/>'))", errno.ErrGeneratedColumnFunctionIsNotAllowed)
++}
+diff --git a/test.sh b/test.sh
+new file mode 100755
+index 0000000000..ac19a966d0
+--- /dev/null
++++ b/test.sh
+@@ -0,0 +1,65 @@
++#!/usr/bin/env bash
++# Usage:
++#   ./test.sh [--output_path <junit.xml>] <base|new>
++#
++# base  runs existing tests of the packages this change builds on: the
++#       collation package, the collation and constant folding tests of
++#       pkg/expression and the generated column function tests of pkg/ddl.
++#       The rest of pkg/expression and pkg/ddl is left out because some of
++#       those tests only pass with failpoints enabled through make.
++# new   runs the SQL level tests in pkg/expression/test/xmlfunctions, which
++#       are compiled only with -tags xmlfuncs.
++set -uo pipefail
++
++ORIG_PWD="$(pwd)"
++
++OUTPUT_PATH=""
++if [ "${1:-}" = "--output_path" ]; then
++  OUTPUT_PATH="$2"
++  shift 2
++  case "$OUTPUT_PATH" in
++    /*) : ;;
++    *) OUTPUT_PATH="$ORIG_PWD/$OUTPUT_PATH" ;;
++  esac
++fi
++
++MODE="${1:-new}"
++
++[ -f go.mod ] || cd "$(dirname "$0")"
++
++TEST_LOG="$(mktemp)"
++STATUS=0
++
++run_tests() {
++  go test -count=1 -v "$@" 2>&1 | tee -a "$TEST_LOG"
++  status=${PIPESTATUS[0]}
++  if [ "$status" -ne 0 ]; then
++    STATUS=$status
++  fi
++}
++
++case "$MODE" in
++  base)
++    run_tests -timeout 1200s -tags intest ./pkg/util/collate
++    run_tests -timeout 1200s -tags intest -run 'Collation|Unfoldable' ./pkg/expression
++    run_tests -timeout 1200s -tags intest -run 'FunctionsInGeneratedColumns' ./pkg/ddl
++    ;;
++  new)
++    run_tests -timeout 1200s -tags intest,xmlfuncs ./pkg/expression/test/xmlfunctions
++    ;;
++  *)
++    echo "unknown mode: $MODE (expected base or new)" >&2
++    exit 2
++    ;;
++esac
++
++if [ -n "$OUTPUT_PATH" ]; then
++  go-junit-report -set-exit-code < "$TEST_LOG" > "$OUTPUT_PATH"
++  junit_status=$?
++  if [ "$junit_status" -ne 0 ] && [ "$STATUS" -eq 0 ]; then
++    echo "go-junit-report failed to convert the test log (exit $junit_status)" >&2
++    STATUS=$junit_status
++  fi
++fi
++
++exit "$STATUS"
