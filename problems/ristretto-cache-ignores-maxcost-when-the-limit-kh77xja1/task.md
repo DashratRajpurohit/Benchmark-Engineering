@@ -1,0 +1,7 @@
+UpdateMaxCost doesn't properly resize the cache. Say I have a cache with a limit of 100, and add 10 items of cost 10. If I update the MaxCost to be 30 and Wait for it, then I'd expect the cache to apply any buffered writes and thus shrink itself to be under the new limit. Instead I get RemainingCost() == -70, and no evictions happen until I try to Set something else. (It should only evict as many items as needed.)
+
+When increasing the cost of a previously set key we can go over the MaxCost and nothing gets evicted to make room. I'd expect that it would evict enough other items to make room, and would leave the increased item with the updated value. If the increased item costs more than the MaxCost on its own, then I'd expect that it would evict that item, but no others. This should also hold when the set buffer is full: right now Set returns true but the new cost just gets dropped.
+
+Adding a new item to a full cache has the same problem. Whether the cache is shrinking, an item grew, or a new item is added, I'd expect any expired items waiting to be evicted to go first, and for a new item, if that frees up enough room then it should be stored, even if it's used less than the items already in the cache. And if the new item gets rejected anyway (OnReject), then no unexpired item should have been evicted for it. Instead some can get evicted and then the new item is rejected.
+
+Each evicted item should trigger the OnEvict func exactly once, providing its value, cost, expiration. Entries that were deleted (or Clear'ed) should not trigger OnEvict.

@@ -1,0 +1,17 @@
+{
+  "problemId": "kh77xja1m73v114gsjehak02vn8g76wd",
+  "title": "Cache ignores MaxCost when the limit is lowered or a stored entry growshttps://shipd.ai/quests/olympus/challenges/new",
+  "status": "draft",
+  "version": 0,
+  "versionId": "kd74x85ah6qwe7vjskfhescvzn8g694j",
+  "isLocked": false,
+  "language": "go",
+  "difficulty": null,
+  "category": "bugfix",
+  "repoUrl": "https://github.com/dgraph-io/ristretto",
+  "commitHash": "a56a38ebeec716a0da3d20a46b417ca2ab7c81f4",
+  "githubIssueUrl": null,
+  "estimatedLOC": null,
+  "testOutputMode": null,
+  "downloadedAt": "2026-10-24T17:09:57.612Z"
+}

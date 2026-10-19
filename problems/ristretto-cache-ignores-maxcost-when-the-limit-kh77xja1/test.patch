@@ -1,0 +1,799 @@
+diff --git a/cache_limits_5d29b1_test.go b/cache_limits_5d29b1_test.go
+new file mode 100644
+index 0000000..c1d2188
+--- /dev/null
++++ b/cache_limits_5d29b1_test.go
+@@ -0,0 +1,487 @@
++//go:build maxcostlimits
++
++package ristretto
++
++import (
++	"runtime"
++	"sync"
++	"sync/atomic"
++	"testing"
++	"time"
++
++	"github.com/stretchr/testify/require"
++)
++
++func TestLimitsLoweringMaxCostEvictsOnlyWhatIsNeeded(t *testing.T) {
++	c := newLimCache(t, 100, nil)
++	limFill(t, c, 10, 10)
++
++	c.UpdateMaxCost(40)
++	c.Wait()
++
++	require.Equal(t, int64(40), c.MaxCost())
++	require.Equal(t, int64(0), c.RemainingCost())
++	require.Len(t, limStored(c, 10), 4)
++}
++
++func TestLimitsEvictedEntriesAreReportedOnce(t *testing.T) {
++	for round := 0; round < 25; round++ {
++		rec := newLimRecorder()
++		c := newLimCache(t, 100, rec)
++		limFill(t, c, 20, 5)
++
++		c.UpdateMaxCost(30)
++		c.Wait()
++
++		require.GreaterOrEqual(t, c.RemainingCost(), int64(0), "round %d", round)
++		evicted := rec.evictedKeys()
++		require.Len(t, evicted, 14, "round %d", round)
++		for key, n := range evicted {
++			require.Equal(t, 1, n, "round %d: key %d reported %d times", round, key, n)
++			item := rec.evicted[key][0]
++			require.Equal(t, int(key), item.Value, "round %d", round)
++			require.Equal(t, int64(5), item.Cost, "round %d", round)
++			require.Equal(t, 1, rec.exited[int(key)], "round %d: value of key %d", round, key)
++			_, ok := c.Get(key)
++			require.False(t, ok, "round %d: key %d still readable", round, key)
++		}
++		c.Close()
++	}
++}
++
++func TestLimitsEvictedEntriesCarryTheirExpiration(t *testing.T) {
++	rec := newLimRecorder()
++	c := newLimCache(t, 60, rec)
++	for k := uint64(1); k <= 6; k++ {
++		if k%2 == 0 {
++			require.True(t, c.SetWithTTL(k, int(k), 10, time.Hour))
++		} else {
++			require.True(t, c.Set(k, int(k), 10))
++		}
++	}
++	c.Wait()
++	inAnHour := time.Now().Add(time.Hour)
++
++	c.UpdateMaxCost(10)
++	c.Wait()
++
++	require.Len(t, rec.evicted, 5)
++	for key, items := range rec.evicted {
++		if key%2 == 1 {
++			require.True(t, items[0].Expiration.IsZero(), "key %d", key)
++			continue
++		}
++		require.WithinDuration(t, inAnHour, items[0].Expiration, time.Minute, "key %d", key)
++	}
++}
++
++func TestLimitsShrinkingEvictsExpiredEntriesFirst(t *testing.T) {
++	t.Run("expired entries are enough", func(t *testing.T) {
++		c := newLimCache(t, 80, nil)
++		limFillWithExpired(t, c, 8, 10, 1, 3, 5)
++
++		c.UpdateMaxCost(50)
++		c.Wait()
++
++		require.Equal(t, []uint64{2, 4, 6, 7, 8}, limStored(c, 8))
++		require.Equal(t, int64(0), c.RemainingCost())
++	})
++	t.Run("live entries go after the expired ones", func(t *testing.T) {
++		c := newLimCache(t, 80, nil)
++		limFillWithExpired(t, c, 8, 10, 2, 4, 6)
++
++		c.UpdateMaxCost(40)
++		c.Wait()
++
++		stored := limStored(c, 8)
++		require.Len(t, stored, 4)
++		for _, k := range []uint64{2, 4, 6} {
++			require.NotContains(t, stored, k)
++		}
++		require.Equal(t, int64(0), c.RemainingCost())
++	})
++}
++
++func TestLimitsRaisingTheCostOfAStoredEntryEvictsOthers(t *testing.T) {
++	for round := 0; round < 20; round++ {
++		rec := newLimRecorder()
++		c := newLimCache(t, 100, rec)
++		limFill(t, c, 5, 20)
++
++		require.True(t, c.Set(1, 1001, 60))
++		c.Wait()
++
++		require.Equal(t, int64(0), c.RemainingCost(), "round %d", round)
++		v, ok := c.Get(1)
++		require.True(t, ok, "round %d: the updated entry was evicted", round)
++		require.Equal(t, 1001, v)
++		require.Len(t, limStored(c, 5), 3, "round %d", round)
++		require.NotContains(t, rec.evictedKeys(), uint64(1), "round %d", round)
++		c.Close()
++	}
++}
++
++func TestLimitsRaisingTheCostEvictsExpiredEntriesFirst(t *testing.T) {
++	for round := 0; round < 20; round++ {
++		c := newLimCache(t, 50, nil)
++		limFillWithExpired(t, c, 5, 10, 1, 2)
++
++		require.True(t, c.Set(5, 1005, 30))
++		c.Wait()
++
++		require.Equal(t, []uint64{3, 4, 5}, limStored(c, 5), "round %d", round)
++		require.Equal(t, int64(0), c.RemainingCost(), "round %d", round)
++		c.Close()
++	}
++}
++
++func TestLimitsAnUpdateBiggerThanTheWholeCacheRemovesOnlyThatEntry(t *testing.T) {
++	rec := newLimRecorder()
++	c := newLimCache(t, 100, rec)
++	limFill(t, c, 4, 20)
++
++	require.True(t, c.Set(1, 1001, 150))
++	c.Wait()
++
++	require.Equal(t, []uint64{2, 3, 4}, limStored(c, 4))
++	require.Equal(t, int64(40), c.RemainingCost())
++	require.Equal(t, map[uint64]int{1: 1}, rec.evictedKeys())
++	require.Equal(t, 1001, rec.evicted[1][0].Value)
++}
++
++func TestLimitsHoldUnderConcurrentGrowthAndShrinking(t *testing.T) {
++	c := newLimCache(t, 400, nil)
++	limFill(t, c, 24, 5)
++
++	// Every entry grows from several goroutines while the limit keeps going down.
++	var wg sync.WaitGroup
++	for g := 0; g < 6; g++ {
++		wg.Add(1)
++		go func(g int) {
++			defer wg.Done()
++			for key := uint64(g*4 + 1); key <= uint64(g*4+4); key++ {
++				c.Set(key, 1000+int(key), 24)
++			}
++		}(g)
++	}
++	wg.Add(1)
++	go func() {
++		defer wg.Done()
++		for max := int64(380); max >= 120; max -= 20 {
++			c.UpdateMaxCost(max)
++			runtime.Gosched()
++		}
++	}()
++	wg.Wait()
++	c.Wait()
++
++	require.Equal(t, int64(120), c.MaxCost())
++	require.GreaterOrEqual(t, c.RemainingCost(), int64(0))
++	require.NotEmpty(t, limStored(c, 24))
++}
++
++func TestLimitsEvictionForANewEntryCarriesTheExpiration(t *testing.T) {
++	rec := newLimRecorder()
++	c := newLimCache(t, 30, rec)
++	for k := uint64(1); k <= 3; k++ {
++		require.True(t, c.SetWithTTL(k, int(k), 10, time.Hour))
++	}
++	c.Wait()
++	inAnHour := time.Now().Add(time.Hour)
++
++	require.True(t, c.Set(4, 4, 10))
++	c.Wait()
++
++	require.Len(t, rec.evicted, 1)
++	for key, items := range rec.evicted {
++		require.WithinDuration(t, inAnHour, items[0].Expiration, time.Minute, "key %d", key)
++	}
++}
++
++func TestLimitsAnUpdateIsNotLostWhenTheWriteBufferIsFull(t *testing.T) {
++	rec := newLimRecorder()
++	gate, entered := make(chan struct{}), make(chan struct{})
++	rec.gate, rec.entered = gate, entered
++	c := newLimCache(t, 100, rec)
++	limFill(t, c, 5, 20)
++	require.True(t, c.Set(6, 6, 20))
++	select {
++	case <-entered:
++	case <-time.After(5 * time.Second):
++		t.Fatal("no entry was evicted to make room")
++	}
++
++	// With the write loop held, pile up more writes than the buffer takes, then
++	// make the entry bigger as the very last write.
++	const writes = 40000
++	var done atomic.Int64
++	written := make(chan struct{})
++	go func() {
++		defer close(written)
++		for i := 0; i < writes; i++ {
++			c.Set(6, 6, 20)
++			done.Add(1)
++		}
++		c.Set(6, 1006, 60)
++		done.Add(1)
++	}()
++	// Let the writes go on until they are all done or stop on the full buffer.
++	deadline := time.Now().Add(20 * time.Second)
++	for last, still := int64(-1), 0; still < 5; {
++		require.True(t, time.Now().Before(deadline), "the writes neither finished nor stopped")
++		time.Sleep(10 * time.Millisecond)
++		n := done.Load()
++		if n == writes+1 {
++			break
++		}
++		if n == last {
++			still++
++		} else {
++			last, still = n, 0
++		}
++	}
++	close(gate)
++	<-written
++	c.Wait()
++
++	v, ok := c.Get(6)
++	require.True(t, ok)
++	require.Equal(t, 1006, v)
++	require.Equal(t, int64(0), c.RemainingCost())
++	require.Len(t, limStored(c, 6), 3)
++}
++
++func TestLimitsClearingReleasesValuesWithoutReportingEvictions(t *testing.T) {
++	rec := newLimRecorder()
++	c := newLimCache(t, 100, rec)
++	limFill(t, c, 5, 10)
++
++	c.Clear()
++	c.Wait()
++
++	require.Empty(t, rec.evictedKeys())
++	for k := 1; k <= 5; k++ {
++		require.Equal(t, 1, rec.exited[k], "value %d", k)
++	}
++	require.Empty(t, limStored(c, 5))
++}
++
++func TestLimitsOnlyEntriesStillInTheCacheAreReportedAsEvicted(t *testing.T) {
++	// limParked returns a cache whose write loop is held inside the OnEvict call
++	// of an eviction until release is called, with a shrink still to come.
++	limParked := func(t *testing.T) (c *Cache[uint64, int], rec *limRecorder, release func()) {
++		t.Helper()
++		rec = newLimRecorder()
++		gate, entered := make(chan struct{}), make(chan struct{})
++		rec.gate, rec.entered = gate, entered
++		c = newLimCache(t, 100, rec)
++		limFill(t, c, 10, 10)
++		require.True(t, c.Set(100, 100, 10))
++		select {
++		case <-entered:
++		case <-time.After(5 * time.Second):
++			t.Fatal("no entry was evicted to make room")
++		}
++		return c, rec, func() { close(gate) }
++	}
++	limNothingZero := func(t *testing.T, rec *limRecorder) {
++		t.Helper()
++		rec.Lock()
++		defer rec.Unlock()
++		for key, items := range rec.evicted {
++			for _, item := range items {
++				require.NotZero(t, item.Value, "key %d was reported with a zero value", key)
++			}
++		}
++	}
++
++	// A shrink is still queued when the cache is cleared: nothing may be reported
++	// without a value.
++	c, rec, release := limParked(t)
++	for i := 0; i < 5000; i++ {
++		require.True(t, c.Set(100, 100, 10))
++	}
++	require.True(t, c.Set(200, 200, 10))
++	c.UpdateMaxCost(30)
++	cleared := make(chan struct{})
++	go func() {
++		defer close(cleared)
++		c.Clear()
++	}()
++	time.Sleep(50 * time.Millisecond) // let Clear queue behind the parked write loop
++	release()
++	<-cleared
++	c.Wait()
++	limNothingZero(t, rec)
++	require.Zero(t, rec.exited[0], "a shrink marker released a zero value")
++	require.Empty(t, limStored(c, 100))
++
++	// An entry is deleted and the cache is cleared before the delete is applied.
++	c, rec, release = limParked(t)
++	stored := limStored(c, 100)
++	require.NotEmpty(t, stored)
++	for i := 0; i < 5000; i++ {
++		require.True(t, c.Set(100, 100, 10))
++	}
++	var deleted uint64
++	for _, k := range stored {
++		if k != 100 {
++			deleted = k
++			break
++		}
++	}
++	c.Del(deleted)
++	cleared = make(chan struct{})
++	go func() {
++		defer close(cleared)
++		c.Clear()
++	}()
++	time.Sleep(50 * time.Millisecond) // let Clear queue behind the parked write loop
++	release()
++	<-cleared
++	c.Wait()
++	limNothingZero(t, rec)
++	require.NotContains(t, rec.evictedKeys(), deleted)
++	require.Zero(t, rec.exited[0], "a delete that was never applied released a zero value")
++
++	// Some entries are deleted while a shrink is queued: the shrink must neither
++	// report them nor stop short of the new limit for the others.
++	c, rec, release = limParked(t)
++	c.UpdateMaxCost(30)
++	stored = limStored(c, 100)
++	require.Greater(t, len(stored), 4)
++	for _, k := range stored[:3] {
++		c.Del(k)
++	}
++	release()
++	c.Wait()
++	limNothingZero(t, rec)
++	for key, n := range rec.evictedKeys() {
++		require.Equal(t, 1, n, "key %d", key)
++	}
++	require.LessOrEqual(t, len(limStored(c, 100)), 3)
++	require.GreaterOrEqual(t, c.RemainingCost(), int64(0))
++}
++
++func TestLimitsEntriesDeletedMeanwhileAreNotReportedByOtherEvictions(t *testing.T) {
++	t.Run("making room for a new entry", func(t *testing.T) {
++		rec := newLimRecorder()
++		gate, entered := make(chan struct{}), make(chan struct{})
++		rec.gate, rec.entered = gate, entered
++		c := newLimCache(t, 40, rec)
++		limFill(t, c, 4, 10)
++
++		// The new entry needs two victims; the write loop is held on the first.
++		require.True(t, c.Set(100, 100, 20))
++		select {
++		case <-entered:
++		case <-time.After(5 * time.Second):
++			t.Fatal("no entry was evicted to make room")
++		}
++		for _, k := range limStored(c, 4) {
++			c.Del(k)
++		}
++		close(gate)
++		c.Wait()
++
++		require.Len(t, rec.evictedKeys(), 1)
++		rec.Lock()
++		defer rec.Unlock()
++		for key, items := range rec.evicted {
++			require.NotZero(t, items[0].Value, "key %d was reported with a zero value", key)
++		}
++	})
++	t.Run("expiry cleanup", func(t *testing.T) {
++		rec := newLimRecorder()
++		gate, entered := make(chan struct{}), make(chan struct{})
++		rec.gate, rec.entered = gate, entered
++		c, err := NewCache(&Config[uint64, int]{
++			NumCounters:            1000,
++			MaxCost:                100,
++			BufferItems:            64,
++			IgnoreInternalCost:     true,
++			Metrics:                true,
++			TtlTickerDurationInSec: 1,
++			OnEvict:                rec.onEvict,
++			OnExit:                 rec.onExit,
++		})
++		require.NoError(t, err)
++		t.Cleanup(c.Close)
++		for k := uint64(1); k <= 2; k++ {
++			require.True(t, c.SetWithTTL(k, int(k), 10, 40*time.Millisecond))
++		}
++		c.Wait()
++
++		// The cleanup of the expired entries is held on the first one it reports.
++		select {
++		case <-entered:
++		case <-time.After(20 * time.Second):
++			t.Fatal("expired entries were never cleaned up")
++		}
++		for _, k := range []uint64{1, 2} {
++			c.Del(k)
++		}
++		close(gate)
++		c.Wait()
++
++		require.Len(t, rec.evictedKeys(), 1)
++		rec.Lock()
++		defer rec.Unlock()
++		for key, items := range rec.evicted {
++			require.NotZero(t, items[0].Value, "key %d was reported with a zero value", key)
++		}
++	})
++}
++
++func TestLimitsANewEntryTakesThePlaceOfExpiredEntriesFirst(t *testing.T) {
++	cases := []struct {
++		name string
++		// popular are the keys that are read often before the cache fills up.
++		popular []uint64
++	}{
++		// LFU alone would evict the live entries, which were never read.
++		{"live entries are the least used", []uint64{2, 4}},
++		// LFU alone would reject the new entry, which was never read.
++		{"the new entry is the least used", []uint64{1, 2, 3, 4, 5}},
++	}
++	for _, tc := range cases {
++		t.Run(tc.name, func(t *testing.T) {
++			rec := newLimRecorder()
++			c := newLimCountingCache(t, 50, rec)
++			limHeat(c, tc.popular...)
++			limFillWithExpired(t, c, 5, 10, 2, 4)
++
++			require.True(t, c.Set(6, 6, 20))
++			c.Wait()
++
++			require.Equal(t, []uint64{1, 3, 5, 6}, limStored(c, 6))
++			require.Equal(t, int64(0), c.RemainingCost())
++			evicted := rec.evictedKeys()
++			require.Equal(t, map[uint64]int{2: 1, 4: 1}, evicted)
++			for _, k := range []uint64{2, 4} {
++				item := rec.evicted[k][0]
++				require.Equal(t, int(k), item.Value)
++				require.False(t, item.Expiration.IsZero(), "key %d", k)
++			}
++		})
++	}
++}
++
++func TestLimitsARejectedEntryEvictsNothing(t *testing.T) {
++	rec := newLimRecorder()
++	c := newLimCountingCache(t, 30, rec)
++	for k := uint64(1); k <= 3; k++ {
++		require.True(t, c.Set(k, int(k), 10))
++	}
++	c.Wait()
++	// Key 1 is as unpopular as the new entry, keys 2 and 3 are more popular, so
++	// making room for 20 would take key 1 and then one of the popular keys.
++	limHeat(c, 2, 3)
++
++	require.True(t, c.Set(4, 4, 20))
++	c.Wait()
++
++	require.Empty(t, rec.evictedKeys())
++	require.Equal(t, []uint64{1, 2, 3}, limStored(c, 4))
++	require.Equal(t, int64(0), c.RemainingCost())
++}
+diff --git a/cache_limits_base_a83c07_test.go b/cache_limits_base_a83c07_test.go
+new file mode 100644
+index 0000000..7320e08
+--- /dev/null
++++ b/cache_limits_base_a83c07_test.go
+@@ -0,0 +1,47 @@
++//go:build maxcostlimits_base
++
++package ristretto
++
++import (
++	"testing"
++
++	"github.com/stretchr/testify/require"
++)
++
++func TestLimitsRaisingMaxCostEvictsNothing(t *testing.T) {
++	c := newLimCache(t, 100, nil)
++	limFill(t, c, 10, 10)
++
++	c.UpdateMaxCost(500)
++	c.Wait()
++
++	require.Equal(t, int64(500), c.MaxCost())
++	require.Equal(t, int64(400), c.RemainingCost())
++	require.Len(t, limStored(c, 10), 10)
++	require.Equal(t, uint64(0), c.Metrics.KeysEvicted())
++}
++
++func TestLimitsSetsBufferedBeforeAShrinkFollowTheNewMaxCost(t *testing.T) {
++	c := newLimCache(t, 100, nil)
++	for k := uint64(1); k <= 10; k++ {
++		require.True(t, c.Set(k, int(k), 10))
++	}
++
++	c.UpdateMaxCost(40)
++	c.Wait()
++
++	require.GreaterOrEqual(t, c.RemainingCost(), int64(0))
++	require.LessOrEqual(t, len(limStored(c, 10)), 4)
++}
++
++func TestLimitsAnUpdateThatStillFitsEvictsNothing(t *testing.T) {
++	c := newLimCache(t, 100, nil)
++	limFill(t, c, 5, 10)
++
++	require.True(t, c.Set(1, 1001, 40))
++	c.Wait()
++
++	require.Equal(t, int64(20), c.RemainingCost())
++	require.Len(t, limStored(c, 5), 5)
++	require.Equal(t, uint64(0), c.Metrics.KeysEvicted())
++}
+diff --git a/cache_limits_helpers_c41e92_test.go b/cache_limits_helpers_c41e92_test.go
+new file mode 100644
+index 0000000..e27c48b
+--- /dev/null
++++ b/cache_limits_helpers_c41e92_test.go
+@@ -0,0 +1,155 @@
++//go:build maxcostlimits || maxcostlimits_base
++
++package ristretto
++
++import (
++	"sync"
++	"testing"
++	"time"
++
++	"github.com/stretchr/testify/require"
++)
++
++// limRecorder collects the callbacks of a cache under test.
++type limRecorder struct {
++	sync.Mutex
++	evicted map[uint64][]Item[int]
++	exited  map[int]int
++	// When set, the first eviction reported blocks until gate is closed, after
++	// signalling on entered.
++	gate    chan struct{}
++	entered chan struct{}
++	once    sync.Once
++}
++
++func newLimRecorder() *limRecorder {
++	return &limRecorder{evicted: map[uint64][]Item[int]{}, exited: map[int]int{}}
++}
++
++func (r *limRecorder) onEvict(i *Item[int]) {
++	if r.gate != nil {
++		r.once.Do(func() {
++			close(r.entered)
++			<-r.gate
++		})
++	}
++	r.Lock()
++	defer r.Unlock()
++	r.evicted[i.Key] = append(r.evicted[i.Key], Item[int]{Key: i.Key, Value: i.Value, Cost: i.Cost, Expiration: i.Expiration})
++}
++
++func (r *limRecorder) onExit(v int) {
++	r.Lock()
++	defer r.Unlock()
++	r.exited[v]++
++}
++
++func (r *limRecorder) evictedKeys() map[uint64]int {
++	r.Lock()
++	defer r.Unlock()
++	out := map[uint64]int{}
++	for k, v := range r.evicted {
++		out[k] = len(v)
++	}
++	return out
++}
++
++func newLimCache(t *testing.T, maxCost int64, rec *limRecorder) *Cache[uint64, int] {
++	t.Helper()
++	return newLimCacheFrom(t, limConfig(maxCost, rec))
++}
++
++// newLimCountingCache is newLimCache with every Get handed to the admission
++// policy right away, so a test can make some keys more popular than others.
++func newLimCountingCache(t *testing.T, maxCost int64, rec *limRecorder) *Cache[uint64, int] {
++	t.Helper()
++	cfg := limConfig(maxCost, rec)
++	cfg.BufferItems = 1
++	return newLimCacheFrom(t, cfg)
++}
++
++func limConfig(maxCost int64, rec *limRecorder) *Config[uint64, int] {
++	cfg := &Config[uint64, int]{
++		NumCounters:            1000,
++		MaxCost:                maxCost,
++		BufferItems:            64,
++		IgnoreInternalCost:     true,
++		Metrics:                true,
++		TtlTickerDurationInSec: 3600,
++	}
++	if rec != nil {
++		cfg.OnEvict = rec.onEvict
++		cfg.OnExit = rec.onExit
++	}
++	return cfg
++}
++
++func newLimCacheFrom(t *testing.T, cfg *Config[uint64, int]) *Cache[uint64, int] {
++	t.Helper()
++	c, err := NewCache(cfg)
++	require.NoError(t, err)
++	t.Cleanup(c.Close)
++	return c
++}
++
++// limStored returns the keys in [1, n] that can be read back.
++func limStored(c *Cache[uint64, int], n uint64) []uint64 {
++	var out []uint64
++	for k := uint64(1); k <= n; k++ {
++		if _, ok := c.Get(k); ok {
++			out = append(out, k)
++		}
++	}
++	return out
++}
++
++// limFill stores keys 1..n with the given cost, each holding its own key as value.
++func limFill(t *testing.T, c *Cache[uint64, int], n uint64, cost int64) {
++	t.Helper()
++	for k := uint64(1); k <= n; k++ {
++		require.True(t, c.Set(k, int(k), cost))
++	}
++	c.Wait()
++	require.Len(t, limStored(c, n), int(n))
++}
++
++// limFillWithExpired stores keys 1..n, where the keys in expired carry a short
++// TTL, and returns once those entries read as expired.
++func limFillWithExpired(t *testing.T, c *Cache[uint64, int], n uint64, cost int64, expired ...uint64) {
++	t.Helper()
++	isExpired := map[uint64]bool{}
++	for _, k := range expired {
++		isExpired[k] = true
++	}
++	for k := uint64(1); k <= n; k++ {
++		if isExpired[k] {
++			require.True(t, c.SetWithTTL(k, int(k), cost, 40*time.Millisecond))
++		} else {
++			require.True(t, c.Set(k, int(k), cost))
++		}
++	}
++	c.Wait()
++	deadline := time.Now().Add(5 * time.Second)
++	for _, k := range expired {
++		for {
++			if _, ok := c.Get(k); !ok {
++				break
++			}
++			require.True(t, time.Now().Before(deadline), "key %d never expired", k)
++			time.Sleep(5 * time.Millisecond)
++		}
++	}
++}
++
++// limHeat reads every key a few times, so that a cache from
++// newLimCountingCache treats them as popular. Missing keys count too.
++func limHeat(c *Cache[uint64, int], keys ...uint64) {
++	for round := 0; round < 6; round++ {
++		for _, k := range keys {
++			c.Get(k)
++			time.Sleep(time.Millisecond)
++		}
++	}
++	// The policy counts the reads on its own goroutine.
++	time.Sleep(100 * time.Millisecond)
++}
+diff --git a/policy_test.go b/policy_test.go
+index c190d8c..4d58b72 100644
+--- a/policy_test.go
++++ b/policy_test.go
+@@ -81,8 +81,7 @@ func TestPolicyAdd(t *testing.T) {
+ 	require.NotNil(t, victims)
+ 	require.True(t, added)
+ 
+-	victims, added = p.Add(4, 20)
+-	require.NotNil(t, victims)
++	_, added = p.Add(4, 20)
+ 	require.False(t, added)
+ }
+ 
+diff --git a/test.sh b/test.sh
+new file mode 100755
+index 0000000..9e1847f
+--- /dev/null
++++ b/test.sh
+@@ -0,0 +1,72 @@
++#!/usr/bin/env bash
++# Usage:
++#   ./test.sh [--output_path <junit.xml>] <base|new>
++#
++# base  runs the existing tests of the cache package, the only package this
++#       change touches, plus a small set of regression controls in
++#       cache_limits_base_a83c07_test.go (compiled only with -tags
++#       maxcostlimits_base) that already hold on the base commit and must keep
++#       holding after any change. The z, sim and contrib packages are not
++#       affected by it and are left out, so the baseline does not depend on
++#       the machine.
++# new   runs the capacity tests in cache_limits_5d29b1_test.go, the file that is
++#       compiled only with -tags maxcostlimits.
++set -uo pipefail
++
++ORIG_PWD="$(pwd)"
++
++OUTPUT_PATH=""
++if [ "${1:-}" = "--output_path" ]; then
++  OUTPUT_PATH="$2"
++  shift 2
++  case "$OUTPUT_PATH" in
++    /*) : ;;
++    *) OUTPUT_PATH="$ORIG_PWD/$OUTPUT_PATH" ;;
++  esac
++fi
++
++MODE="${1:-new}"
++
++[ -f go.mod ] || cd "$(dirname "$0")"
++
++TEST_LOG="$(mktemp)"
++STATUS=0
++
++run_tests() {
++  go test -count=1 -v "$@" 2>&1 | tee -a "$TEST_LOG"
++  status=${PIPESTATUS[0]}
++  if [ "$status" -ne 0 ]; then
++    STATUS=$status
++  fi
++}
++
++# new_tests lists the test functions of the files built only with the given tag.
++new_tests() {
++  grep -lx "//go:build $1" ./*_test.go |
++    xargs sed -n 's/^func \(Test[A-Za-z0-9_]*\)(t \*testing\.T).*/\1/p' |
++    paste -sd '|' -
++}
++
++case "$MODE" in
++  base)
++    run_tests -timeout 900s -tags maxcostlimits_base .
++    ;;
++  new)
++    run_tests -timeout 600s -tags maxcostlimits -run "^($(new_tests maxcostlimits))\$" .
++    ;;
++  *)
++    echo "unknown mode: $MODE (expected base or new)" >&2
++    exit 2
++    ;;
++esac
++
++if [ -n "$OUTPUT_PATH" ]; then
++  go-junit-report -set-exit-code < "$TEST_LOG" > "$OUTPUT_PATH"
++  junit_status=$?
++  if [ "$junit_status" -ne 0 ] && [ "$STATUS" -eq 0 ]; then
++    echo "go-junit-report failed to convert the test log (exit $junit_status)" >&2
++    STATUS=$junit_status
++  fi
++fi
++
++exit "$STATUS"
