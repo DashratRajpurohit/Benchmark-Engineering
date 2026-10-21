@@ -1,0 +1,399 @@
+diff --git a/pkg/executor/BUILD.bazel b/pkg/executor/BUILD.bazel
+index eddcaee887..d85ed55624 100644
+--- a/pkg/executor/BUILD.bazel
++++ b/pkg/executor/BUILD.bazel
+@@ -57,6 +57,7 @@ go_library(
+         "operate_ddl_jobs.go",
+         "opt_rule_blacklist.go",
+         "parallel_apply.go",
++        "partial_revoke.go",
+         "plan_replayer.go",
+         "point_get.go",
+         "prepared.go",
+diff --git a/pkg/executor/partial_revoke.go b/pkg/executor/partial_revoke.go
+new file mode 100644
+index 0000000000..53c00e17db
+--- /dev/null
++++ b/pkg/executor/partial_revoke.go
+@@ -0,0 +1,120 @@
++// Copyright 2026 PingCAP, Inc.
++//
++// Licensed under the Apache License, Version 2.0 (the "License");
++// you may not use this file except in compliance with the License.
++// You may obtain a copy of the License at
++//
++//     http://www.apache.org/licenses/LICENSE-2.0
++//
++// Unless required by applicable law or agreed to in writing, software
++// distributed under the License is distributed on an "AS IS" BASIS,
++// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++// See the License for the specific language governing permissions and
++// limitations under the License.
++
++
++package executor
++
++import (
++	"bytes"
++	"context"
++	"encoding/json"
++	"slices"
++	"strings"
++
++	"github.com/pingcap/errors"
++	"github.com/pingcap/tidb/pkg/kv"
++	"github.com/pingcap/tidb/pkg/parser/mysql"
++	"github.com/pingcap/tidb/pkg/privilege/privileges"
++	"github.com/pingcap/tidb/pkg/sessionctx"
++	"github.com/pingcap/tidb/pkg/util/dbterror/exeerrors"
++	"github.com/pingcap/tidb/pkg/util/sqlescape"
++)
++
++// revokeOnSchema records a partial revoke: the privileges stay granted
++// globally but no longer apply to the schema dbName.
++func (e *RevokeExec) revokeOnSchema(internalSession sessionctx.Context, user, host, dbName string) error {
++	ctx := kv.WithInternalSourceType(context.Background(), kv.InternalTxnPrivilege)
++	sql := new(strings.Builder)
++	sqlescape.MustFormatSQL(sql, "SELECT User_attributes")
++	for _, p := range privileges.RestrictablePrivs {
++		sqlescape.MustFormatSQL(sql, ", %n", p.ColumnString())
++	}
++	sqlescape.MustFormatSQL(sql, " FROM %n.%n WHERE User=%? AND Host=%? FOR UPDATE", mysql.SystemDB, mysql.UserTable, user, strings.ToLower(host))
++	rs, err := internalSession.GetSQLExecutor().ExecuteInternal(ctx, sql.String())
++	if err != nil {
++		return err
++	}
++	rows, _, err := getRowsAndFields(internalSession, rs)
++	if err != nil {
++		return err
++	}
++	if len(rows) == 0 {
++		return errors.Errorf("There is no such grant defined for user '%s' on host '%s'", user, host)
++	}
++	row := rows[0]
++	var global mysql.PrivilegeType
++	for i, p := range privileges.RestrictablePrivs {
++		if row.GetEnum(i+1).String() == "Y" {
++			global |= p
++		}
++	}
++
++	var privs mysql.PrivilegeType
++	for _, priv := range e.Privs {
++		switch {
++		case priv.Priv == mysql.UsagePriv:
++		case priv.Priv == mysql.AllPriv:
++			privs |= global &^ mysql.GrantPriv
++		case slices.Contains(privileges.RestrictablePrivs, priv.Priv):
++			privs |= priv.Priv
++		default:
++			return exeerrors.ErrWrongUsage.GenWithStackByArgs("DB GRANT", "GLOBAL PRIVILEGES")
++		}
++	}
++	if privs&^global != 0 {
++		return errors.Errorf("There is no such grant defined for user '%s' on host '%s'", user, host)
++	}
++	if privs == 0 {
++		return nil
++	}
++
++	attrs := make(map[string]any)
++	var restrictions []privileges.RestrictionJSON
++	if !row.IsNull(0) {
++		dec := json.NewDecoder(bytes.NewReader([]byte(row.GetJSON(0).String())))
++		dec.UseNumber()
++		if err := dec.Decode(&attrs); err != nil {
++			return err
++		}
++		if stored, ok := attrs["Restrictions"]; ok {
++			b, err := json.Marshal(stored)
++			if err != nil {
++				return err
++			}
++			if err := json.Unmarshal(b, &restrictions); err != nil {
++				return err
++			}
++		}
++	}
++	found := false
++	for i := range restrictions {
++		if restrictions[i].Database == dbName {
++			merged := privileges.DecodeRestrictionPrivs(restrictions[i].Privileges) | privs
++			restrictions[i].Privileges = privileges.EncodeRestrictionPrivs(merged)
++			found = true
++		}
++	}
++	if !found {
++		restrictions = append(restrictions, privileges.RestrictionJSON{Database: dbName, Privileges: privileges.EncodeRestrictionPrivs(privs)})
++	}
++	slices.SortFunc(restrictions, func(a, b privileges.RestrictionJSON) int { return strings.Compare(a.Database, b.Database) })
++	attrs["Restrictions"] = restrictions
++	value, err := json.Marshal(attrs)
++	if err != nil {
++		return err
++	}
++	_, err = internalSession.GetSQLExecutor().ExecuteInternal(ctx, "UPDATE %n.%n SET User_attributes=%? WHERE User=%? AND Host=%?",
++		mysql.SystemDB, mysql.UserTable, string(value), user, strings.ToLower(host))
++	return err
++}
+diff --git a/pkg/executor/revoke.go b/pkg/executor/revoke.go
+index aa1dc2041f..7363b137ae 100644
+--- a/pkg/executor/revoke.go
++++ b/pkg/executor/revoke.go
+@@ -28,6 +28,7 @@ import (
+ 	"github.com/pingcap/tidb/pkg/parser/terror"
+ 	"github.com/pingcap/tidb/pkg/privilege"
+ 	"github.com/pingcap/tidb/pkg/sessionctx"
++	"github.com/pingcap/tidb/pkg/sessionctx/vardef"
+ 	"github.com/pingcap/tidb/pkg/sessiontxn"
+ 	"github.com/pingcap/tidb/pkg/table"
+ 	"github.com/pingcap/tidb/pkg/util/chunk"
+@@ -171,6 +172,9 @@ func (e *RevokeExec) revokeOneUser(ctx context.Context, internalSession sessionc
+ 			return err
+ 		}
+ 		if !ok {
++			if vardef.PartialRevokesEnabled.Load() {
++				return e.revokeOnSchema(internalSession, user, host, dbName)
++			}
+ 			return errors.Errorf("There is no such grant defined for user '%s' on host '%s' on database %s", user, host, requestedDBName)
+ 		}
+ 	case ast.GrantLevelTable:
+diff --git a/pkg/privilege/privileges/BUILD.bazel b/pkg/privilege/privileges/BUILD.bazel
+index 96ce7ea3ed..532fd0e5c0 100644
+--- a/pkg/privilege/privileges/BUILD.bazel
++++ b/pkg/privilege/privileges/BUILD.bazel
+@@ -6,6 +6,7 @@ go_library(
+         "cache.go",
+         "errors.go",
+         "privileges.go",
++        "restrictions.go",
+         "tidb_auth_token.go",
+         "user_attributes_filter.go",
+     ],
+diff --git a/pkg/privilege/privileges/cache.go b/pkg/privilege/privileges/cache.go
+index 06334fa15a..f19546aa92 100644
+--- a/pkg/privilege/privileges/cache.go
++++ b/pkg/privilege/privileges/cache.go
+@@ -129,6 +129,8 @@ type UserRecord struct {
+ 	PasswordLifeTime     int64
+ 	MaxUserConnections   int64
+ 	ResourceGroup        string
++	// Restrictions are the partial revokes of the global privileges.
++	Restrictions []SchemaRestriction
+ }
+ 
+ // NewUserRecord return a UserRecord, only use for unit test.
+@@ -1082,6 +1084,11 @@ func (p *MySQLPrivilege) decodeUserTableRow(userList map[string]struct{}) func(c
+ 				value.FailedLoginCount = passwordLocking.FailedLoginCount
+ 				value.AutoLockedLastChanged = passwordLocking.AutoLockedLastChanged
+ 				value.AutoAccountLocked = passwordLocking.AutoAccountLocked
++				restrictions, err := decodeRestrictions(bj)
++				if err != nil {
++					return err
++				}
++				value.Restrictions = restrictions
+ 			case f.ColumnAsName.L == "password_expired":
+ 				if row.GetEnum(i).String() == "Y" {
+ 					value.PasswordExpired = true
+@@ -1646,7 +1653,7 @@ func (p *MySQLPrivilege) RequestVerification(activeRoles []*auth.RoleIdentity, u
+ 	for _, r := range roleList {
+ 		userRecord := p.matchUser(r.Username, r.Hostname)
+ 		if userRecord != nil {
+-			userPriv |= userRecord.Privileges
++			userPriv |= userRecord.Privileges &^ userRecord.restrictedPrivs(db)
+ 		}
+ 	}
+ 	if userPriv&priv > 0 {
+@@ -1692,7 +1699,7 @@ func (p *MySQLPrivilege) RequestVerification(activeRoles []*auth.RoleIdentity, u
+ // DBIsVisible checks whether the user can see the db.
+ func (p *MySQLPrivilege) DBIsVisible(user, host, db string) bool {
+ 	if record := p.matchUser(user, host); record != nil {
+-		if record.Privileges&globalDBVisible > 0 {
++		if (record.Privileges&^record.restrictedPrivs(db))&globalDBVisible > 0 {
+ 			return true
+ 		}
+ 		// For metrics_schema, `PROCESS` can also work.
+@@ -1834,6 +1841,22 @@ func (p *MySQLPrivilege) showGrants(ctx sessionctx.Context, user, host string, r
+ 	}
+ 	slices.Sort(gs[sortFromIdx:])
+ 
++	// Show partial revokes.
++	sortFromIdx = len(gs)
++	if userList, ok := p.user.Get(itemUser{username: user}); ok {
++		for _, record := range userList.data {
++			if !record.fullyMatch(user, host) {
++				continue
++			}
++			for _, r := range record.Restrictions {
++				s := fmt.Sprintf(`REVOKE %s ON %s.* FROM %s`, dbPrivToString(r.Privileges), stringutil.Escape(r.DB, sqlMode), account)
++				gs = append(gs, s)
++			}
++			break
++		}
++	}
++	slices.Sort(gs[sortFromIdx:])
++
+ 	// Show table scope grants.
+ 	sortFromIdx = len(gs)
+ 	tablePrivTable := make(map[string]mysql.PrivilegeType)
+diff --git a/pkg/privilege/privileges/restrictions.go b/pkg/privilege/privileges/restrictions.go
+new file mode 100644
+index 0000000000..989c3c15d8
+--- /dev/null
++++ b/pkg/privilege/privileges/restrictions.go
+@@ -0,0 +1,106 @@
++// Copyright 2026 PingCAP, Inc.
++//
++// Licensed under the Apache License, Version 2.0 (the "License");
++// you may not use this file except in compliance with the License.
++// You may obtain a copy of the License at
++//
++//     http://www.apache.org/licenses/LICENSE-2.0
++//
++// Unless required by applicable law or agreed to in writing, software
++// distributed under the License is distributed on an "AS IS" BASIS,
++// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++// See the License for the specific language governing permissions and
++// limitations under the License.
++
++
++package privileges
++
++import (
++	"encoding/json"
++	"slices"
++	"strings"
++
++	"github.com/pingcap/tidb/pkg/parser/mysql"
++	"github.com/pingcap/tidb/pkg/types"
++)
++
++// SchemaRestriction is one entry of User_attributes->>"$.Restrictions": the
++// globally granted privileges that a partial revoke removed for one schema.
++type SchemaRestriction struct {
++	DB         string
++	Privileges mysql.PrivilegeType
++}
++
++// RestrictionJSON is the stored form of a SchemaRestriction, the same as MySQL's.
++type RestrictionJSON struct {
++	Database   string   `json:"Database"`
++	Privileges []string `json:"Privileges"`
++}
++
++// RestrictablePrivs are the privileges a partial revoke can remove from a schema,
++// in the order they are stored and shown.
++var RestrictablePrivs = slices.Concat(mysql.AllDBPrivs, mysql.Privileges{mysql.GrantPriv})
++
++// RestrictionPrivName returns the name a restriction stores for priv.
++func RestrictionPrivName(priv mysql.PrivilegeType) string {
++	return strings.ToUpper(mysql.Priv2Str[priv])
++}
++
++// EncodeRestrictionPrivs converts privs to the names a restriction stores.
++func EncodeRestrictionPrivs(privs mysql.PrivilegeType) []string {
++	names := make([]string, 0, 4)
++	for _, p := range RestrictablePrivs {
++		if privs&p != 0 {
++			names = append(names, RestrictionPrivName(p))
++		}
++	}
++	return names
++}
++
++// DecodeRestrictionPrivs converts the stored names of a restriction back to privileges.
++func DecodeRestrictionPrivs(names []string) mysql.PrivilegeType {
++	var privs mysql.PrivilegeType
++	for _, name := range names {
++		for _, p := range RestrictablePrivs {
++			if strings.EqualFold(name, RestrictionPrivName(p)) {
++				privs |= p
++			}
++		}
++	}
++	return privs
++}
++
++func decodeRestrictions(bj types.BinaryJSON) ([]SchemaRestriction, error) {
++	pathExpr, err := types.ParseJSONPathExpr("$.Restrictions")
++	if err != nil {
++		return nil, err
++	}
++	rbj, found := bj.Extract([]types.JSONPathExpression{pathExpr})
++	if !found {
++		return nil, nil
++	}
++	var entries []RestrictionJSON
++	if err := json.Unmarshal([]byte(rbj.String()), &entries); err != nil {
++		return nil, err
++	}
++	restrictions := make([]SchemaRestriction, 0, len(entries))
++	for _, entry := range entries {
++		privs := DecodeRestrictionPrivs(entry.Privileges)
++		if privs == 0 {
++			continue
++		}
++		restrictions = append(restrictions, SchemaRestriction{DB: strings.Clone(entry.Database), Privileges: privs})
++	}
++	return restrictions, nil
++}
++
++// restrictedPrivs returns the global privileges of the record that are revoked on db.
++func (record *UserRecord) restrictedPrivs(db string) mysql.PrivilegeType {
++	var privs mysql.PrivilegeType
++	for _, r := range record.Restrictions {
++		if strings.EqualFold(r.DB, db) {
++			privs |= r.Privileges
++		}
++	}
++	return privs
++}
+diff --git a/pkg/sessionctx/vardef/tidb_vars.go b/pkg/sessionctx/vardef/tidb_vars.go
+index ef3e821a3a..e78a5aa63e 100644
+--- a/pkg/sessionctx/vardef/tidb_vars.go
++++ b/pkg/sessionctx/vardef/tidb_vars.go
+@@ -307,6 +307,8 @@ const (
+ 
+ 	// RequireSecureTransport indicates the secure mode for data transport
+ 	RequireSecureTransport = "require_secure_transport"
++	// PartialRevokes enables revoking globally granted privileges on single schemas.
++	PartialRevokes = "partial_revokes"
+ 
+ 	// TiFlashFastScan indicates whether use fast scan in tiflash.
+ 	TiFlashFastScan = "tiflash_fastscan"
+@@ -1792,6 +1794,7 @@ const (
+ 	MaxTiDBStatsCacheMemQuota                         = 1024 * 1024 * 1024 * 1024 // 1TB
+ 	DefTiDBQueryLogMaxLen                             = 4096
+ 	DefRequireSecureTransport                         = false
++	DefPartialRevokes                                 = false
+ 	DefTiDBCommitterConcurrency                       = 128
+ 	DefTiDBPipelinedDmlResourcePolicy                 = StrategyStandard
+ 	DefTiDBBatchDMLIgnoreError                        = false
+@@ -2107,6 +2110,7 @@ var (
+ 	PasswordHistory                 = atomic.NewInt64(DefPasswordReuseHistory)
+ 	PasswordReuseInterval           = atomic.NewInt64(DefPasswordReuseTime)
+ 	IsSandBoxModeEnabled            = atomic.NewBool(false)
++	PartialRevokesEnabled           = atomic.NewBool(DefPartialRevokes)
+ 	MaxUserConnectionsValue         = atomic.NewUint32(DefMaxUserConnections)
+ 	MaxPreparedStmtCountValue       = atomic.NewInt64(DefMaxPreparedStmtCount)
+ 	HistoricalStatsDuration         = atomic.NewDuration(DefTiDBHistoricalStatsDuration)
+diff --git a/pkg/sessionctx/variable/sysvar.go b/pkg/sessionctx/variable/sysvar.go
+index 19ab330be7..723c4a5c1a 100644
+--- a/pkg/sessionctx/variable/sysvar.go
++++ b/pkg/sessionctx/variable/sysvar.go
+@@ -1559,6 +1559,15 @@ var defaultSysVars = []*SysVar{
+ 		SetGlobal: func(_ context.Context, s *SessionVars, val string) error {
+ 			return nil
+ 		}},
++	{Scope: vardef.ScopeGlobal, Name: vardef.PartialRevokes, Value: BoolToOnOff(vardef.DefPartialRevokes), Type: vardef.TypeBool,
++		GetGlobal: func(_ context.Context, s *SessionVars) (string, error) {
++			return BoolToOnOff(vardef.PartialRevokesEnabled.Load()), nil
++		},
++		SetGlobal: func(_ context.Context, s *SessionVars, val string) error {
++			vardef.PartialRevokesEnabled.Store(TiDBOptOn(val))
++			return nil
++		},
++	},
+ 	{Scope: vardef.ScopeGlobal, Name: vardef.RequireSecureTransport, Value: BoolToOnOff(vardef.DefRequireSecureTransport), Type: vardef.TypeBool,
+ 		GetGlobal: func(_ context.Context, s *SessionVars) (string, error) {
+ 			if deploymode.IsStarter() {

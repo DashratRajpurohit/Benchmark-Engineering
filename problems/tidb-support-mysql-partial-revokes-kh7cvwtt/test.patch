@@ -1,0 +1,206 @@
+diff --git a/pkg/executor/test/acctrestrictd9b2ec/main_test.go b/pkg/executor/test/acctrestrictd9b2ec/main_test.go
+new file mode 100644
+index 0000000000..19560468db
+--- /dev/null
++++ b/pkg/executor/test/acctrestrictd9b2ec/main_test.go
+@@ -0,0 +1,60 @@
++// Copyright 2026 PingCAP, Inc.
++//
++// Licensed under the Apache License, Version 2.0 (the "License");
++// you may not use this file except in compliance with the License.
++// You may obtain a copy of the License at
++//
++//     http://www.apache.org/licenses/LICENSE-2.0
++//
++// Unless required by applicable law or agreed to in writing, software
++// distributed under the License is distributed on an "AS IS" BASIS,
++// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++// See the License for the specific language governing permissions and
++// limitations under the License.
++
++
++//go:build acctrestrict
++
++package acctrestrict
++
++import (
++	"testing"
++
++	"github.com/pingcap/tidb/pkg/config"
++	"github.com/pingcap/tidb/pkg/testkit/testmain"
++	"github.com/pingcap/tidb/pkg/testkit/testsetup"
++	"github.com/pingcap/tidb/pkg/util/timeutil"
++	"github.com/tikv/client-go/v2/tikv"
++	"go.uber.org/goleak"
++)
++
++func TestMain(m *testing.M) {
++	testsetup.SetupForCommonTest()
++	testmain.ShortCircuitForBench(m)
++
++	config.UpdateGlobal(func(conf *config.Config) {
++		conf.TiKVClient.AsyncCommit.SafeWindow = 0
++		conf.TiKVClient.AsyncCommit.AllowedClockDrift = 0
++		conf.Experimental.AllowsExpressionIndex = true
++	})
++	tikv.EnableFailpoints()
++
++	// Some test depends on the values of timeutil.SystemLocation()
++	// If we don't SetSystemTZ() here, the value would change unpredictable.
++	// Affected by the order whether a testsuite runs before or after integration test.
++	// Note, SetSystemTZ() is a sync.Once operation.
++	timeutil.SetSystemTZ("system")
++
++	opts := []goleak.Option{
++		goleak.IgnoreTopFunction("github.com/golang/glog.(*fileSink).flushDaemon"),
++		goleak.IgnoreTopFunction("github.com/bazelbuild/rules_go/go/tools/bzltestutil.RegisterTimeoutHandler.func1"),
++		goleak.IgnoreTopFunction("github.com/lestrrat-go/httprc.runFetchWorker"),
++		goleak.IgnoreTopFunction("go.etcd.io/etcd/client/pkg/v3/logutil.(*MergeLogger).outputLoop"),
++		goleak.IgnoreTopFunction("go.opencensus.io/stats/view.(*worker).start"),
++		goleak.IgnoreTopFunction("github.com/pingcap/tidb/pkg/ttl/ttlworker.(*ttlScanWorker).loop"),
++		goleak.IgnoreTopFunction("github.com/pingcap/tidb/pkg/ttl/client.(*mockClient).WatchCommand.func1"),
++		goleak.IgnoreTopFunction("github.com/pingcap/tidb/pkg/ttl/ttlworker.(*JobManager).jobLoop"),
++	}
++
++	goleak.VerifyTestMain(m, opts...)
++}
+diff --git a/pkg/executor/test/acctrestrictd9b2ec/partial_revokes_ede4b5_test.go b/pkg/executor/test/acctrestrictd9b2ec/partial_revokes_ede4b5_test.go
+new file mode 100644
+index 0000000000..f4143c2ec5
+--- /dev/null
++++ b/pkg/executor/test/acctrestrictd9b2ec/partial_revokes_ede4b5_test.go
+@@ -0,0 +1,66 @@
++// Copyright 2026 PingCAP, Inc.
++//
++// Licensed under the Apache License, Version 2.0 (the "License");
++// you may not use this file except in compliance with the License.
++// You may obtain a copy of the License at
++//
++//     http://www.apache.org/licenses/LICENSE-2.0
++//
++// Unless required by applicable law or agreed to in writing, software
++// distributed under the License is distributed on an "AS IS" BASIS,
++// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++// See the License for the specific language governing permissions and
++// limitations under the License.
++
++
++//go:build acctrestrict
++
++package acctrestrict
++
++import (
++	"testing"
++
++	"github.com/pingcap/tidb/pkg/kv"
++	"github.com/pingcap/tidb/pkg/parser/auth"
++	"github.com/pingcap/tidb/pkg/testkit"
++	"github.com/stretchr/testify/require"
++)
++
++func loginAs(t *testing.T, store kv.Storage, user, host string) *testkit.TestKit {
++	tk := testkit.NewTestKit(t, store)
++	require.NoError(t, tk.Session().Auth(&auth.UserIdentity{Username: user, Hostname: host}, nil, nil, nil))
++	return tk
++}
++
++func TestPartialRevokeOfAGlobalPrivilege(t *testing.T) {
++	store := testkit.CreateMockStore(t)
++	root := loginAs(t, store, "root", "%")
++	root.MustExec("create database world")
++	root.MustExec("create table world.city (id int)")
++	root.MustExec("insert into world.city values (1)")
++	root.MustExec("create database other")
++	root.MustExec("create table other.t (id int)")
++	root.MustExec("create user u1")
++	root.MustExec("grant select, insert on *.* to u1")
++
++	// Without partial_revokes a schema level revoke of a global privilege is refused.
++	root.MustQuery("select @@global.partial_revokes").Check(testkit.Rows("0"))
++	require.Error(t, root.ExecToErr("revoke insert on world.* from u1"))
++
++	root.MustExec("set global partial_revokes = on")
++	t.Cleanup(func() {
++		root.MustExec("drop user u1")
++		root.MustExec("set global partial_revokes = off")
++	})
++	root.MustExec("revoke insert on world.* from u1")
++	root.MustQuery("show grants for u1").Check(testkit.Rows(
++		"GRANT SELECT,INSERT ON *.* TO `u1`@`%`",
++		"REVOKE INSERT ON `world`.* FROM `u1`@`%`",
++	))
++
++	u1 := loginAs(t, store, "u1", "localhost")
++	u1.MustQuery("select id from world.city").Check(testkit.Rows("1"))
++	require.ErrorContains(t, u1.ExecToErr("insert into world.city values (2)"), "INSERT command denied")
++	u1.MustExec("insert into other.t values (2)")
++	u1.MustQuery("select id from other.t").Check(testkit.Rows("2"))
++}
+diff --git a/test.sh b/test.sh
+new file mode 100755
+index 0000000000..b8589db457
+--- /dev/null
++++ b/test.sh
+@@ -0,0 +1,62 @@
++#!/usr/bin/env bash
++# Usage:
++#   ./test.sh [--output_path <junit.xml>] <base|new>
++#
++# base  runs existing tests of the account and privilege code: the
++#       privilege cache package and the grant, revoke, role and privilege
++#       tests of the executor test suites.
++# new   runs the SQL level tests in pkg/executor/test/acctrestrictd9b2ec,
++#       which are compiled only with -tags acctrestrict.
++set -uo pipefail
++
++ORIG_PWD="$(pwd)"
++
++OUTPUT_PATH=""
++if [ "${1:-}" = "--output_path" ]; then
++  OUTPUT_PATH="$2"
++  shift 2
++  case "$OUTPUT_PATH" in
++    /*) : ;;
++    *) OUTPUT_PATH="$ORIG_PWD/$OUTPUT_PATH" ;;
++  esac
++fi
++
++MODE="${1:-new}"
++
++[ -f go.mod ] || cd "$(dirname "$0")"
++
++TEST_LOG="$(mktemp)"
++STATUS=0
++
++run_tests() {
++  go test -count=1 -v "$@" 2>&1 | tee -a "$TEST_LOG"
++  status=${PIPESTATUS[0]}
++  if [ "$status" -ne 0 ]; then
++    STATUS=$status
++  fi
++}
++
++case "$MODE" in
++  base)
++    run_tests -timeout 1200s -tags intest ./pkg/privilege/privileges
++    run_tests -timeout 1200s -tags intest -run 'Grant|Revoke|Role|Privilege' ./pkg/executor/test/simpletest ./pkg/executor/test/showtest
++    ;;
++  new)
++    run_tests -timeout 1200s -tags intest,acctrestrict ./pkg/executor/test/acctrestrictd9b2ec
++    ;;
++  *)
++    echo "unknown mode: $MODE (expected base or new)" >&2
++    exit 2
++    ;;
++esac
++
++if [ -n "$OUTPUT_PATH" ]; then
++  go-junit-report -set-exit-code < "$TEST_LOG" > "$OUTPUT_PATH"
++  junit_status=$?
++  if [ "$junit_status" -ne 0 ] && [ "$STATUS" -eq 0 ]; then
++    echo "go-junit-report failed to convert the test log (exit $junit_status)" >&2
++    STATUS=$junit_status
++  fi
++fi
++
++exit "$STATUS"

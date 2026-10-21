@@ -1,0 +1,17 @@
+{
+  "problemId": "kh7cvwtthhmcjbm3atxatp6jqs8gjwey",
+  "title": "Support MySQL partial revokes",
+  "status": "draft",
+  "version": 0,
+  "versionId": "kd72jrb5v0fr1xkev396saqd0d8gkffz",
+  "isLocked": false,
+  "language": "go",
+  "difficulty": "hard",
+  "category": "feature_request",
+  "repoUrl": "https://github.com/pingcap/tidb",
+  "commitHash": "0a4db0d86bb53a011097c26730127d1737bcc125",
+  "githubIssueUrl": null,
+  "estimatedLOC": 1200,
+  "testOutputMode": null,
+  "downloadedAt": "2026-10-24T17:09:49.677Z"
+}
