@@ -1,0 +1,302 @@
+diff --git a/nsqd/lookup_peer.go b/nsqd/lookup_peer.go
+index ed1755a..c77dd12 100644
+--- a/nsqd/lookup_peer.go
++++ b/nsqd/lookup_peer.go
+@@ -139,6 +139,10 @@ func readResponseBounded(r io.Reader, limit int64) ([]byte, error) {
+ 		return nil, err
+ 	}
+ 
++	if msgSize < 0 {
++		return nil, fmt.Errorf("response body size (%d) is invalid", msgSize)
++	}
++
+ 	if int64(msgSize) > limit {
+ 		return nil, fmt.Errorf("response body size (%d) is greater than limit (%d)",
+ 			msgSize, limit)
+diff --git a/nsqlookupd/http.go b/nsqlookupd/http.go
+index e5493fa..f578b8d 100644
+--- a/nsqlookupd/http.go
++++ b/nsqlookupd/http.go
+@@ -1,7 +1,6 @@
+ package nsqlookupd
+ 
+ import (
+-	"fmt"
+ 	"net/http"
+ 	"net/http/pprof"
+ 	"sync/atomic"
+@@ -95,6 +94,10 @@ func (s *httpServer) doChannels(w http.ResponseWriter, req *http.Request, ps htt
+ 		return nil, http_api.Err{Code: 400, Text: "MISSING_ARG_TOPIC"}
+ 	}
+ 
++	if !protocol.IsValidTopicName(topicName) {
++		return nil, http_api.Err{Code: 400, Text: "INVALID_ARG_TOPIC"}
++	}
++
+ 	channels := s.nsqlookupd.DB.FindRegistrations("channel", topicName, "*").SubKeys()
+ 	return map[string]interface{}{
+ 		"channels": channels,
+@@ -112,6 +115,10 @@ func (s *httpServer) doLookup(w http.ResponseWriter, req *http.Request, ps httpr
+ 		return nil, http_api.Err{Code: 400, Text: "MISSING_ARG_TOPIC"}
+ 	}
+ 
++	if !protocol.IsValidTopicName(topicName) {
++		return nil, http_api.Err{Code: 400, Text: "INVALID_ARG_TOPIC"}
++	}
++
+ 	registration := s.nsqlookupd.DB.FindRegistrations("topic", topicName, "")
+ 	if len(registration) == 0 {
+ 		return nil, http_api.Err{Code: 404, Text: "TOPIC_NOT_FOUND"}
+@@ -160,6 +167,10 @@ func (s *httpServer) doDeleteTopic(w http.ResponseWriter, req *http.Request, ps
+ 		return nil, http_api.Err{Code: 400, Text: "MISSING_ARG_TOPIC"}
+ 	}
+ 
++	if !protocol.IsValidTopicName(topicName) {
++		return nil, http_api.Err{Code: 400, Text: "INVALID_ARG_TOPIC"}
++	}
++
+ 	registrations := s.nsqlookupd.DB.FindRegistrations("channel", topicName, "*")
+ 	for _, registration := range registrations {
+ 		s.nsqlookupd.logf(LOG_INFO, "DB: removing channel(%s) from topic(%s)", registration.SubKey, topicName)
+@@ -186,6 +197,10 @@ func (s *httpServer) doTombstoneTopicProducer(w http.ResponseWriter, req *http.R
+ 		return nil, http_api.Err{Code: 400, Text: "MISSING_ARG_TOPIC"}
+ 	}
+ 
++	if !protocol.IsValidTopicName(topicName) {
++		return nil, http_api.Err{Code: 400, Text: "INVALID_ARG_TOPIC"}
++	}
++
+ 	node, err := reqParams.Get("node")
+ 	if err != nil {
+ 		return nil, http_api.Err{Code: 400, Text: "MISSING_ARG_NODE"}
+@@ -194,8 +209,7 @@ func (s *httpServer) doTombstoneTopicProducer(w http.ResponseWriter, req *http.R
+ 	s.nsqlookupd.logf(LOG_INFO, "DB: setting tombstone for producer@%s of topic(%s)", node, topicName)
+ 	producers := s.nsqlookupd.DB.FindProducers("topic", topicName, "")
+ 	for _, p := range producers {
+-		thisNode := fmt.Sprintf("%s:%d", p.peerInfo.BroadcastAddress, p.peerInfo.HTTPPort)
+-		if thisNode == node {
++		if p.HTTPAddress() == node {
+ 			p.Tombstone()
+ 		}
+ 	}
+diff --git a/nsqlookupd/lookup_protocol_v1.go b/nsqlookupd/lookup_protocol_v1.go
+index af69853..947078f 100644
+--- a/nsqlookupd/lookup_protocol_v1.go
++++ b/nsqlookupd/lookup_protocol_v1.go
+@@ -4,6 +4,7 @@ import (
+ 	"bufio"
+ 	"encoding/binary"
+ 	"encoding/json"
++	"errors"
+ 	"fmt"
+ 	"io"
+ 	"log"
+@@ -17,6 +18,14 @@ import (
+ 	"github.com/nsqio/nsq/internal/version"
+ )
+ 
++// maxIdentifyBodySize bounds the IDENTIFY body, a small JSON document
++// describing the nsqd, before any memory is allocated for it.
++const maxIdentifyBodySize = 1024 * 1024
++
++// errInactiveProducer ends the connection of a client that has not sent a PING
++// within InactiveProducerTimeout.
++var errInactiveProducer = errors.New("no PING within the inactive producer timeout")
++
+ type LookupProtocolV1 struct {
+ 	nsqlookupd *NSQLookupd
+ }
+@@ -31,12 +40,35 @@ func (p *LookupProtocolV1) IOLoop(c protocol.Client) error {
+ 
+ 	client := c.(*ClientV1)
+ 
++	// an nsqd sends a PING well within InactiveProducerTimeout, so a producer
++	// whose last PING (or IDENTIFY) is older than that is treated as gone;
++	// other commands do not extend its lifetime
++	connected := time.Now()
+ 	reader := bufio.NewReader(client)
+ 	for {
++		lastSeen := connected
++		if client.peerInfo != nil {
++			lastSeen = time.Unix(0, atomic.LoadInt64(&client.peerInfo.lastUpdate))
++		}
++		deadline := lastSeen.Add(p.nsqlookupd.opts.InactiveProducerTimeout)
++		if !time.Now().Before(deadline) {
++			err = errInactiveProducer
++			break
++		}
++		err = client.SetReadDeadline(deadline)
++		if err != nil {
++			break
++		}
+ 		line, err = reader.ReadString('\n')
+ 		if err != nil {
+ 			break
+ 		}
++		// a line served from already-buffered data does not see the read
++		// deadline, so it is checked again here
++		if !time.Now().Before(deadline) {
++			err = errInactiveProducer
++			break
++		}
+ 
+ 		line = strings.TrimSpace(line)
+ 		params := strings.Split(line, " ")
+@@ -160,15 +192,11 @@ func (p *LookupProtocolV1) UNREGISTER(client *ClientV1, reader *bufio.Reader, pa
+ 
+ 	if channel != "" {
+ 		key := Registration{"channel", topic, channel}
+-		removed, left := p.nsqlookupd.DB.RemoveProducer(key, client.peerInfo.id)
++		removed, _ := p.nsqlookupd.DB.RemoveProducer(key, client.peerInfo.id)
+ 		if removed {
+ 			p.nsqlookupd.logf(LOG_INFO, "DB: client(%s) UNREGISTER category:%s key:%s subkey:%s",
+ 				client, "channel", topic, channel)
+ 		}
+-		// for ephemeral channels, remove the channel as well if it has no producers
+-		if left == 0 && strings.HasSuffix(channel, "#ephemeral") {
+-			p.nsqlookupd.DB.RemoveRegistration(key)
+-		}
+ 	} else {
+ 		// no channel was specified so this is a topic unregistration
+ 		// remove all of the channel registrations...
+@@ -184,14 +212,11 @@ func (p *LookupProtocolV1) UNREGISTER(client *ClientV1, reader *bufio.Reader, pa
+ 		}
+ 
+ 		key := Registration{"topic", topic, ""}
+-		removed, left := p.nsqlookupd.DB.RemoveProducer(key, client.peerInfo.id)
++		removed, _ := p.nsqlookupd.DB.RemoveProducer(key, client.peerInfo.id)
+ 		if removed {
+ 			p.nsqlookupd.logf(LOG_INFO, "DB: client(%s) UNREGISTER category:%s key:%s subkey:%s",
+ 				client, "topic", topic, "")
+ 		}
+-		if left == 0 && strings.HasSuffix(topic, "#ephemeral") {
+-			p.nsqlookupd.DB.RemoveRegistration(key)
+-		}
+ 	}
+ 
+ 	return []byte("OK"), nil
+@@ -210,6 +235,11 @@ func (p *LookupProtocolV1) IDENTIFY(client *ClientV1, reader *bufio.Reader, para
+ 		return nil, protocol.NewFatalClientErr(err, "E_BAD_BODY", "IDENTIFY failed to read body size")
+ 	}
+ 
++	if bodyLen <= 0 || bodyLen > maxIdentifyBodySize {
++		return nil, protocol.NewFatalClientErr(nil, "E_BAD_BODY",
++			fmt.Sprintf("IDENTIFY invalid body size %d", bodyLen))
++	}
++
+ 	body := make([]byte, bodyLen)
+ 	_, err = io.ReadFull(reader, body)
+ 	if err != nil {
+diff --git a/nsqlookupd/registration_db.go b/nsqlookupd/registration_db.go
+index 31c9da6..89e0624 100644
+--- a/nsqlookupd/registration_db.go
++++ b/nsqlookupd/registration_db.go
+@@ -2,6 +2,9 @@ package nsqlookupd
+ 
+ import (
+ 	"fmt"
++	"net"
++	"strconv"
++	"strings"
+ 	"sync"
+ 	"sync/atomic"
+ 	"time"
+@@ -54,6 +57,12 @@ func (p *Producer) IsTombstoned(lifetime time.Duration) bool {
+ 	return p.tombstoned && time.Since(p.tombstonedAt) < lifetime
+ }
+ 
++// HTTPAddress returns the host:port form used to name this producer's node,
++// bracketing IPv6 broadcast addresses.
++func (p *Producer) HTTPAddress() string {
++	return net.JoinHostPort(p.peerInfo.BroadcastAddress, strconv.Itoa(p.peerInfo.HTTPPort))
++}
++
+ func NewRegistrationDB() *RegistrationDB {
+ 	return &RegistrationDB{
+ 		registrationMap: make(map[Registration]ProducerMap),
+@@ -61,7 +70,13 @@ func NewRegistrationDB() *RegistrationDB {
+ }
+ 
+ // add a registration key
++//
++// An ephemeral registration only exists while a producer has it, so one
++// without a producer is not stored.
+ func (r *RegistrationDB) AddRegistration(k Registration) {
++	if k.IsEphemeral() {
++		return
++	}
+ 	r.Lock()
+ 	defer r.Unlock()
+ 	_, ok := r.registrationMap[k]
+@@ -87,6 +102,10 @@ func (r *RegistrationDB) AddProducer(k Registration, p *Producer) bool {
+ }
+ 
+ // remove a producer from a registration
++//
++// Registrations of durable topics and channels are kept even when their last
++// producer goes away. An ephemeral registration only exists while something
++// produces it, so it is removed together with its last producer.
+ func (r *RegistrationDB) RemoveProducer(k Registration, id string) (bool, int) {
+ 	r.Lock()
+ 	defer r.Unlock()
+@@ -99,9 +118,12 @@ func (r *RegistrationDB) RemoveProducer(k Registration, id string) (bool, int) {
+ 		removed = true
+ 	}
+ 
+-	// Note: this leaves keys in the DB even if they have empty lists
+ 	delete(producers, id)
+-	return removed, len(producers)
++	left := len(producers)
++	if left == 0 && k.IsEphemeral() {
++		delete(r.registrationMap, k)
++	}
++	return removed, left
+ }
+ 
+ // remove a Registration and all it's producers
+@@ -172,6 +194,18 @@ func (r *RegistrationDB) LookupRegistrations(id string) Registrations {
+ 	return results
+ }
+ 
++// IsEphemeral reports whether the registration names an ephemeral topic, an
++// ephemeral channel, or a channel of an ephemeral topic.
++func (k Registration) IsEphemeral() bool {
++	switch k.Category {
++	case "topic":
++		return strings.HasSuffix(k.Key, "#ephemeral")
++	case "channel":
++		return strings.HasSuffix(k.Key, "#ephemeral") || strings.HasSuffix(k.SubKey, "#ephemeral")
++	}
++	return false
++}
++
+ func (k Registration) IsMatch(category string, key string, subkey string) bool {
+ 	if category != k.Category {
+ 		return false
+diff --git a/nsqlookupd/tcp.go b/nsqlookupd/tcp.go
+index b370d26..3ea55ca 100644
+--- a/nsqlookupd/tcp.go
++++ b/nsqlookupd/tcp.go
+@@ -4,6 +4,7 @@ import (
+ 	"io"
+ 	"net"
+ 	"sync"
++	"time"
+ 
+ 	"github.com/nsqio/nsq/internal/protocol"
+ )
+@@ -20,7 +21,13 @@ func (p *tcpServer) Handle(conn net.Conn) {
+ 	// the version of the protocol that it intends to communicate, this will allow us
+ 	// to gracefully upgrade the protocol away from text/line oriented to whatever...
+ 	buf := make([]byte, 4)
+-	_, err := io.ReadFull(conn, buf)
++	err := conn.SetReadDeadline(time.Now().Add(p.nsqlookupd.opts.InactiveProducerTimeout))
++	if err != nil {
++		p.nsqlookupd.logf(LOG_ERROR, "failed to set read deadline - %s", err)
++		_ = conn.Close()
++		return
++	}
++	_, err = io.ReadFull(conn, buf)
+ 	if err != nil {
+ 		p.nsqlookupd.logf(LOG_ERROR, "failed to read protocol version - %s", err)
+ 		_ = conn.Close()

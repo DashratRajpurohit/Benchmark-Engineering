@@ -1,0 +1,30 @@
+[
+ {
+  "feedback": "Tests: T3/T4: Minor gap issue, the tests are correctly applied and written, no inconsistencies and no hidden requirements, approvable",
+  "fieldBands": {
+   "description": {
+    "band": 3
+   },
+   "solution": {
+    "band": 3
+   },
+   "tests": {
+    "band": 2,
+    "reasoning": "T3/T4: Minor gap issue, the tests are correctly applied and written, no inconsistencies and no hidden requirements, approvable"
+   }
+  },
+  "internalNotes": null,
+  "otherNotes": null,
+  "otherNotesTags": null,
+  "outcome": "approved",
+  "overallQuality": 2.6666666666666665,
+  "qualityScore": 6,
+  "reasoning": null,
+  "reviewFormatVersion": 2,
+  "reviewId": "m57emyj5p45dtws3gpn9zyrwr18gsj46",
+  "reviewerName": "Augusto Pontes",
+  "submittedAt": 1792652245935,
+  "versionNumber": 1,
+  "submittedAtIST": "2026-10-22T12:27:25.935000+05:30"
+ }
+]

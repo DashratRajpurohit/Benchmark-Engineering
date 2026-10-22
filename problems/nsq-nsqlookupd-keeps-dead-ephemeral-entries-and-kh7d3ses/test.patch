@@ -1,0 +1,1034 @@
+diff --git a/nsqd/lookupd_reply_rg5e1b_test.go b/nsqd/lookupd_reply_rg5e1b_test.go
+new file mode 100644
+index 0000000..d412fdd
+--- /dev/null
++++ b/nsqd/lookupd_reply_rg5e1b_test.go
+@@ -0,0 +1,136 @@
++//go:build lookupdreg
++
++package nsqd_test
++
++import (
++	"bufio"
++	"encoding/binary"
++	"fmt"
++	"io"
++	"log"
++	"math"
++	"net"
++	"net/http"
++	"os"
++	"os/exec"
++	"strings"
++	"testing"
++	"time"
++
++	"github.com/nsqio/nsq/internal/test"
++	"github.com/nsqio/nsq/nsqd"
++)
++
++const (
++	nsqdChildEnvRg5e1b   = "NSQD_CHILD_RG5E1B"
++	nsqdLookupdEnvRg5e1b = "NSQD_CHILD_LOOKUPD_RG5E1B"
++)
++
++// lookupdChildRg5e1b runs nsqd in a separate process so a crash in nsqd is
++// observed as a dead server rather than a dead test.
++func lookupdChildRg5e1b() {
++	dataPath, err := os.MkdirTemp("", "nsq-test-")
++	if err != nil {
++		fmt.Println("ERR", err)
++		os.Exit(1)
++	}
++	defer os.RemoveAll(dataPath)
++	opts := nsqd.NewOptions()
++	opts.Logger = log.New(io.Discard, "", 0)
++	opts.TCPAddress = "127.0.0.1:0"
++	opts.HTTPAddress = "127.0.0.1:0"
++	opts.HTTPSAddress = "127.0.0.1:0"
++	opts.DataPath = dataPath
++	opts.NSQLookupdTCPAddresses = []string{os.Getenv(nsqdLookupdEnvRg5e1b)}
++	n, err := nsqd.New(opts)
++	if err != nil {
++		fmt.Println("ERR", err)
++		os.Exit(1)
++	}
++	go func() { _ = n.Main() }()
++	fmt.Println("ADDR", n.RealHTTPAddr())
++	_, _ = io.Copy(io.Discard, os.Stdin)
++	n.Exit()
++}
++
++func TestNSQDSurvivesLookupdReplyWithBadSizeRg5e1b(t *testing.T) {
++	if os.Getenv(nsqdChildEnvRg5e1b) == "1" {
++		lookupdChildRg5e1b()
++		return
++	}
++
++	for _, size := range []int64{-1, math.MinInt32} {
++		t.Run(fmt.Sprint(size), func(t *testing.T) {
++			fake, err := net.Listen("tcp", "127.0.0.1:0")
++			test.Nil(t, err)
++			defer fake.Close()
++
++			cmd := exec.Command(os.Args[0], "-test.run=^TestNSQDSurvivesLookupdReplyWithBadSizeRg5e1b$")
++			cmd.Env = append(os.Environ(), nsqdChildEnvRg5e1b+"=1", nsqdLookupdEnvRg5e1b+"="+fake.Addr().String())
++			stdin, err := cmd.StdinPipe()
++			test.Nil(t, err)
++			stdout, err := cmd.StdoutPipe()
++			test.Nil(t, err)
++			cmd.Stderr = io.Discard
++			test.Nil(t, cmd.Start())
++			exited := make(chan struct{})
++			go func() {
++				_ = cmd.Wait()
++				close(exited)
++			}()
++			defer func() {
++				_ = stdin.Close()
++				select {
++				case <-exited:
++				case <-time.After(10 * time.Second):
++					_ = cmd.Process.Kill()
++					<-exited
++				}
++			}()
++
++			var httpAddr string
++			scanner := bufio.NewScanner(stdout)
++			for scanner.Scan() {
++				if n, _ := fmt.Sscanf(scanner.Text(), "ADDR %s", &httpAddr); n == 1 {
++					break
++				}
++			}
++			if httpAddr == "" {
++				t.Fatal("nsqd child did not start")
++			}
++			go func() { _, _ = io.Copy(io.Discard, stdout) }()
++
++			// act as nsqlookupd: take the connection and IDENTIFY, then answer
++			// with a frame whose size field is not a usable length
++			test.Nil(t, fake.(*net.TCPListener).SetDeadline(time.Now().Add(5*time.Second)))
++			conn, err := fake.Accept()
++			test.Nil(t, err)
++			defer conn.Close()
++			test.Nil(t, conn.SetDeadline(time.Now().Add(5*time.Second)))
++			r := bufio.NewReader(conn)
++			magic := make([]byte, 4)
++			_, err = io.ReadFull(r, magic)
++			test.Nil(t, err)
++			test.Equal(t, "  V1", string(magic))
++			line, err := r.ReadString('\n')
++			test.Nil(t, err)
++			test.Equal(t, "IDENTIFY", strings.TrimSpace(line))
++			var bodyLen int32
++			test.Nil(t, binary.Read(r, binary.BigEndian, &bodyLen))
++			_, err = io.CopyN(io.Discard, r, int64(bodyLen))
++			test.Nil(t, err)
++			test.Nil(t, binary.Write(conn, binary.BigEndian, int32(size)))
++
++			// nsqd gives up on this lookupd connection and keeps serving
++			_, err = r.ReadByte()
++			if err != io.EOF {
++				t.Fatalf("nsqd did not close the lookupd connection (%v)", err)
++			}
++			client := &http.Client{Timeout: 5 * time.Second}
++			resp, err := client.Get("http://" + httpAddr + "/ping")
++			test.Nil(t, err)
++			resp.Body.Close()
++			test.Equal(t, 200, resp.StatusCode)
++		})
++	}
++}
+diff --git a/nsqlookupd/registry_rg5e1b_test.go b/nsqlookupd/registry_rg5e1b_test.go
+new file mode 100644
+index 0000000..8ddd6a3
+--- /dev/null
++++ b/nsqlookupd/registry_rg5e1b_test.go
+@@ -0,0 +1,805 @@
++//go:build lookupdreg
++
++package nsqlookupd_test
++
++import (
++	"bufio"
++	"bytes"
++	"encoding/binary"
++	"encoding/json"
++	"fmt"
++	"io"
++	"log"
++	"math"
++	"net"
++	"net/http"
++	"net/url"
++	"os"
++	"os/exec"
++	"runtime"
++	"sort"
++	"strings"
++	"sync"
++	"testing"
++	"time"
++
++	"github.com/nsqio/go-nsq"
++	"github.com/nsqio/nsq/internal/test"
++	"github.com/nsqio/nsq/nsqlookupd"
++)
++
++const lookupdChildEnvRg5e1b = "NSQLOOKUPD_CHILD_RG5E1B"
++
++type lookupdRg5e1b struct {
++	tcpAddr  string
++	httpAddr string
++}
++
++func startLookupdRg5e1b(t *testing.T, inactive time.Duration) *lookupdRg5e1b {
++	t.Helper()
++	opts := nsqlookupd.NewOptions()
++	opts.Logger = test.NewTestLogger(t)
++	opts.TCPAddress = "127.0.0.1:0"
++	opts.HTTPAddress = "127.0.0.1:0"
++	if inactive > 0 {
++		opts.InactiveProducerTimeout = inactive
++	}
++	l, err := nsqlookupd.New(opts)
++	test.Nil(t, err)
++	go func() { _ = l.Main() }()
++	t.Cleanup(l.Exit)
++	return &lookupdRg5e1b{tcpAddr: l.RealTCPAddr().String(), httpAddr: l.RealHTTPAddr().String()}
++}
++
++// peerRg5e1b is a connection that talks to nsqlookupd the way an nsqd does.
++type peerRg5e1b struct {
++	t    *testing.T
++	conn net.Conn
++}
++
++func dialRg5e1b(t *testing.T, l *lookupdRg5e1b) *peerRg5e1b {
++	t.Helper()
++	conn, err := net.DialTimeout("tcp", l.tcpAddr, time.Second)
++	test.Nil(t, err)
++	t.Cleanup(func() { _ = conn.Close() })
++	_, err = conn.Write(nsq.MagicV1)
++	test.Nil(t, err)
++	return &peerRg5e1b{t: t, conn: conn}
++}
++
++func joinRg5e1b(t *testing.T, l *lookupdRg5e1b, broadcast string, httpPort int) *peerRg5e1b {
++	t.Helper()
++	p := dialRg5e1b(t, l)
++	cmd, err := nsq.Identify(map[string]interface{}{
++		"broadcast_address": broadcast,
++		"hostname":          broadcast,
++		"tcp_port":          httpPort - 1,
++		"http_port":         httpPort,
++		"version":           "1.3.0",
++	})
++	test.Nil(t, err)
++	resp := p.send(cmd)
++	if strings.HasPrefix(resp, "E_") {
++		t.Fatalf("IDENTIFY as %s rejected: %s", broadcast, resp)
++	}
++	return p
++}
++
++func (p *peerRg5e1b) send(cmd *nsq.Command) string {
++	p.t.Helper()
++	test.Nil(p.t, p.conn.SetDeadline(time.Now().Add(5*time.Second)))
++	_, err := cmd.WriteTo(p.conn)
++	test.Nil(p.t, err)
++	resp, err := nsq.ReadResponse(p.conn)
++	if err != nil {
++		p.t.Fatalf("%s: no response - %s", cmd, err)
++	}
++	return string(resp)
++}
++
++func (p *peerRg5e1b) ok(cmd *nsq.Command) {
++	p.t.Helper()
++	if resp := p.send(cmd); resp != "OK" {
++		p.t.Fatalf("%s: got %q, want OK", cmd, resp)
++	}
++}
++
++func getRg5e1b(t *testing.T, l *lookupdRg5e1b, path string, v interface{}) int {
++	t.Helper()
++	return doRg5e1b(t, "GET", "http://"+l.httpAddr+path, v)
++}
++
++func postRg5e1b(t *testing.T, l *lookupdRg5e1b, path string) int {
++	t.Helper()
++	return doRg5e1b(t, "POST", "http://"+l.httpAddr+path, nil)
++}
++
++func doRg5e1b(t *testing.T, method, endpoint string, v interface{}) int {
++	t.Helper()
++	req, err := http.NewRequest(method, endpoint, nil)
++	test.Nil(t, err)
++	req.Header.Set("Accept", "application/vnd.nsq; version=1.0")
++	client := &http.Client{Timeout: 5 * time.Second}
++	resp, err := client.Do(req)
++	test.Nil(t, err)
++	defer resp.Body.Close()
++	body, err := io.ReadAll(resp.Body)
++	test.Nil(t, err)
++	if v != nil && resp.StatusCode == 200 {
++		if err := json.Unmarshal(body, v); err != nil {
++			t.Fatalf("%s %s: decoding %q - %s", method, endpoint, body, err)
++		}
++	}
++	return resp.StatusCode
++}
++
++func topicsRg5e1b(t *testing.T, l *lookupdRg5e1b) []string {
++	t.Helper()
++	var doc struct {
++		Topics []string `json:"topics"`
++	}
++	test.Equal(t, 200, getRg5e1b(t, l, "/topics", &doc))
++	sort.Strings(doc.Topics)
++	if doc.Topics == nil {
++		doc.Topics = []string{}
++	}
++	return doc.Topics
++}
++
++func channelsRg5e1b(t *testing.T, l *lookupdRg5e1b, topic string) []string {
++	t.Helper()
++	var doc struct {
++		Channels []string `json:"channels"`
++	}
++	test.Equal(t, 200, getRg5e1b(t, l, "/channels?topic="+url.QueryEscape(topic), &doc))
++	sort.Strings(doc.Channels)
++	if doc.Channels == nil {
++		doc.Channels = []string{}
++	}
++	return doc.Channels
++}
++
++type nodeRg5e1b struct {
++	BroadcastAddress string   `json:"broadcast_address"`
++	HTTPPort         int      `json:"http_port"`
++	Topics           []string `json:"topics"`
++	Tombstones       []bool   `json:"tombstones"`
++}
++
++func nodesRg5e1b(t *testing.T, l *lookupdRg5e1b) []nodeRg5e1b {
++	t.Helper()
++	var doc struct {
++		Producers []nodeRg5e1b `json:"producers"`
++	}
++	test.Equal(t, 200, getRg5e1b(t, l, "/nodes", &doc))
++	return doc.Producers
++}
++
++// lookupRg5e1b returns the status of /lookup and the broadcast addresses it lists.
++func lookupRg5e1b(t *testing.T, l *lookupdRg5e1b, topic string) (int, []string) {
++	t.Helper()
++	var doc struct {
++		Producers []struct {
++			BroadcastAddress string `json:"broadcast_address"`
++		} `json:"producers"`
++	}
++	status := getRg5e1b(t, l, "/lookup?topic="+url.QueryEscape(topic), &doc)
++	addrs := []string{}
++	for _, p := range doc.Producers {
++		addrs = append(addrs, p.BroadcastAddress)
++	}
++	sort.Strings(addrs)
++	return status, addrs
++}
++
++// leaveRg5e1b closes the peer and waits until nsqlookupd has finished handling
++// the disconnect, which is when the node is no longer listed by /nodes.
++func leaveRg5e1b(t *testing.T, l *lookupdRg5e1b, p *peerRg5e1b, broadcast string) {
++	t.Helper()
++	_ = p.conn.Close()
++	deadline := time.Now().Add(5 * time.Second)
++	for {
++		listed := false
++		for _, n := range nodesRg5e1b(t, l) {
++			if n.BroadcastAddress == broadcast {
++				listed = true
++			}
++		}
++		if !listed {
++			return
++		}
++		if time.Now().After(deadline) {
++			t.Fatalf("node %s still listed 5s after its connection closed", broadcast)
++		}
++		time.Sleep(10 * time.Millisecond)
++	}
++}
++
++func containsRg5e1b(list []string, s string) bool {
++	for _, v := range list {
++		if v == s {
++			return true
++		}
++	}
++	return false
++}
++
++func TestDisconnectForgetsEphemeralTopicRg5e1b(t *testing.T) {
++	l := startLookupdRg5e1b(t, 0)
++	p := joinRg5e1b(t, l, "10.1.0.1", 4151)
++	p.ok(nsq.Register("live#ephemeral", "audit"))
++	p.ok(nsq.Register("live#ephemeral", "tail#ephemeral"))
++	p.ok(nsq.Register("keep", "billing"))
++
++	leaveRg5e1b(t, l, p, "10.1.0.1")
++
++	test.Equal(t, []string{"keep"}, topicsRg5e1b(t, l))
++	test.Equal(t, []string{}, channelsRg5e1b(t, l, "live#ephemeral"))
++	status, _ := lookupRg5e1b(t, l, "live#ephemeral")
++	test.Equal(t, 404, status)
++	test.Equal(t, []string{"billing"}, channelsRg5e1b(t, l, "keep"))
++}
++
++func TestDisconnectForgetsEphemeralChannelOfDurableTopicRg5e1b(t *testing.T) {
++	l := startLookupdRg5e1b(t, 0)
++	p := joinRg5e1b(t, l, "10.1.0.2", 4151)
++	p.ok(nsq.Register("orders", "audit#ephemeral"))
++	p.ok(nsq.Register("orders", "billing"))
++
++	leaveRg5e1b(t, l, p, "10.1.0.2")
++
++	test.Equal(t, []string{"orders"}, topicsRg5e1b(t, l))
++	test.Equal(t, []string{"billing"}, channelsRg5e1b(t, l, "orders"))
++}
++
++func TestEphemeralSharedByTwoNodesOutlivesFirstRg5e1b(t *testing.T) {
++	l := startLookupdRg5e1b(t, 0)
++	a := joinRg5e1b(t, l, "10.1.0.3", 4151)
++	b := joinRg5e1b(t, l, "10.1.0.4", 4151)
++	for _, p := range []*peerRg5e1b{a, b} {
++		p.ok(nsq.Register("fan#ephemeral", "x#ephemeral"))
++	}
++	a.ok(nsq.Register("fan#ephemeral", "replay"))
++
++	leaveRg5e1b(t, l, a, "10.1.0.3")
++
++	test.Equal(t, []string{"fan#ephemeral"}, topicsRg5e1b(t, l))
++	test.Equal(t, []string{"x#ephemeral"}, channelsRg5e1b(t, l, "fan#ephemeral"))
++	status, producers := lookupRg5e1b(t, l, "fan#ephemeral")
++	test.Equal(t, 200, status)
++	test.Equal(t, []string{"10.1.0.4"}, producers)
++
++	leaveRg5e1b(t, l, b, "10.1.0.4")
++
++	test.Equal(t, []string{}, topicsRg5e1b(t, l))
++	test.Equal(t, []string{}, channelsRg5e1b(t, l, "fan#ephemeral"))
++}
++
++// registerManyRg5e1b pipelines a REGISTER for every topic and reads the replies.
++func registerManyRg5e1b(t *testing.T, p *peerRg5e1b, topics []string) error {
++	return pipelineRg5e1b(p, topics, func(topic string) *nsq.Command { return nsq.Register(topic, "c") })
++}
++
++// unregisterManyRg5e1b pipelines an UNREGISTER of every topic and reads the replies.
++func unregisterManyRg5e1b(t *testing.T, p *peerRg5e1b, topics []string) error {
++	return pipelineRg5e1b(p, topics, func(topic string) *nsq.Command { return nsq.UnRegister(topic, "") })
++}
++
++func pipelineRg5e1b(p *peerRg5e1b, topics []string, command func(string) *nsq.Command) error {
++	var buf bytes.Buffer
++	for _, topic := range topics {
++		_, _ = command(topic).WriteTo(&buf)
++	}
++	if err := p.conn.SetDeadline(time.Now().Add(20 * time.Second)); err != nil {
++		return err
++	}
++	written := make(chan error, 1)
++	go func() {
++		_, err := p.conn.Write(buf.Bytes())
++		written <- err
++	}()
++	for range topics {
++		resp, err := nsq.ReadResponse(p.conn)
++		if err != nil {
++			return err
++		}
++		if string(resp) != "OK" {
++			return fmt.Errorf("got %q, want OK", resp)
++		}
++	}
++	return <-written
++}
++
++func TestEphemeralKeptWhileAnotherNodeStillHasItRg5e1b(t *testing.T) {
++	// the registry is shared by every connection, so run them in parallel
++	defer runtime.GOMAXPROCS(runtime.GOMAXPROCS(8))
++	l := startLookupdRg5e1b(t, 0)
++
++	for round := 0; round < 30; round++ {
++		topics := make([]string, 1500)
++		for i := range topics {
++			topics[i] = fmt.Sprintf("r%d-%d#ephemeral", round, i)
++		}
++		leaving := fmt.Sprintf("10.2.%d.1", round)
++		a := joinRg5e1b(t, l, leaving, 4151)
++		test.Nil(t, registerManyRg5e1b(t, a, topics))
++
++		// while one node leaves, others register the same ephemeral topics
++		var stayers []*peerRg5e1b
++		for j := 0; j < 3; j++ {
++			stayers = append(stayers, joinRg5e1b(t, l, fmt.Sprintf("10.2.%d.%d", round, j+2), 4151))
++		}
++		stopReads := make(chan struct{})
++		readsDone := make(chan struct{})
++		go func() {
++			defer close(readsDone)
++			for {
++				select {
++				case <-stopReads:
++					return
++				default:
++					doRg5e1b(t, "GET", "http://"+l.httpAddr+"/topics", nil)
++				}
++			}
++		}()
++		errs := make(chan error, len(stayers))
++		for _, p := range stayers {
++			p := p
++			go func() { errs <- registerManyRg5e1b(t, p, topics) }()
++		}
++		_ = a.conn.Close()
++		for range stayers {
++			test.Nil(t, <-errs)
++		}
++		close(stopReads)
++		<-readsDone
++		leaveRg5e1b(t, l, a, leaving)
++
++		for _, n := range nodesRg5e1b(t, l) {
++			has := make(map[string]bool, len(n.Topics))
++			for _, topic := range n.Topics {
++				has[topic] = true
++			}
++			for _, topic := range topics {
++				if !has[topic] {
++					t.Fatalf("%s lost %s when %s left", n.BroadcastAddress, topic, leaving)
++				}
++			}
++		}
++
++		// once the last node with them is gone, so are the topics
++		for j, p := range stayers {
++			leaveRg5e1b(t, l, p, fmt.Sprintf("10.2.%d.%d", round, j+2))
++		}
++		deadline := time.Now().Add(5 * time.Second)
++		for {
++			listed := topicsRg5e1b(t, l)
++			if len(listed) == 0 {
++				break
++			}
++			if time.Now().After(deadline) {
++				t.Fatalf("round %d: %d topics still listed after every node that had them left", round, len(listed))
++			}
++			time.Sleep(10 * time.Millisecond)
++		}
++	}
++}
++
++func TestEphemeralKeptWhileAnotherNodeUnregistersItRg5e1b(t *testing.T) {
++	// the registry is shared by every connection, so run them in parallel
++	defer runtime.GOMAXPROCS(runtime.GOMAXPROCS(8))
++	l := startLookupdRg5e1b(t, 0)
++
++	for round := 0; round < 30; round++ {
++		topics := make([]string, 1500)
++		for i := range topics {
++			topics[i] = fmt.Sprintf("u%d-%d#ephemeral", round, i)
++		}
++		leaving := fmt.Sprintf("10.3.%d.1", round)
++		a := joinRg5e1b(t, l, leaving, 4151)
++		test.Nil(t, registerManyRg5e1b(t, a, topics))
++
++		// while one node unregisters the topics, others register the same ones
++		var stayers []*peerRg5e1b
++		for j := 0; j < 3; j++ {
++			stayers = append(stayers, joinRg5e1b(t, l, fmt.Sprintf("10.3.%d.%d", round, j+2), 4151))
++		}
++		stopReads := make(chan struct{})
++		readsDone := make(chan struct{})
++		go func() {
++			defer close(readsDone)
++			for {
++				select {
++				case <-stopReads:
++					return
++				default:
++					doRg5e1b(t, "GET", "http://"+l.httpAddr+"/topics", nil)
++				}
++			}
++		}()
++		// in small steps, so the nodes stay on the same topics
++		for start := 0; start < len(topics); start += 20 {
++			step := topics[start : start+20]
++			errs := make(chan error, len(stayers)+1)
++			go func() { errs <- unregisterManyRg5e1b(t, a, step) }()
++			for _, p := range stayers {
++				p := p
++				go func() { errs <- registerManyRg5e1b(t, p, step) }()
++			}
++			for i := 0; i < len(stayers)+1; i++ {
++				test.Nil(t, <-errs)
++			}
++		}
++		close(stopReads)
++		<-readsDone
++		leaveRg5e1b(t, l, a, leaving)
++
++		for _, n := range nodesRg5e1b(t, l) {
++			has := make(map[string]bool, len(n.Topics))
++			for _, topic := range n.Topics {
++				has[topic] = true
++			}
++			for _, topic := range topics {
++				if !has[topic] {
++					t.Fatalf("%s lost %s when %s unregistered it", n.BroadcastAddress, topic, leaving)
++				}
++			}
++		}
++
++		for j, p := range stayers {
++			leaveRg5e1b(t, l, p, fmt.Sprintf("10.3.%d.%d", round, j+2))
++		}
++		deadline := time.Now().Add(5 * time.Second)
++		for {
++			listed := topicsRg5e1b(t, l)
++			if len(listed) == 0 {
++				break
++			}
++			if time.Now().After(deadline) {
++				t.Fatalf("round %d: %d topics still listed after every node that had them left", round, len(listed))
++			}
++			time.Sleep(10 * time.Millisecond)
++		}
++	}
++}
++
++func TestTopicUnregisterForgetsEphemeralLeftoversRg5e1b(t *testing.T) {
++	l := startLookupdRg5e1b(t, 0)
++	p := joinRg5e1b(t, l, "10.1.0.5", 4151)
++	p.ok(nsq.Register("jobs", "scratch#ephemeral"))
++	p.ok(nsq.Register("jobs", "workers"))
++	p.ok(nsq.Register("burst#ephemeral", "sink"))
++
++	p.ok(nsq.UnRegister("jobs", ""))
++	p.ok(nsq.UnRegister("burst#ephemeral", ""))
++
++	test.Equal(t, []string{"jobs"}, topicsRg5e1b(t, l))
++	test.Equal(t, []string{"workers"}, channelsRg5e1b(t, l, "jobs"))
++	test.Equal(t, []string{}, channelsRg5e1b(t, l, "burst#ephemeral"))
++}
++
++// Topics and channels created over HTTP have no nsqd behind them. When an
++// nsqd unregisters one of those, it must not be kept either.
++func TestUnregisterForgetsEphemeralNobodyHasRg5e1b(t *testing.T) {
++	l := startLookupdRg5e1b(t, 0)
++	test.Equal(t, 200, postRg5e1b(t, l, "/channel/create?topic=orphan%23ephemeral&channel=side"))
++	test.Equal(t, 200, postRg5e1b(t, l, "/channel/create?topic=orphan%23ephemeral&channel=tail%23ephemeral"))
++	test.Equal(t, 200, postRg5e1b(t, l, "/topic/create?topic=loose%23ephemeral"))
++
++	p := joinRg5e1b(t, l, "10.1.0.6", 4151)
++	p.ok(nsq.UnRegister("orphan#ephemeral", "side"))
++	p.ok(nsq.UnRegister("orphan#ephemeral", "tail#ephemeral"))
++	p.ok(nsq.UnRegister("loose#ephemeral", ""))
++
++	test.Equal(t, false, containsRg5e1b(topicsRg5e1b(t, l), "loose#ephemeral"))
++	test.Equal(t, []string{}, channelsRg5e1b(t, l, "orphan#ephemeral"))
++}
++
++// pauseLoggerRg5e1b is an nsqlookupd logger that holds the goroutine logging
++// the first line mentioning mark until release is closed. nsqlookupd logs
++// each registration as it makes it, so this pauses the connection that
++// registered mark right after the registration.
++type pauseLoggerRg5e1b struct {
++	mark    string
++	paused  chan struct{}
++	release chan struct{}
++	once    sync.Once
++}
++
++func (l *pauseLoggerRg5e1b) Output(_ int, s string) error {
++	if strings.Contains(s, l.mark) {
++		l.once.Do(func() {
++			close(l.paused)
++			<-l.release
++		})
++	}
++	return nil
++}
++
++// A node that has gone longer than --inactive-producer-timeout without a PING
++// is dead, however much else it sends. The node here stops pinging and sends
++// a burst of REGISTERs for durable topics in one write. nsqlookupd is held
++// right after the first of them until the timeout has passed, with the rest
++// already read. That first topic was registered in time and, being durable,
++// stays; nothing may be registered for the node after the timeout.
++func TestNothingRegistersForANodePastItsTimeoutRg5e1b(t *testing.T) {
++	const timeout = time.Second
++	pause := &pauseLoggerRg5e1b{mark: "gate7q", paused: make(chan struct{}), release: make(chan struct{})}
++	opts := nsqlookupd.NewOptions()
++	opts.Logger = pause
++	opts.TCPAddress = "127.0.0.1:0"
++	opts.HTTPAddress = "127.0.0.1:0"
++	opts.InactiveProducerTimeout = timeout
++	nl, err := nsqlookupd.New(opts)
++	test.Nil(t, err)
++	go func() { _ = nl.Main() }()
++	t.Cleanup(nl.Exit)
++	defer func() {
++		select {
++		case <-pause.release:
++		default:
++			close(pause.release)
++		}
++	}()
++	l := &lookupdRg5e1b{tcpAddr: nl.RealTCPAddr().String(), httpAddr: nl.RealHTTPAddr().String()}
++
++	p := joinRg5e1b(t, l, "10.2.0.1", 4151)
++	joined := time.Now()
++	var burst bytes.Buffer
++	_, _ = nsq.Register("gate7q", "").WriteTo(&burst)
++	for i := 0; i < 20; i++ {
++		_, _ = nsq.Register(fmt.Sprintf("late%02d", i), "").WriteTo(&burst)
++	}
++	test.Nil(t, p.conn.SetDeadline(joined.Add(timeout+10*time.Second)))
++	_, err = p.conn.Write(burst.Bytes())
++	test.Nil(t, err)
++
++	select {
++	case <-pause.paused:
++	case <-time.After(timeout / 2):
++		t.Fatal("nsqlookupd did not register gate7q")
++	}
++	time.Sleep(time.Until(joined.Add(timeout + 200*time.Millisecond)))
++	close(pause.release)
++
++	// read whatever replies come until nsqlookupd drops the connection
++	for {
++		if _, err := nsq.ReadResponse(p.conn); err != nil {
++			break
++		}
++	}
++	test.Equal(t, []string{"gate7q"}, topicsRg5e1b(t, l))
++}
++
++func TestStarTopicIsNotAWildcardForReadsRg5e1b(t *testing.T) {
++	l := startLookupdRg5e1b(t, 0)
++	test.Equal(t, 200, postRg5e1b(t, l, "/channel/create?topic=alpha&channel=x"))
++	test.Equal(t, 200, postRg5e1b(t, l, "/channel/create?topic=beta&channel=y"))
++
++	test.Equal(t, 400, getRg5e1b(t, l, "/lookup?topic=*", nil))
++	test.Equal(t, 400, getRg5e1b(t, l, "/channels?topic=*", nil))
++	test.Equal(t, []string{"alpha", "beta"}, topicsRg5e1b(t, l))
++}
++
++func TestStarTopicIsNotAWildcardForWritesRg5e1b(t *testing.T) {
++	l := startLookupdRg5e1b(t, 0)
++	p := joinRg5e1b(t, l, "10.1.0.6", 4151)
++	p.ok(nsq.Register("alpha", "x"))
++	p.ok(nsq.Register("beta", "y"))
++
++	test.Equal(t, 400, postRg5e1b(t, l, "/topic/tombstone?topic=*&node=10.1.0.6:4151"))
++	test.Equal(t, 400, postRg5e1b(t, l, "/topic/delete?topic=*"))
++
++	test.Equal(t, []string{"alpha", "beta"}, topicsRg5e1b(t, l))
++	test.Equal(t, []string{"x"}, channelsRg5e1b(t, l, "alpha"))
++	test.Equal(t, []string{"y"}, channelsRg5e1b(t, l, "beta"))
++	for _, topic := range []string{"alpha", "beta"} {
++		status, producers := lookupRg5e1b(t, l, topic)
++		test.Equal(t, 200, status)
++		test.Equal(t, []string{"10.1.0.6"}, producers)
++	}
++}
++
++func TestTombstoneNamesIPv6NodeLikeNsqadminRg5e1b(t *testing.T) {
++	l := startLookupdRg5e1b(t, 0)
++	v6 := joinRg5e1b(t, l, "fd00::7", 4151)
++	v4 := joinRg5e1b(t, l, "10.1.0.7", 4151)
++	v6.ok(nsq.Register("metrics", "agg"))
++	v6.ok(nsq.Register("other", "agg"))
++	v4.ok(nsq.Register("metrics", "agg"))
++
++	v6Node := net.JoinHostPort("fd00::7", "4151")
++	test.Equal(t, 200, postRg5e1b(t, l, "/topic/tombstone?topic=metrics&node="+url.QueryEscape(v6Node)))
++
++	status, producers := lookupRg5e1b(t, l, "metrics")
++	test.Equal(t, 200, status)
++	test.Equal(t, []string{"10.1.0.7"}, producers)
++	status, producers = lookupRg5e1b(t, l, "other")
++	test.Equal(t, 200, status)
++	test.Equal(t, []string{"fd00::7"}, producers)
++
++	for _, n := range nodesRg5e1b(t, l) {
++		if n.BroadcastAddress != "fd00::7" {
++			continue
++		}
++		for i, topic := range n.Topics {
++			test.Equal(t, topic == "metrics", n.Tombstones[i])
++		}
++	}
++}
++
++// keepSendingRg5e1b writes cmd n times back to back every interval until stop
++// is closed, reads the n responses, and reports the first failure, if any.
++func keepSendingRg5e1b(p *peerRg5e1b, cmd *nsq.Command, n int, interval time.Duration, stop chan struct{}) chan error {
++	done := make(chan error, 1)
++	go func() {
++		ticker := time.NewTicker(interval)
++		defer ticker.Stop()
++		for {
++			select {
++			case <-stop:
++				done <- nil
++				return
++			case <-ticker.C:
++			}
++			_ = p.conn.SetDeadline(time.Now().Add(5 * time.Second))
++			var batch bytes.Buffer
++			for i := 0; i < n; i++ {
++				_, _ = cmd.WriteTo(&batch)
++			}
++			if _, err := p.conn.Write(batch.Bytes()); err != nil {
++				done <- err
++				return
++			}
++			for i := 0; i < n; i++ {
++				if _, err := nsq.ReadResponse(p.conn); err != nil {
++					done <- err
++					return
++				}
++			}
++		}
++	}()
++	return done
++}
++
++func TestNodeThatStopsPingingIsForgottenRg5e1b(t *testing.T) {
++	const timeout = 500 * time.Millisecond
++	l := startLookupdRg5e1b(t, timeout)
++	start := time.Now()
++
++	quiet := joinRg5e1b(t, l, "10.1.0.8", 4151)
++	quiet.ok(nsq.Register("hush#ephemeral", "c"))
++	quiet.ok(nsq.Register("ledger", "c"))
++
++	// busy keeps talking to nsqlookupd, several commands at a time, but never
++	// with a PING
++	busy := joinRg5e1b(t, l, "10.1.0.11", 4151)
++	busy.ok(nsq.Register("busy#ephemeral", "c"))
++
++	chatty := joinRg5e1b(t, l, "10.1.0.9", 4151)
++	chatty.ok(nsq.Register("chatter#ephemeral", "c"))
++
++	stop := make(chan struct{})
++	busyDone := keepSendingRg5e1b(busy, nsq.UnRegister("noise", ""), 3, 100*time.Millisecond, stop)
++	chattyDone := keepSendingRg5e1b(chatty, nsq.Ping(), 1, 100*time.Millisecond, stop)
++	defer func() {
++		select {
++		case <-stop:
++		default:
++			close(stop)
++		}
++	}()
++
++	// the nodes that stopped pinging lose their ephemeral entries, while the
++	// pinging node keeps its own for at least three inactive timeouts
++	deadline := start.Add(5 * time.Second)
++	forgotten := false
++	for !forgotten || time.Now().Before(start.Add(3*timeout)) {
++		topics := topicsRg5e1b(t, l)
++		if !containsRg5e1b(topics, "chatter#ephemeral") {
++			t.Fatalf("a node that keeps pinging lost its topic after %s", time.Since(start))
++		}
++		test.Equal(t, true, containsRg5e1b(topics, "ledger"))
++		forgotten = !containsRg5e1b(topics, "hush#ephemeral") && !containsRg5e1b(topics, "busy#ephemeral")
++		if !forgotten && time.Now().After(deadline) {
++			t.Fatalf("nodes without a PING for %s are still registered: %v", time.Since(start), topics)
++		}
++		time.Sleep(20 * time.Millisecond)
++	}
++
++	close(stop)
++	test.Nil(t, <-chattyDone)
++	<-busyDone
++	chatty.ok(nsq.Ping())
++	test.Equal(t, true, containsRg5e1b(topicsRg5e1b(t, l), "chatter#ephemeral"))
++}
++
++// identifyChildRg5e1b runs nsqlookupd in a separate process so a crash while
++// handling a connection is observed as a dead server rather than a dead test.
++func identifyChildRg5e1b() {
++	opts := nsqlookupd.NewOptions()
++	opts.TCPAddress = "127.0.0.1:0"
++	opts.HTTPAddress = "127.0.0.1:0"
++	opts.Logger = log.New(io.Discard, "", 0)
++	l, err := nsqlookupd.New(opts)
++	if err != nil {
++		fmt.Println("ERR", err)
++		os.Exit(1)
++	}
++	go func() { _ = l.Main() }()
++	fmt.Println("ADDR", l.RealTCPAddr(), l.RealHTTPAddr())
++	_, _ = io.Copy(io.Discard, os.Stdin)
++	os.Exit(0)
++}
++
++func TestIdentifyWithBadBodySizeIsRefusedRg5e1b(t *testing.T) {
++	if os.Getenv(lookupdChildEnvRg5e1b) == "1" {
++		identifyChildRg5e1b()
++		return
++	}
++
++	cmd := exec.Command(os.Args[0], "-test.run=^TestIdentifyWithBadBodySizeIsRefusedRg5e1b$")
++	cmd.Env = append(os.Environ(), lookupdChildEnvRg5e1b+"=1")
++	stdin, err := cmd.StdinPipe()
++	test.Nil(t, err)
++	stdout, err := cmd.StdoutPipe()
++	test.Nil(t, err)
++	cmd.Stderr = io.Discard
++	test.Nil(t, cmd.Start())
++	exited := make(chan struct{})
++	go func() {
++		_ = cmd.Wait()
++		close(exited)
++	}()
++	t.Cleanup(func() {
++		_ = stdin.Close()
++		select {
++		case <-exited:
++		case <-time.After(5 * time.Second):
++			_ = cmd.Process.Kill()
++			<-exited
++		}
++	})
++
++	var tcpAddr, httpAddr string
++	scanner := bufio.NewScanner(stdout)
++	for scanner.Scan() {
++		if n, _ := fmt.Sscanf(scanner.Text(), "ADDR %s %s", &tcpAddr, &httpAddr); n == 2 {
++			break
++		}
++	}
++	if httpAddr == "" {
++		t.Fatal("nsqlookupd child did not start")
++	}
++	go func() { _, _ = io.Copy(io.Discard, stdout) }()
++	l := &lookupdRg5e1b{tcpAddr: tcpAddr, httpAddr: httpAddr}
++
++	for _, size := range []int64{0, -1, math.MinInt32, 64 << 20} {
++		p := dialRg5e1b(t, l)
++		_, err := p.conn.Write([]byte("IDENTIFY\n"))
++		test.Nil(t, err)
++		test.Nil(t, binary.Write(p.conn, binary.BigEndian, int32(size)))
++
++		test.Nil(t, p.conn.SetReadDeadline(time.Now().Add(3*time.Second)))
++		resp, err := nsq.ReadResponse(p.conn)
++		if err != nil {
++			t.Fatalf("IDENTIFY with body size %d: no error response - %s", size, err)
++		}
++		if !strings.HasPrefix(string(resp), "E_BAD_BODY") {
++			t.Fatalf("IDENTIFY with body size %d: got %q, want E_BAD_BODY", size, resp)
++		}
++		_, err = p.conn.Read(make([]byte, 1))
++		if err != io.EOF {
++			t.Fatalf("IDENTIFY with body size %d: connection left open (%v)", size, err)
++		}
++	}
++
++	select {
++	case <-exited:
++		t.Fatal("nsqlookupd exited")
++	default:
++	}
++	p := joinRg5e1b(t, l, "10.1.0.10", 4151)
++	p.ok(nsq.Register("after", ""))
++	test.Equal(t, []string{"after"}, topicsRg5e1b(t, l))
++}
+diff --git a/test.sh b/test.sh
+index 5874b6a..d4d6b28 100755
+--- a/test.sh
++++ b/test.sh
+@@ -1,6 +1,76 @@
+ #!/bin/sh
+ set -e
+ 
++# ./test.sh [--output_path <junit.xml>] base|new runs one test set and exits.
++# base runs the existing tests of the packages listed below; new runs only the
++# tests in files behind the lookupdreg build tag. Without arguments the
++# repository's CI checks below run as before.
++if [ "$#" -gt 0 ]; then
++    OUTPUT_PATH=""
++    MODE=""
++    while [ "$#" -gt 0 ]; do
++        case "$1" in
++            --output_path)
++                if [ "$#" -lt 2 ] || [ -z "$2" ]; then
++                    echo "--output_path needs a file path" >&2
++                    exit 2
++                fi
++                OUTPUT_PATH="$2"
++                shift 2
++                ;;
++            base|new)
++                if [ -n "$MODE" ]; then
++                    echo "mode given more than once: $MODE and $1" >&2
++                    exit 2
++                fi
++                MODE="$1"
++                shift
++                ;;
++            *)
++                echo "usage: ./test.sh [--output_path <junit.xml>] [base|new]" >&2
++                exit 2
++                ;;
++        esac
++    done
++    if [ -z "$MODE" ]; then
++        echo "a mode is required: base or new" >&2
++        exit 2
++    fi
++    case "$OUTPUT_PATH" in
++        "" | /*) ;;
++        *) OUTPUT_PATH="$PWD/$OUTPUT_PATH" ;;
++    esac
++    [ -f go.mod ] || cd "$(dirname "$0")"
++
++    case "$MODE" in
++        base)
++            set -- -timeout 600s ./nsqlookupd/... ./nsqd/... ./nsqadmin/... \
++                ./apps/nsqlookupd/... ./apps/nsqd/...
++            ;;
++        new)
++            files=$(grep -rl --include='*_test.go' '^//go:build lookupdreg$' .)
++            tests=$(sed -n 's/^func \(Test[A-Za-z0-9_]*\)(t \*testing\.T) {$/\1/p' $files | paste -sd '|' -)
++            set -- -tags lookupdreg -timeout 300s -run "^($tests)\$" \
++                $(for f in $files; do dirname "$f"; done | sort -u)
++            ;;
++    esac
++
++    TEST_LOG="$(mktemp)"
++    STATUS=0
++    go test -count=1 -v "$@" >"$TEST_LOG" 2>&1 || STATUS=$?
++    cat "$TEST_LOG"
++
++    if [ -n "$OUTPUT_PATH" ]; then
++        junit_status=0
++        go-junit-report -set-exit-code <"$TEST_LOG" >"$OUTPUT_PATH" || junit_status=$?
++        if [ "$junit_status" -ne 0 ] && [ "$STATUS" -eq 0 ]; then
++            echo "go-junit-report failed to convert the test log (exit $junit_status)" >&2
++            STATUS=$junit_status
++        fi
++    fi
++    exit "$STATUS"
++fi
++
+ GOMAXPROCS=1 go test -vet=all -timeout 90s ./...
+ 
+ if [ "$GOARCH" = "amd64" ] || [ "$GOARCH" = "arm64" ]; then

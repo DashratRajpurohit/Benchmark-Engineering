@@ -1,0 +1,17 @@
+{
+  "problemId": "kh7d3sesjpf5dgzht8cexe573s8fcm9h",
+  "title": "nsqlookupd keeps dead ephemeral entries and trusts malformed input",
+  "status": "finalizing_review",
+  "version": 1,
+  "versionId": "kd7assrhakk8t0z1ja9pmqm47s8grh6c",
+  "isLocked": true,
+  "language": "go",
+  "difficulty": null,
+  "category": "bugfix",
+  "repoUrl": "https://github.com/nsqio/nsq",
+  "commitHash": "85cf10c09c6c3c86160d6f0eb156f62d0efc1648",
+  "githubIssueUrl": null,
+  "estimatedLOC": null,
+  "testOutputMode": null,
+  "downloadedAt": "2026-10-24T17:09:47.930Z"
+}
