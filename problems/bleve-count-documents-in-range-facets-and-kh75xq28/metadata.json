@@ -1,0 +1,17 @@
+{
+  "problemId": "kh75xq28nm3feybtmqrq4agdzx8g9750",
+  "title": "Count documents in range facets and show readable values in number and date term facets",
+  "status": "draft",
+  "version": 1,
+  "versionId": "kd78fjbmkbk68jvzva2qsc8bg18g9hrg",
+  "isLocked": false,
+  "language": "go",
+  "difficulty": null,
+  "category": "bugfix",
+  "repoUrl": "https://github.com/blevesearch/bleve",
+  "commitHash": "6abe37307eb4a902d29bc472d39c23bc1bb90a79",
+  "githubIssueUrl": null,
+  "estimatedLOC": null,
+  "testOutputMode": null,
+  "downloadedAt": "2026-10-24T17:09:55.421Z"
+}

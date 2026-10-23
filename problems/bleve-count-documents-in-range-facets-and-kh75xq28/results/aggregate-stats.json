@@ -1,0 +1,31 @@
+{
+ "byAgent": {
+  "antigravity": {
+   "passed": 0,
+   "total": 1
+  },
+  "codex_cli": {
+   "medianLOC": 815,
+   "medianMessages": 53,
+   "passed": 1,
+   "total": 1
+  }
+ },
+ "byModel": {
+  "gemini-4-argon": {
+   "passed": 0,
+   "total": 1
+  },
+  "openai/gpt-6.1-sol": {
+   "medianLOC": 815,
+   "medianMessages": 53,
+   "passed": 1,
+   "total": 1
+  }
+ },
+ "medianLocOverall": 815,
+ "medianMessagesOverall": 53,
+ "passedRuns": 1,
+ "totalRuns": 2,
+ "updatedAt": 1792736489390
+}

@@ -1,0 +1,1721 @@
+diff --git a/search/facet/facet_multivalue_test.go b/search/facet/facet_multivalue_test.go
+new file mode 100644
+index 0000000..96ef628
+--- /dev/null
++++ b/search/facet/facet_multivalue_test.go
+@@ -0,0 +1,385 @@
++//go:build Bv28feebas
++
++package facet_test
++
++import (
++	"fmt"
++	"os"
++	"testing"
++	"time"
++
++	"github.com/blevesearch/bleve/v2"
++	"github.com/blevesearch/bleve/v2/analysis/analyzer/keyword"
++	"github.com/blevesearch/bleve/v2/search"
++)
++
++func newTestIndex(t *testing.T) (bleve.Index, func()) {
++	t.Helper()
++	dir, err := os.MkdirTemp("", "bleve-facet-bas-*")
++	if err != nil {
++		t.Fatal(err)
++	}
++	idx, err := bleve.New(dir, bleve.NewIndexMapping())
++	if err != nil {
++		os.RemoveAll(dir)
++		t.Fatal(err)
++	}
++	return idx, func() { idx.Close(); os.RemoveAll(dir) }
++}
++
++func numericFacet(t *testing.T, idx bleve.Index, field string, size int,
++	ranges map[string][2]float64) *search.FacetResult {
++	t.Helper()
++	req := bleve.NewSearchRequest(bleve.NewMatchAllQuery())
++	fr := bleve.NewFacetRequest(field, size)
++	for name, b := range ranges {
++		lo, hi := b[0], b[1]
++		fr.AddNumericRange(name, &lo, &hi)
++	}
++	req.AddFacet("f", fr)
++	res, err := idx.Search(req)
++	if err != nil {
++		t.Fatal(err)
++	}
++	if res.Facets["f"] == nil {
++		t.Fatal("no facet result")
++	}
++	return res.Facets["f"]
++}
++
++func dateFacet(t *testing.T, idx bleve.Index, field string, size int,
++	ranges map[string][2]time.Time) *search.FacetResult {
++	t.Helper()
++	req := bleve.NewSearchRequest(bleve.NewMatchAllQuery())
++	fr := bleve.NewFacetRequest(field, size)
++	for name, b := range ranges {
++		fr.AddDateTimeRange(name, b[0], b[1])
++	}
++	req.AddFacet("f", fr)
++	res, err := idx.Search(req)
++	if err != nil {
++		t.Fatal(err)
++	}
++	if res.Facets["f"] == nil {
++		t.Fatal("no facet result")
++	}
++	return res.Facets["f"]
++}
++
++func numericCount(fr *search.FacetResult, name string) (int, bool) {
++	for _, r := range fr.NumericRanges {
++		if r.Name == name {
++			return r.Count, true
++		}
++	}
++	return 0, false
++}
++
++func dateCount(fr *search.FacetResult, name string) (int, bool) {
++	for _, r := range fr.DateRanges {
++		if r.Name == name {
++			return r.Count, true
++		}
++	}
++	return 0, false
++}
++
++// A document with a single value inside a range contributes one to that range.
++func TestNumericFacetSingleValueInRangeBv28fee(t *testing.T) {
++	idx, cleanup := newTestIndex(t)
++	defer cleanup()
++
++	b := idx.NewBatch()
++	b.Index("a", map[string]interface{}{"score": 1.0})
++	b.Index("b", map[string]interface{}{"score": 3.0})
++	if err := idx.Batch(b); err != nil {
++		t.Fatal(err)
++	}
++
++	fr := numericFacet(t, idx, "score", 10, map[string][2]float64{"low": {0, 5}})
++	if got, ok := numericCount(fr, "low"); !ok || got != 2 {
++		t.Errorf("range low: got count %d (present=%v), want 2", got, ok)
++	}
++}
++
++// Values in two different ranges raise each of those ranges by one.
++func TestNumericFacetMultiValueDifferentRangesBv28fee(t *testing.T) {
++	idx, cleanup := newTestIndex(t)
++	defer cleanup()
++
++	b := idx.NewBatch()
++	b.Index("spread", map[string]interface{}{"score": []interface{}{1.0, 7.0}})
++	if err := idx.Batch(b); err != nil {
++		t.Fatal(err)
++	}
++
++	fr := numericFacet(t, idx, "score", 10,
++		map[string][2]float64{"low": {0, 5}, "high": {5, 10}})
++	for _, name := range []string{"low", "high"} {
++		if got, ok := numericCount(fr, name); !ok || got != 1 {
++			t.Errorf("range %s: got count %d (present=%v), want 1", name, got, ok)
++		}
++	}
++}
++
++// A document without the faceted field is reported as missing.
++func TestNumericFacetAbsentFieldIsMissingBv28fee(t *testing.T) {
++	idx, cleanup := newTestIndex(t)
++	defer cleanup()
++
++	b := idx.NewBatch()
++	b.Index("has", map[string]interface{}{"score": 1.0})
++	b.Index("hasnt", map[string]interface{}{"other": 1.0})
++	if err := idx.Batch(b); err != nil {
++		t.Fatal(err)
++	}
++
++	fr := numericFacet(t, idx, "score", 10, map[string][2]float64{"low": {0, 5}})
++	if fr.Missing != 1 {
++		t.Errorf("missing: got %d, want 1", fr.Missing)
++	}
++}
++
++// Ranges are ordered by descending count, ties broken by name.
++func TestNumericFacetOrderingBv28fee(t *testing.T) {
++	idx, cleanup := newTestIndex(t)
++	defer cleanup()
++
++	b := idx.NewBatch()
++	for _, id := range []string{"p", "q", "r"} {
++		b.Index(id, map[string]interface{}{"score": 1.0})
++	}
++	b.Index("s", map[string]interface{}{"score": 7.0})
++	if err := idx.Batch(b); err != nil {
++		t.Fatal(err)
++	}
++
++	fr := numericFacet(t, idx, "score", 10,
++		map[string][2]float64{"low": {0, 5}, "high": {5, 10}})
++	if len(fr.NumericRanges) < 2 {
++		t.Fatalf("got %d ranges, want at least 2", len(fr.NumericRanges))
++	}
++	if fr.NumericRanges[0].Name != "low" {
++		t.Errorf("first range: got %q, want %q", fr.NumericRanges[0].Name, "low")
++	}
++}
++
++// A document with a single date inside a range contributes one to that range.
++func TestDateTimeFacetSingleValueInRangeBv28fee(t *testing.T) {
++	idx, cleanup := newTestIndex(t)
++	defer cleanup()
++
++	b := idx.NewBatch()
++	b.Index("a", map[string]interface{}{"when": time.Date(2020, 5, 1, 0, 0, 0, 0, time.UTC)})
++	if err := idx.Batch(b); err != nil {
++		t.Fatal(err)
++	}
++
++	fr := dateFacet(t, idx, "when", 10, map[string][2]time.Time{
++		"y2020": {time.Date(2020, 1, 1, 0, 0, 0, 0, time.UTC), time.Date(2021, 1, 1, 0, 0, 0, 0, time.UTC)},
++	})
++	if got, ok := dateCount(fr, "y2020"); !ok || got != 1 {
++		t.Errorf("range y2020: got count %d (present=%v), want 1", got, ok)
++	}
++}
++
++// Dates in two different ranges raise each of those ranges by one.
++func TestDateTimeFacetMultiValueDifferentRangesBv28fee(t *testing.T) {
++	idx, cleanup := newTestIndex(t)
++	defer cleanup()
++
++	b := idx.NewBatch()
++	b.Index("spread", map[string]interface{}{"when": []interface{}{
++		time.Date(2020, 5, 1, 0, 0, 0, 0, time.UTC),
++		time.Date(2022, 5, 1, 0, 0, 0, 0, time.UTC),
++	}})
++	if err := idx.Batch(b); err != nil {
++		t.Fatal(err)
++	}
++
++	fr := dateFacet(t, idx, "when", 10, map[string][2]time.Time{
++		"y2020": {time.Date(2020, 1, 1, 0, 0, 0, 0, time.UTC), time.Date(2021, 1, 1, 0, 0, 0, 0, time.UTC)},
++		"y2022": {time.Date(2022, 1, 1, 0, 0, 0, 0, time.UTC), time.Date(2023, 1, 1, 0, 0, 0, 0, time.UTC)},
++	})
++	for _, name := range []string{"y2020", "y2022"} {
++		if got, ok := dateCount(fr, name); !ok || got != 1 {
++			t.Errorf("range %s: got count %d (present=%v), want 1", name, got, ok)
++		}
++	}
++}
++
++// The start of a date range is inside it and the end is outside it.
++func TestDateTimeFacetBoundariesBv28fee(t *testing.T) {
++	idx, cleanup := newTestIndex(t)
++	defer cleanup()
++
++	start := time.Date(2021, 1, 1, 0, 0, 0, 0, time.UTC)
++	end := time.Date(2022, 1, 1, 0, 0, 0, 0, time.UTC)
++
++	b := idx.NewBatch()
++	b.Index("atstart", map[string]interface{}{"when": start})
++	b.Index("atend", map[string]interface{}{"when": end})
++	if err := idx.Batch(b); err != nil {
++		t.Fatal(err)
++	}
++
++	fr := dateFacet(t, idx, "when", 10, map[string][2]time.Time{"y2021": {start, end}})
++	if got, ok := dateCount(fr, "y2021"); !ok || got != 1 {
++		t.Errorf("range y2021: got count %d (present=%v), want 1 (start inside, end outside)", got, ok)
++	}
++}
++
++// A numeric range counts a value at its lower bound and leaves one at its upper bound out.
++func TestNumericFacetBoundariesBv28fee(t *testing.T) {
++	idx, cleanup := newTestIndex(t)
++	defer cleanup()
++
++	b := idx.NewBatch()
++	b.Index("atlow", map[string]interface{}{"score": 10.0})
++	b.Index("athigh", map[string]interface{}{"score": 20.0})
++	if err := idx.Batch(b); err != nil {
++		t.Fatal(err)
++	}
++
++	fr := numericFacet(t, idx, "score", 10,
++		map[string][2]float64{"r": {10, 20}, "s": {20, 30}})
++	if got, ok := numericCount(fr, "r"); !ok || got != 1 {
++		t.Errorf("range r [10,20): got count %d (present=%v), want 1", got, ok)
++	}
++	if got, ok := numericCount(fr, "s"); !ok || got != 1 {
++		t.Errorf("range s [20,30): got count %d (present=%v), want 1", got, ok)
++	}
++}
++
++// Trimming a datetime facet keeps the range with the highest count.
++func TestDateTimeFacetTrimKeepsTopRangeBv28fee(t *testing.T) {
++	idx, cleanup := newTestIndex(t)
++	defer cleanup()
++
++	b := idx.NewBatch()
++	for i, year := range []int{2020, 2021, 2021, 2022, 2022, 2022} {
++		b.Index(fmt.Sprintf("d%d", i), map[string]interface{}{
++			"when": time.Date(year, 6, 1, 0, 0, 0, 0, time.UTC)})
++	}
++	if err := idx.Batch(b); err != nil {
++		t.Fatal(err)
++	}
++
++	year := func(y int) [2]time.Time {
++		return [2]time.Time{
++			time.Date(y, 1, 1, 0, 0, 0, 0, time.UTC),
++			time.Date(y+1, 1, 1, 0, 0, 0, 0, time.UTC),
++		}
++	}
++	fr := dateFacet(t, idx, "when", 1, map[string][2]time.Time{
++		"y2020": year(2020), "y2021": year(2021), "y2022": year(2022),
++	})
++	if len(fr.DateRanges) != 1 {
++		t.Fatalf("got %d ranges, want 1", len(fr.DateRanges))
++	}
++	if fr.DateRanges[0].Name != "y2022" || fr.DateRanges[0].Count != 3 {
++		t.Errorf("kept %q with count %d, want \"y2022\" with count 3",
++			fr.DateRanges[0].Name, fr.DateRanges[0].Count)
++	}
++}
++
++// On a single index a term facet lists its top terms and puts the rest in Other.
++func TestTermFacetSingleIndexBv28fee(t *testing.T) {
++	idx, cleanup := newTestIndex(t)
++	defer cleanup()
++
++	b := idx.NewBatch()
++	for id, tags := range map[string][]string{
++		"d1": {"apple"}, "d2": {"apple"}, "d3": {"apple", "berry"}, "d4": {"cherry"},
++	} {
++		b.Index(id, map[string]interface{}{"tag": tags})
++	}
++	if err := idx.Batch(b); err != nil {
++		t.Fatal(err)
++	}
++
++	req := bleve.NewSearchRequest(bleve.NewMatchAllQuery())
++	req.AddFacet("t", bleve.NewFacetRequest("tag", 1))
++	res, err := idx.Search(req)
++	if err != nil {
++		t.Fatal(err)
++	}
++	g := res.Facets["t"]
++	if g == nil || len(g.Terms.Terms()) != 1 {
++		t.Fatalf("want one listed term, got %+v", g)
++	}
++	top := g.Terms.Terms()[0]
++	if top.Term != "apple" || top.Count != 3 {
++		t.Errorf("top term %s=%d, want apple=3", top.Term, top.Count)
++	}
++	if g.Total != 5 || g.Other != 2 {
++		t.Errorf("total %d other %d, want 5 and 2", g.Total, g.Other)
++	}
++}
++
++// Term facets count every nested object as a document of its own, and Missing
++// counts the hits that have no value at all.
++func TestTermFacetNestedObjectsAreDocumentsBv28fee(t *testing.T) {
++	dir, err := os.MkdirTemp("", "bleve-facet-nested-bas-*")
++	if err != nil {
++		t.Fatal(err)
++	}
++	defer os.RemoveAll(dir)
++	im := bleve.NewIndexMapping()
++	items := bleve.NewNestedDocumentMapping()
++	tag := bleve.NewTextFieldMapping()
++	tag.Analyzer = keyword.Name
++	items.AddFieldMappingsAt("tag", tag)
++	items.AddFieldMappingsAt("price", bleve.NewNumericFieldMapping())
++	im.DefaultMapping.AddSubDocumentMapping("items", items)
++	idx, err := bleve.New(dir, im)
++	if err != nil {
++		t.Fatal(err)
++	}
++	defer idx.Close()
++
++	b := idx.NewBatch()
++	docs := map[string]interface{}{
++		"r1": map[string]interface{}{"items": []interface{}{
++			map[string]interface{}{"tag": []interface{}{"apple", "apple"}},
++			map[string]interface{}{"tag": "apple"},
++			map[string]interface{}{"tag": "berry"},
++		}},
++		"r2": map[string]interface{}{"items": []interface{}{
++			map[string]interface{}{"tag": "apple"},
++		}},
++		"r3": map[string]interface{}{"name": "no items"},
++		"r4": map[string]interface{}{"items": []interface{}{
++			map[string]interface{}{"price": 1.0},
++		}},
++	}
++	for id, doc := range docs {
++		if err := b.Index(id, doc); err != nil {
++			t.Fatal(err)
++		}
++	}
++	if err := idx.Batch(b); err != nil {
++		t.Fatal(err)
++	}
++
++	req := bleve.NewSearchRequest(bleve.NewMatchAllQuery())
++	req.AddFacet("f", bleve.NewFacetRequest("items.tag", 10))
++	res, err := idx.Search(req)
++	if err != nil {
++		t.Fatal(err)
++	}
++	got := res.Facets["f"]
++	if got == nil {
++		t.Fatal("no facet result")
++	}
++	counts := map[string]int{}
++	for _, tf := range got.Terms.Terms() {
++		counts[tf.Term] = tf.Count
++	}
++	if counts["apple"] != 3 || counts["berry"] != 1 || len(counts) != 2 {
++		t.Errorf("terms: got %v, want apple:3 berry:1", counts)
++	}
++	if got.Missing != 2 {
++		t.Errorf("missing: got %d, want 2 (two hits have no tag at all)", got.Missing)
++	}
++}
+diff --git a/search/facet/facet_new_test.go b/search/facet/facet_new_test.go
+new file mode 100644
+index 0000000..3eb2460
+--- /dev/null
++++ b/search/facet/facet_new_test.go
+@@ -0,0 +1,1037 @@
++//go:build Bv28feenew
++
++package facet_test
++
++import (
++	"fmt"
++	"math"
++	"os"
++	"testing"
++	"time"
++
++	"github.com/blevesearch/bleve/v2"
++	"github.com/blevesearch/bleve/v2/analysis/analyzer/keyword"
++	"github.com/blevesearch/bleve/v2/search"
++)
++
++func newIdxNew(t *testing.T) (bleve.Index, func()) {
++	t.Helper()
++	dir, err := os.MkdirTemp("", "bleve-facet-new-*")
++	if err != nil {
++		t.Fatal(err)
++	}
++	idx, err := bleve.New(dir, bleve.NewIndexMapping())
++	if err != nil {
++		os.RemoveAll(dir)
++		t.Fatal(err)
++	}
++	return idx, func() { idx.Close(); os.RemoveAll(dir) }
++}
++
++func numFacetNew(t *testing.T, idx bleve.Index, size int,
++	ranges map[string][2]float64) *search.FacetResult {
++	t.Helper()
++	req := bleve.NewSearchRequest(bleve.NewMatchAllQuery())
++	fr := bleve.NewFacetRequest("score", size)
++	for name, b := range ranges {
++		lo, hi := b[0], b[1]
++		fr.AddNumericRange(name, &lo, &hi)
++	}
++	req.AddFacet("f", fr)
++	res, err := idx.Search(req)
++	if err != nil {
++		t.Fatal(err)
++	}
++	if res.Facets["f"] == nil {
++		t.Fatal("no facet result")
++	}
++	return res.Facets["f"]
++}
++
++func dateFacetNew(t *testing.T, idx bleve.Index, size int,
++	ranges map[string][2]time.Time) *search.FacetResult {
++	t.Helper()
++	req := bleve.NewSearchRequest(bleve.NewMatchAllQuery())
++	fr := bleve.NewFacetRequest("when", size)
++	for name, b := range ranges {
++		fr.AddDateTimeRange(name, b[0], b[1])
++	}
++	req.AddFacet("f", fr)
++	res, err := idx.Search(req)
++	if err != nil {
++		t.Fatal(err)
++	}
++	if res.Facets["f"] == nil {
++		t.Fatal("no facet result")
++	}
++	return res.Facets["f"]
++}
++
++func numCountNew(t *testing.T, fr *search.FacetResult, name string) int {
++	t.Helper()
++	for _, r := range fr.NumericRanges {
++		if r.Name == name {
++			return r.Count
++		}
++	}
++	t.Errorf("range %q is not present in the result", name)
++	return -1
++}
++
++func dateCountNew(t *testing.T, fr *search.FacetResult, name string) int {
++	t.Helper()
++	for _, r := range fr.DateRanges {
++		if r.Name == name {
++			return r.Count
++		}
++	}
++	t.Errorf("range %q is not present in the result", name)
++	return -1
++}
++
++// A range counts a document once however many of its values land inside it.
++func TestNumericFacetMultiValueSameRangeBv28fee(t *testing.T) {
++	idx, cleanup := newIdxNew(t)
++	defer cleanup()
++
++	b := idx.NewBatch()
++	b.Index("multi", map[string]interface{}{"score": []interface{}{2.0, 3.0, 4.0}})
++	b.Index("single", map[string]interface{}{"score": 1.0})
++	if err := idx.Batch(b); err != nil {
++		t.Fatal(err)
++	}
++
++	fr := numFacetNew(t, idx, 10, map[string][2]float64{"low": {0, 5}})
++	if got := numCountNew(t, fr, "low"); got != 2 {
++		t.Errorf("range low: got count %d, want 2 (two documents)", got)
++	}
++	if fr.Total != 2 {
++		t.Errorf("total: got %d, want 2 (two documents with a usable value)", fr.Total)
++	}
++}
++
++// A range the caller asked for is present even when nothing fell inside it.
++func TestNumericFacetEmptyRangeIsPresentBv28fee(t *testing.T) {
++	idx, cleanup := newIdxNew(t)
++	defer cleanup()
++
++	b := idx.NewBatch()
++	b.Index("a", map[string]interface{}{"score": 1.0})
++	if err := idx.Batch(b); err != nil {
++		t.Fatal(err)
++	}
++
++	fr := numFacetNew(t, idx, 10,
++		map[string][2]float64{"low": {0, 5}, "nothing": {500, 600}})
++	if got := numCountNew(t, fr, "nothing"); got != 0 {
++		t.Errorf("range nothing: got count %d, want 0", got)
++	}
++	if len(fr.NumericRanges) != 2 {
++		t.Errorf("got %d ranges in the result, want 2", len(fr.NumericRanges))
++	}
++}
++
++// A document whose value falls in no range is still counted in total and other.
++func TestNumericFacetOutsideEveryRangeBv28fee(t *testing.T) {
++	idx, cleanup := newIdxNew(t)
++	defer cleanup()
++
++	b := idx.NewBatch()
++	b.Index("in", map[string]interface{}{"score": 1.0})
++	b.Index("out1", map[string]interface{}{"score": 888.0})
++	b.Index("out2", map[string]interface{}{"score": 999.0})
++	if err := idx.Batch(b); err != nil {
++		t.Fatal(err)
++	}
++
++	fr := numFacetNew(t, idx, 10, map[string][2]float64{"low": {0, 5}})
++	if fr.Total != 3 {
++		t.Errorf("total: got %d, want 3 (every document has a usable value)", fr.Total)
++	}
++	if fr.Other != 2 {
++		t.Errorf("other: got %d, want 2 (two documents fell in no range)", fr.Other)
++	}
++	if fr.Missing != 0 {
++		t.Errorf("missing: got %d, want 0", fr.Missing)
++	}
++}
++
++// A document whose value cannot be read as a number is missing, not counted.
++func TestNumericFacetUnreadableValueIsMissingBv28fee(t *testing.T) {
++	idx, cleanup := newIdxNew(t)
++	defer cleanup()
++
++	b := idx.NewBatch()
++	b.Index("num", map[string]interface{}{"score": 1.0})
++	b.Index("text", map[string]interface{}{"score": "not a number"})
++	b.Index("absent", map[string]interface{}{"other": 1.0})
++	if err := idx.Batch(b); err != nil {
++		t.Fatal(err)
++	}
++
++	fr := numFacetNew(t, idx, 10, map[string][2]float64{"low": {0, 5}})
++	if fr.Missing != 2 {
++		t.Errorf("missing: got %d, want 2 (one unreadable value, one absent field)", fr.Missing)
++	}
++	if fr.Total != 1 {
++		t.Errorf("total: got %d, want 1 (only one document has a usable value)", fr.Total)
++	}
++}
++
++// Trimming the result to the requested size leaves the summary figures alone.
++func TestNumericFacetTrimKeepsTotalsBv28fee(t *testing.T) {
++	idx, cleanup := newIdxNew(t)
++	defer cleanup()
++
++	b := idx.NewBatch()
++	b.Index("d1", map[string]interface{}{"score": 1.0})
++	b.Index("d2", map[string]interface{}{"score": 3.0})
++	b.Index("d3", map[string]interface{}{"score": 5.0})
++	b.Index("d4", map[string]interface{}{"score": 100.0})
++	if err := idx.Batch(b); err != nil {
++		t.Fatal(err)
++	}
++
++	ranges := map[string][2]float64{"a": {0, 2}, "b": {2, 4}, "c": {4, 6}}
++	full := numFacetNew(t, idx, 10, ranges)
++	trimmed := numFacetNew(t, idx, 1, ranges)
++
++	if len(trimmed.NumericRanges) != 1 {
++		t.Errorf("trimmed result: got %d ranges, want 1", len(trimmed.NumericRanges))
++	}
++	if trimmed.Total != full.Total {
++		t.Errorf("total changed by trimming: got %d, want %d", trimmed.Total, full.Total)
++	}
++	if trimmed.Other != full.Other {
++		t.Errorf("other changed by trimming: got %d, want %d", trimmed.Other, full.Other)
++	}
++	if full.Total != 4 {
++		t.Errorf("total: got %d, want 4", full.Total)
++	}
++	if full.Other != 1 {
++		t.Errorf("other: got %d, want 1 (one document fell in no range)", full.Other)
++	}
++	if trimmed.Missing != full.Missing {
++		t.Errorf("missing changed by trimming: got %d, want %d", trimmed.Missing, full.Missing)
++	}
++}
++
++// A date range counts a document once however many of its dates land inside it.
++func TestDateTimeFacetMultiValueSameRangeBv28fee(t *testing.T) {
++	idx, cleanup := newIdxNew(t)
++	defer cleanup()
++
++	b := idx.NewBatch()
++	b.Index("multi", map[string]interface{}{"when": []interface{}{
++		time.Date(2020, 2, 1, 0, 0, 0, 0, time.UTC),
++		time.Date(2020, 8, 1, 0, 0, 0, 0, time.UTC),
++	}})
++	b.Index("single", map[string]interface{}{"when": time.Date(2020, 5, 1, 0, 0, 0, 0, time.UTC)})
++	if err := idx.Batch(b); err != nil {
++		t.Fatal(err)
++	}
++
++	fr := dateFacetNew(t, idx, 10, map[string][2]time.Time{
++		"y2020": {time.Date(2020, 1, 1, 0, 0, 0, 0, time.UTC), time.Date(2021, 1, 1, 0, 0, 0, 0, time.UTC)},
++	})
++	if got := dateCountNew(t, fr, "y2020"); got != 2 {
++		t.Errorf("range y2020: got count %d, want 2 (two documents)", got)
++	}
++	if fr.Total != 2 {
++		t.Errorf("total: got %d, want 2 (two documents with a usable value)", fr.Total)
++	}
++}
++
++// A date range the caller asked for is present even when nothing fell inside it.
++func TestDateTimeFacetEmptyRangeIsPresentBv28fee(t *testing.T) {
++	idx, cleanup := newIdxNew(t)
++	defer cleanup()
++
++	b := idx.NewBatch()
++	b.Index("a", map[string]interface{}{"when": time.Date(2020, 5, 1, 0, 0, 0, 0, time.UTC)})
++	if err := idx.Batch(b); err != nil {
++		t.Fatal(err)
++	}
++
++	fr := dateFacetNew(t, idx, 10, map[string][2]time.Time{
++		"y2020": {time.Date(2020, 1, 1, 0, 0, 0, 0, time.UTC), time.Date(2021, 1, 1, 0, 0, 0, 0, time.UTC)},
++		"y2099": {time.Date(2099, 1, 1, 0, 0, 0, 0, time.UTC), time.Date(2100, 1, 1, 0, 0, 0, 0, time.UTC)},
++	})
++	if got := dateCountNew(t, fr, "y2099"); got != 0 {
++		t.Errorf("range y2099: got count %d, want 0", got)
++	}
++	if len(fr.DateRanges) != 2 {
++		t.Errorf("got %d ranges in the result, want 2", len(fr.DateRanges))
++	}
++}
++
++// A document whose date falls in no range is still counted in total and other.
++func TestDateTimeFacetOutsideEveryRangeBv28fee(t *testing.T) {
++	idx, cleanup := newIdxNew(t)
++	defer cleanup()
++
++	b := idx.NewBatch()
++	b.Index("in", map[string]interface{}{"when": time.Date(2020, 5, 1, 0, 0, 0, 0, time.UTC)})
++	b.Index("old", map[string]interface{}{"when": time.Date(1990, 5, 1, 0, 0, 0, 0, time.UTC)})
++	b.Index("absent", map[string]interface{}{"other": 1.0})
++	if err := idx.Batch(b); err != nil {
++		t.Fatal(err)
++	}
++
++	fr := dateFacetNew(t, idx, 10, map[string][2]time.Time{
++		"y2020": {time.Date(2020, 1, 1, 0, 0, 0, 0, time.UTC), time.Date(2021, 1, 1, 0, 0, 0, 0, time.UTC)},
++	})
++	if fr.Total != 2 {
++		t.Errorf("total: got %d, want 2 (two documents have a usable date)", fr.Total)
++	}
++	if fr.Other != 1 {
++		t.Errorf("other: got %d, want 1 (one document fell in no range)", fr.Other)
++	}
++	if fr.Missing != 1 {
++		t.Errorf("missing: got %d, want 1 (one document has no date)", fr.Missing)
++	}
++}
++
++// Trimming a merged result from several indexes leaves the summary figures alone.
++func TestNumericFacetAliasTrimKeepsOtherBv28fee(t *testing.T) {
++	idxA, cleanupA := newIdxNew(t)
++	defer cleanupA()
++	idxB, cleanupB := newIdxNew(t)
++	defer cleanupB()
++
++	bA := idxA.NewBatch()
++	bA.Index("a1", map[string]interface{}{"score": 1.0})
++	bA.Index("a2", map[string]interface{}{"score": 1.5})
++	bA.Index("a3", map[string]interface{}{"score": 100.0})
++	if err := idxA.Batch(bA); err != nil {
++		t.Fatal(err)
++	}
++	bB := idxB.NewBatch()
++	bB.Index("b1", map[string]interface{}{"score": 5.0})
++	bB.Index("b2", map[string]interface{}{"score": 200.0})
++	if err := idxB.Batch(bB); err != nil {
++		t.Fatal(err)
++	}
++
++	alias := bleve.NewIndexAlias(idxA, idxB)
++	defer alias.Close()
++
++	run := func(size int) *search.FacetResult {
++		req := bleve.NewSearchRequest(bleve.NewMatchAllQuery())
++		fr := bleve.NewFacetRequest("score", size)
++		lo1, hi1 := 0.0, 2.0
++		lo2, hi2 := 4.0, 6.0
++		fr.AddNumericRange("low", &lo1, &hi1)
++		fr.AddNumericRange("mid", &lo2, &hi2)
++		req.AddFacet("f", fr)
++		res, err := alias.Search(req)
++		if err != nil {
++			t.Fatal(err)
++		}
++		if res.Facets["f"] == nil {
++			t.Fatal("no facet result")
++		}
++		return res.Facets["f"]
++	}
++
++	full := run(10)
++	trimmed := run(1)
++
++	if full.Total != 5 {
++		t.Errorf("total: got %d, want 5", full.Total)
++	}
++	if full.Other != 2 {
++		t.Errorf("other: got %d, want 2 (two documents fell in no range)", full.Other)
++	}
++	if trimmed.Other != full.Other {
++		t.Errorf("other changed by trimming the merged result: got %d, want %d",
++			trimmed.Other, full.Other)
++	}
++	if trimmed.Total != full.Total {
++		t.Errorf("total changed by trimming the merged result: got %d, want %d",
++			trimmed.Total, full.Total)
++	}
++}
++
++// Across an alias the global top range is kept, not each index's local winner.
++func TestNumericFacetAliasGlobalTopRangeBv28fee(t *testing.T) {
++	idxA, cleanupA := newIdxNew(t)
++	defer cleanupA()
++	idxB, cleanupB := newIdxNew(t)
++	defer cleanupB()
++
++	// range "a" spans both indexes with 3 + 3, while "b" and "c" sit
++	// entirely inside one index each with 4
++	add := func(idx bleve.Index, prefix string, score float64, n int) {
++		b := idx.NewBatch()
++		for i := 0; i < n; i++ {
++			b.Index(fmt.Sprintf("%s%d", prefix, i),
++				map[string]interface{}{"score": score})
++		}
++		if err := idx.Batch(b); err != nil {
++			t.Fatal(err)
++		}
++	}
++	add(idxA, "a_", 1.0, 3)
++	add(idxA, "b_", 11.0, 4)
++	add(idxB, "c_", 21.0, 4)
++	add(idxB, "d_", 1.0, 3)
++
++	alias := bleve.NewIndexAlias(idxA, idxB)
++	defer alias.Close()
++
++	req := bleve.NewSearchRequest(bleve.NewMatchAllQuery())
++	fr := bleve.NewFacetRequest("score", 1)
++	loA, hiA := 0.0, 10.0
++	loB, hiB := 10.0, 20.0
++	loC, hiC := 20.0, 30.0
++	fr.AddNumericRange("a", &loA, &hiA)
++	fr.AddNumericRange("b", &loB, &hiB)
++	fr.AddNumericRange("c", &loC, &hiC)
++	req.AddFacet("f", fr)
++	res, err := alias.Search(req)
++	if err != nil {
++		t.Fatal(err)
++	}
++	got := res.Facets["f"]
++	if got == nil {
++		t.Fatal("no facet result")
++	}
++	if len(got.NumericRanges) != 1 {
++		t.Fatalf("got %d ranges, want 1", len(got.NumericRanges))
++	}
++	if got.NumericRanges[0].Name != "a" {
++		t.Errorf("kept range %q with count %d, want \"a\" (6 across both indexes)",
++			got.NumericRanges[0].Name, got.NumericRanges[0].Count)
++	}
++	if got.NumericRanges[0].Count != 6 {
++		t.Errorf("range a: got count %d, want 6", got.NumericRanges[0].Count)
++	}
++}
++
++// Two ranges sharing bounds but named differently stay separate buckets.
++func TestNumericFacetAliasDistinctNamesSameBoundsBv28fee(t *testing.T) {
++	idxA, cleanupA := newIdxNew(t)
++	defer cleanupA()
++	idxB, cleanupB := newIdxNew(t)
++	defer cleanupB()
++
++	for _, c := range []struct {
++		idx bleve.Index
++		id  string
++	}{{idxA, "a1"}, {idxB, "b1"}} {
++		b := c.idx.NewBatch()
++		b.Index(c.id, map[string]interface{}{"score": 1.0})
++		if err := c.idx.Batch(b); err != nil {
++			t.Fatal(err)
++		}
++	}
++
++	alias := bleve.NewIndexAlias(idxA, idxB)
++	defer alias.Close()
++
++	req := bleve.NewSearchRequest(bleve.NewMatchAllQuery())
++	fr := bleve.NewFacetRequest("score", 10)
++	lo, hi := 0.0, 5.0
++	lo2, hi2 := 0.0, 5.0
++	fr.AddNumericRange("first", &lo, &hi)
++	fr.AddNumericRange("second", &lo2, &hi2)
++	req.AddFacet("f", fr)
++	res, err := alias.Search(req)
++	if err != nil {
++		t.Fatal(err)
++	}
++	got := res.Facets["f"]
++	if got == nil {
++		t.Fatal("no facet result")
++	}
++	if len(got.NumericRanges) != 2 {
++		t.Fatalf("got %d ranges, want 2 distinct named buckets", len(got.NumericRanges))
++	}
++	byName := map[string]int{}
++	for _, r := range got.NumericRanges {
++		byName[r.Name] = r.Count
++	}
++	for _, name := range []string{"first", "second"} {
++		count, ok := byName[name]
++		if !ok {
++			t.Errorf("range %q is not present in the result, got %v", name, byName)
++			continue
++		}
++		if count != 2 {
++			t.Errorf("range %q: got count %d, want 2", name, count)
++		}
++	}
++}
++
++// Overlapping ranges: a document counted in both still leaves Other correct.
++func TestNumericFacetOverlappingRangesBv28fee(t *testing.T) {
++	idx, cleanup := newIdxNew(t)
++	defer cleanup()
++
++	b := idx.NewBatch()
++	b.Index("both", map[string]interface{}{"score": 7.0})
++	b.Index("onlylow", map[string]interface{}{"score": 1.0})
++	b.Index("neither", map[string]interface{}{"score": 100.0})
++	b.Index("unusable", map[string]interface{}{"score": "not a number"})
++	if err := idx.Batch(b); err != nil {
++		t.Fatal(err)
++	}
++
++	fr := numFacetNew(t, idx, 10,
++		map[string][2]float64{"low": {0, 10}, "mid": {5, 15}})
++	if got := numCountNew(t, fr, "low"); got != 2 {
++		t.Errorf("range low: got count %d, want 2", got)
++	}
++	if got := numCountNew(t, fr, "mid"); got != 1 {
++		t.Errorf("range mid: got count %d, want 1", got)
++	}
++	if fr.Total != 3 {
++		t.Errorf("total: got %d, want 3", fr.Total)
++	}
++	if fr.Missing != 1 {
++		t.Errorf("missing: got %d, want 1", fr.Missing)
++	}
++	if fr.Other != 1 {
++		t.Errorf("other: got %d, want 1 (only the out of range document)", fr.Other)
++	}
++}
++
++// Trimming a datetime facet leaves the summary figures alone.
++func TestDateTimeFacetTrimKeepsTotalsBv28fee(t *testing.T) {
++	idx, cleanup := newIdxNew(t)
++	defer cleanup()
++
++	y := func(year int) time.Time { return time.Date(year, 6, 1, 0, 0, 0, 0, time.UTC) }
++	b := idx.NewBatch()
++	b.Index("d1", map[string]interface{}{"when": y(2020)})
++	b.Index("d2", map[string]interface{}{"when": y(2021)})
++	b.Index("d3", map[string]interface{}{"when": y(2022)})
++	b.Index("old", map[string]interface{}{"when": y(1990)})
++	b.Index("absent", map[string]interface{}{"other": 1.0})
++	if err := idx.Batch(b); err != nil {
++		t.Fatal(err)
++	}
++
++	bound := func(year int) [2]time.Time {
++		return [2]time.Time{
++			time.Date(year, 1, 1, 0, 0, 0, 0, time.UTC),
++			time.Date(year+1, 1, 1, 0, 0, 0, 0, time.UTC),
++		}
++	}
++	ranges := map[string][2]time.Time{
++		"y2020": bound(2020), "y2021": bound(2021), "y2022": bound(2022),
++	}
++	full := dateFacetNew(t, idx, 10, ranges)
++	trimmed := dateFacetNew(t, idx, 1, ranges)
++
++	if len(trimmed.DateRanges) != 1 {
++		t.Errorf("trimmed result: got %d ranges, want 1", len(trimmed.DateRanges))
++	}
++	if full.Total != 4 {
++		t.Errorf("total: got %d, want 4", full.Total)
++	}
++	if full.Other != 1 {
++		t.Errorf("other: got %d, want 1 (the 1990 document)", full.Other)
++	}
++	if full.Missing != 1 {
++		t.Errorf("missing: got %d, want 1 (the document with no date)", full.Missing)
++	}
++	if trimmed.Total != full.Total {
++		t.Errorf("total changed by trimming: got %d, want %d", trimmed.Total, full.Total)
++	}
++	if trimmed.Other != full.Other {
++		t.Errorf("other changed by trimming: got %d, want %d", trimmed.Other, full.Other)
++	}
++	if trimmed.Missing != full.Missing {
++		t.Errorf("missing changed by trimming: got %d, want %d", trimmed.Missing, full.Missing)
++	}
++}
++
++// A value that is not a real number is not a usable value.
++func TestNumericFacetNotARealNumberIsMissingBv28fee(t *testing.T) {
++	idx, cleanup := newIdxNew(t)
++	defer cleanup()
++
++	b := idx.NewBatch()
++	b.Index("ok", map[string]interface{}{"score": 1.0})
++	b.Index("notreal", map[string]interface{}{"score": math.NaN()})
++	b.Index("far", map[string]interface{}{"score": 999.0})
++	if err := idx.Batch(b); err != nil {
++		t.Fatal(err)
++	}
++
++	fr := numFacetNew(t, idx, 10, map[string][2]float64{"low": {0, 5}})
++	if got := numCountNew(t, fr, "low"); got != 1 {
++		t.Errorf("range low: got count %d, want 1", got)
++	}
++	if fr.Missing != 1 {
++		t.Errorf("missing: got %d, want 1 (the value that is not a real number)", fr.Missing)
++	}
++	if fr.Total != 2 {
++		t.Errorf("total: got %d, want 2", fr.Total)
++	}
++	if fr.Other != 1 {
++		t.Errorf("other: got %d, want 1 (only the out of range document)", fr.Other)
++	}
++}
++
++// Two datetime ranges sharing bounds but named differently stay separate across an alias.
++func TestDateTimeFacetAliasDistinctNamesSameBoundsBv28fee(t *testing.T) {
++	idxA, cleanupA := newIdxNew(t)
++	defer cleanupA()
++	idxB, cleanupB := newIdxNew(t)
++	defer cleanupB()
++
++	for _, c := range []struct {
++		idx bleve.Index
++		id  string
++	}{{idxA, "a1"}, {idxB, "b1"}} {
++		b := c.idx.NewBatch()
++		b.Index(c.id, map[string]interface{}{"when": time.Date(2020, 5, 1, 0, 0, 0, 0, time.UTC)})
++		if err := c.idx.Batch(b); err != nil {
++			t.Fatal(err)
++		}
++	}
++
++	alias := bleve.NewIndexAlias(idxA, idxB)
++	defer alias.Close()
++
++	req := bleve.NewSearchRequest(bleve.NewMatchAllQuery())
++	fr := bleve.NewFacetRequest("when", 10)
++	start := time.Date(2020, 1, 1, 0, 0, 0, 0, time.UTC)
++	end := time.Date(2021, 1, 1, 0, 0, 0, 0, time.UTC)
++	fr.AddDateTimeRange("first", start, end)
++	fr.AddDateTimeRange("second", start, end)
++	req.AddFacet("f", fr)
++	res, err := alias.Search(req)
++	if err != nil {
++		t.Fatal(err)
++	}
++	got := res.Facets["f"]
++	if got == nil {
++		t.Fatal("no facet result")
++	}
++	byName := map[string]int{}
++	for _, r := range got.DateRanges {
++		byName[r.Name] = r.Count
++	}
++	if len(got.DateRanges) != 2 {
++		t.Fatalf("got %d ranges %v, want 2 distinct named buckets", len(got.DateRanges), byName)
++	}
++	for _, name := range []string{"first", "second"} {
++		count, ok := byName[name]
++		if !ok {
++			t.Errorf("range %q is not present in the result, got %v", name, byName)
++			continue
++		}
++		if count != 2 {
++			t.Errorf("range %q: got count %d, want 2", name, count)
++		}
++	}
++}
++
++// Overlapping datetime ranges: a document counted in both still leaves Other correct.
++func TestDateTimeFacetOverlappingRangesBv28fee(t *testing.T) {
++	idx, cleanup := newIdxNew(t)
++	defer cleanup()
++
++	b := idx.NewBatch()
++	b.Index("both", map[string]interface{}{"when": time.Date(2020, 8, 1, 0, 0, 0, 0, time.UTC)})
++	b.Index("onlyfirst", map[string]interface{}{"when": time.Date(2020, 2, 1, 0, 0, 0, 0, time.UTC)})
++	b.Index("neither", map[string]interface{}{"when": time.Date(1990, 2, 1, 0, 0, 0, 0, time.UTC)})
++	b.Index("absent", map[string]interface{}{"other": 1.0})
++	if err := idx.Batch(b); err != nil {
++		t.Fatal(err)
++	}
++
++	fr := dateFacetNew(t, idx, 10, map[string][2]time.Time{
++		"first":  {time.Date(2020, 1, 1, 0, 0, 0, 0, time.UTC), time.Date(2021, 1, 1, 0, 0, 0, 0, time.UTC)},
++		"second": {time.Date(2020, 6, 1, 0, 0, 0, 0, time.UTC), time.Date(2021, 6, 1, 0, 0, 0, 0, time.UTC)},
++	})
++	if got := dateCountNew(t, fr, "first"); got != 2 {
++		t.Errorf("range first: got count %d, want 2", got)
++	}
++	if got := dateCountNew(t, fr, "second"); got != 1 {
++		t.Errorf("range second: got count %d, want 1", got)
++	}
++	if fr.Total != 3 {
++		t.Errorf("total: got %d, want 3", fr.Total)
++	}
++	if fr.Other != 1 {
++		t.Errorf("other: got %d, want 1 (only the 1990 document)", fr.Other)
++	}
++	if fr.Missing != 1 {
++		t.Errorf("missing: got %d, want 1", fr.Missing)
++	}
++}
++
++// A document whose field holds text that is not a date is missing, not counted.
++func TestDateTimeFacetUnreadableValueIsMissingBv28fee(t *testing.T) {
++	idx, cleanup := newIdxNew(t)
++	defer cleanup()
++
++	b := idx.NewBatch()
++	b.Index("date", map[string]interface{}{"when": time.Date(2020, 5, 1, 0, 0, 0, 0, time.UTC)})
++	b.Index("text", map[string]interface{}{"when": "not a date at all"})
++	b.Index("absent", map[string]interface{}{"other": 1.0})
++	if err := idx.Batch(b); err != nil {
++		t.Fatal(err)
++	}
++
++	fr := dateFacetNew(t, idx, 10, map[string][2]time.Time{
++		"y2020": {time.Date(2020, 1, 1, 0, 0, 0, 0, time.UTC), time.Date(2021, 1, 1, 0, 0, 0, 0, time.UTC)},
++	})
++	if fr.Missing != 2 {
++		t.Errorf("missing: got %d, want 2 (one unreadable value, one absent field)", fr.Missing)
++	}
++	if fr.Total != 1 {
++		t.Errorf("total: got %d, want 1 (only one document has a usable date)", fr.Total)
++	}
++}
++
++func termIdxNew(t *testing.T, docs map[string][]string) bleve.Index {
++	t.Helper()
++	idx, cleanup := newIdxNew(t)
++	t.Cleanup(cleanup)
++	b := idx.NewBatch()
++	for id, tags := range docs {
++		b.Index(id, map[string]interface{}{"tag": tags})
++	}
++	if err := idx.Batch(b); err != nil {
++		t.Fatal(err)
++	}
++	return idx
++}
++
++// facetLine renders everything a facet result reports, in result order.
++func facetLine(fr *search.FacetResult) string {
++	line := fmt.Sprintf("total=%d missing=%d other=%d", fr.Total, fr.Missing, fr.Other)
++	if fr.Terms != nil {
++		for _, tf := range fr.Terms.Terms() {
++			line += fmt.Sprintf(" %s:%d", tf.Term, tf.Count)
++		}
++	}
++	for _, r := range fr.NumericRanges {
++		line += fmt.Sprintf(" %s:%d", r.Name, r.Count)
++	}
++	for _, r := range fr.DateRanges {
++		line += fmt.Sprintf(" %s:%d", r.Name, r.Count)
++	}
++	return line
++}
++
++// checkSameFacets runs the same facet request against target and against one
++// index holding all of the documents, and wants the same answer each time.
++func checkSameFacets(t *testing.T, target, one bleve.Index, sizes []int,
++	newFacet func(size int) *bleve.FacetRequest) {
++	t.Helper()
++	run := func(idx bleve.Index, size int) string {
++		req := bleve.NewSearchRequest(bleve.NewMatchAllQuery())
++		req.AddFacet("f", newFacet(size))
++		res, err := idx.Search(req)
++		if err != nil {
++			t.Fatal(err)
++		}
++		if res.Facets["f"] == nil {
++			t.Fatal("no facet result")
++		}
++		return facetLine(res.Facets["f"])
++	}
++	for _, size := range sizes {
++		want := run(one, size)
++		for i := 0; i < 5; i++ {
++			if got := run(target, size); got != want {
++				t.Errorf("size %d, search %d:\n got  %s\n want %s (one index)", size, i, got, want)
++			}
++		}
++	}
++}
++
++var termDocsA = map[string][]string{
++	"a1": {"apple"}, "a2": {"apple"}, "a3": {"apple"},
++	"a4": {"apple", "berry"}, "a5": {"apple", "berry"},
++	"a6": {"berry"}, "a7": {"berry"}, "a8": {"cherry"},
++}
++
++var termDocsB = map[string][]string{
++	"b1": {"cherry"}, "b2": {"cherry"},
++	"b3": {"cherry", "berry"}, "b4": {"cherry", "berry"}, "b5": {"cherry", "berry"},
++	"b6": {"berry"}, "b7": {"apple"},
++}
++
++var termDocsC = map[string][]string{
++	"c1": {"apple"}, "c2": {"apple"}, "c3": {"apple"}, "c4": {"date"},
++}
++
++func mergeDocs(sets ...map[string][]string) map[string][]string {
++	rv := map[string][]string{}
++	for _, set := range sets {
++		for id, tags := range set {
++			rv[id] = tags
++		}
++	}
++	return rv
++}
++
++func termFacet(size int) *bleve.FacetRequest {
++	return bleve.NewFacetRequest("tag", size)
++}
++
++// An alias gives the same term facets as one index holding all the documents.
++func TestTermFacetAliasSameAsOneIndexBv28fee(t *testing.T) {
++	a := termIdxNew(t, termDocsA)
++	b := termIdxNew(t, termDocsB)
++	one := termIdxNew(t, mergeDocs(termDocsA, termDocsB))
++	alias := bleve.NewIndexAlias(a, b)
++	defer alias.Close()
++	checkSameFacets(t, alias, one, []int{1, 2, 3}, termFacet)
++}
++
++// The same holds when an alias contains another alias.
++func TestTermFacetNestedAliasSameAsOneIndexBv28fee(t *testing.T) {
++	a := termIdxNew(t, termDocsA)
++	b := termIdxNew(t, termDocsB)
++	c := termIdxNew(t, termDocsC)
++	one := termIdxNew(t, mergeDocs(termDocsA, termDocsB, termDocsC))
++	inner := bleve.NewIndexAlias(a, b)
++	outer := bleve.NewIndexAlias(inner, c)
++	defer outer.Close()
++	checkSameFacets(t, outer, one, []int{1, 2, 4}, termFacet)
++}
++
++// An alias gives the same datetime range facets as one index holding all the documents.
++func TestDateTimeFacetAliasSameAsOneIndexBv28fee(t *testing.T) {
++	year := func(y int) time.Time { return time.Date(y, 6, 1, 0, 0, 0, 0, time.UTC) }
++	idxA, cleanupA := newIdxNew(t)
++	defer cleanupA()
++	idxB, cleanupB := newIdxNew(t)
++	defer cleanupB()
++	one, cleanupOne := newIdxNew(t)
++	defer cleanupOne()
++
++	// "early" spans both indexes with 3 + 3, "mid" and "late" sit inside one
++	// index each with 4
++	add := func(idx bleve.Index, prefix string, y, n int) {
++		bOne := one.NewBatch()
++		b := idx.NewBatch()
++		for i := 0; i < n; i++ {
++			id := fmt.Sprintf("%s%d", prefix, i)
++			b.Index(id, map[string]interface{}{"when": year(y)})
++			bOne.Index(id, map[string]interface{}{"when": year(y)})
++		}
++		if err := idx.Batch(b); err != nil {
++			t.Fatal(err)
++		}
++		if err := one.Batch(bOne); err != nil {
++			t.Fatal(err)
++		}
++	}
++	add(idxA, "a_", 2001, 3)
++	add(idxA, "m_", 2011, 4)
++	add(idxB, "l_", 2021, 4)
++	add(idxB, "e_", 2002, 3)
++
++	alias := bleve.NewIndexAlias(idxA, idxB)
++	defer alias.Close()
++	checkSameFacets(t, alias, one, []int{1, 2, 3}, func(size int) *bleve.FacetRequest {
++		fr := bleve.NewFacetRequest("when", size)
++		fr.AddDateTimeRange("early", year(2000), year(2010))
++		fr.AddDateTimeRange("mid", year(2010), year(2020))
++		fr.AddDateTimeRange("late", year(2020), year(2030))
++		return fr
++	})
++}
++
++// A document with one value inside a range and another outside every range is
++// in that range, so it is not counted in Other.
++func TestNumericFacetPartlyInRangeIsNotOtherBv28fee(t *testing.T) {
++	idx, cleanup := newIdxNew(t)
++	defer cleanup()
++
++	b := idx.NewBatch()
++	b.Index("mixed", map[string]interface{}{"score": []interface{}{1.0, 999.0}})
++	b.Index("in", map[string]interface{}{"score": 2.0})
++	b.Index("out", map[string]interface{}{"score": 888.0})
++	if err := idx.Batch(b); err != nil {
++		t.Fatal(err)
++	}
++
++	fr := numFacetNew(t, idx, 10, map[string][2]float64{"low": {0, 5}})
++	if got := numCountNew(t, fr, "low"); got != 2 {
++		t.Errorf("range low: got count %d, want 2", got)
++	}
++	if fr.Total != 3 {
++		t.Errorf("total: got %d, want 3", fr.Total)
++	}
++	if fr.Other != 1 {
++		t.Errorf("other: got %d, want 1 (only the document with no value in a range)", fr.Other)
++	}
++}
++
++// Same as above for dates.
++func TestDateTimeFacetPartlyInRangeIsNotOtherBv28fee(t *testing.T) {
++	year := func(y int) time.Time { return time.Date(y, 6, 1, 0, 0, 0, 0, time.UTC) }
++	idx, cleanup := newIdxNew(t)
++	defer cleanup()
++
++	b := idx.NewBatch()
++	b.Index("mixed", map[string]interface{}{"when": []interface{}{year(2001), year(2050)}})
++	b.Index("in", map[string]interface{}{"when": year(2002)})
++	b.Index("out", map[string]interface{}{"when": year(2060)})
++	if err := idx.Batch(b); err != nil {
++		t.Fatal(err)
++	}
++
++	fr := dateFacetNew(t, idx, 10, map[string][2]time.Time{"early": {year(2000), year(2010)}})
++	if got := dateCountNew(t, fr, "early"); got != 2 {
++		t.Errorf("range early: got count %d, want 2", got)
++	}
++	if fr.Total != 3 {
++		t.Errorf("total: got %d, want 3", fr.Total)
++	}
++	if fr.Other != 1 {
++		t.Errorf("other: got %d, want 1 (only the document with no date in a range)", fr.Other)
++	}
++}
++
++// newNestedIdxNew returns an index whose "items" are nested objects with a
++// keyword "tag", a numeric "price" and a datetime "when".
++func newNestedIdxNew(t *testing.T) bleve.Index {
++	t.Helper()
++	dir, err := os.MkdirTemp("", "bleve-facet-nested-*")
++	if err != nil {
++		t.Fatal(err)
++	}
++	t.Cleanup(func() { os.RemoveAll(dir) })
++	im := bleve.NewIndexMapping()
++	items := bleve.NewNestedDocumentMapping()
++	tag := bleve.NewTextFieldMapping()
++	tag.Analyzer = keyword.Name
++	items.AddFieldMappingsAt("tag", tag)
++	items.AddFieldMappingsAt("price", bleve.NewNumericFieldMapping())
++	items.AddFieldMappingsAt("when", bleve.NewDateTimeFieldMapping())
++	im.DefaultMapping.AddSubDocumentMapping("items", items)
++	idx, err := bleve.New(dir, im)
++	if err != nil {
++		t.Fatal(err)
++	}
++	t.Cleanup(func() { idx.Close() })
++	return idx
++}
++
++func indexNestedNew(t *testing.T, idx bleve.Index, docs map[string]interface{}) {
++	t.Helper()
++	b := idx.NewBatch()
++	for id, doc := range docs {
++		if err := b.Index(id, doc); err != nil {
++			t.Fatal(err)
++		}
++	}
++	if err := idx.Batch(b); err != nil {
++		t.Fatal(err)
++	}
++}
++
++func item(fields ...interface{}) map[string]interface{} {
++	rv := map[string]interface{}{}
++	for i := 0; i+1 < len(fields); i += 2 {
++		rv[fields[i].(string)] = fields[i+1]
++	}
++	return rv
++}
++
++// Every nested object is a document of its own: it counts once in each range
++// one of its values falls in, Total and Other count nested objects, and
++// Missing counts the hits without any usable value.
++func TestNumericFacetNestedObjectsAreDocumentsBv28fee(t *testing.T) {
++	idx := newNestedIdxNew(t)
++	indexNestedNew(t, idx, map[string]interface{}{
++		"r1": map[string]interface{}{"items": []interface{}{
++			item("price", []interface{}{1.0, 2.0}),
++			item("price", 3.0),
++			item("price", 500.0),
++		}},
++		"r2": map[string]interface{}{"items": []interface{}{item("price", 50.0)}},
++		"r3": map[string]interface{}{"name": "no items"},
++		"r4": map[string]interface{}{"items": []interface{}{item("tag", "x")}},
++	})
++
++	req := bleve.NewSearchRequest(bleve.NewMatchAllQuery())
++	fr := bleve.NewFacetRequest("items.price", 10)
++	for _, r := range []struct {
++		name   string
++		lo, hi float64
++	}{{"low", 0, 10}, {"high", 10, 100}, {"empty", 1000, 2000}} {
++		lo, hi := r.lo, r.hi
++		fr.AddNumericRange(r.name, &lo, &hi)
++	}
++	req.AddFacet("f", fr)
++	res, err := idx.Search(req)
++	if err != nil {
++		t.Fatal(err)
++	}
++	got := res.Facets["f"]
++	if got == nil {
++		t.Fatal("no facet result")
++	}
++	for name, want := range map[string]int{"low": 2, "high": 1, "empty": 0} {
++		if c := numCountNew(t, got, name); c != want {
++			t.Errorf("range %s: got count %d, want %d", name, c, want)
++		}
++	}
++	if got.Total != 4 {
++		t.Errorf("total: got %d, want 4 (four nested objects have a price)", got.Total)
++	}
++	if got.Other != 1 {
++		t.Errorf("other: got %d, want 1 (the nested object priced 500)", got.Other)
++	}
++	if got.Missing != 2 {
++		t.Errorf("missing: got %d, want 2 (two hits have no price at all)", got.Missing)
++	}
++}
++
++// Same as above for dates.
++func TestDateTimeFacetNestedObjectsAreDocumentsBv28fee(t *testing.T) {
++	year := func(y int) time.Time { return time.Date(y, 6, 1, 0, 0, 0, 0, time.UTC) }
++	idx := newNestedIdxNew(t)
++	indexNestedNew(t, idx, map[string]interface{}{
++		"r1": map[string]interface{}{"items": []interface{}{
++			item("when", []interface{}{year(2001), year(2002)}),
++			item("when", year(2003)),
++			item("when", year(2050)),
++		}},
++		"r2": map[string]interface{}{"items": []interface{}{item("when", year(2015))}},
++		"r3": map[string]interface{}{"name": "no items"},
++		"r4": map[string]interface{}{"items": []interface{}{item("tag", "x")}},
++	})
++
++	req := bleve.NewSearchRequest(bleve.NewMatchAllQuery())
++	fr := bleve.NewFacetRequest("items.when", 10)
++	fr.AddDateTimeRange("early", year(2000), year(2010))
++	fr.AddDateTimeRange("late", year(2010), year(2020))
++	fr.AddDateTimeRange("empty", year(2100), year(2110))
++	req.AddFacet("f", fr)
++	res, err := idx.Search(req)
++	if err != nil {
++		t.Fatal(err)
++	}
++	got := res.Facets["f"]
++	if got == nil {
++		t.Fatal("no facet result")
++	}
++	for name, want := range map[string]int{"early": 2, "late": 1, "empty": 0} {
++		if c := dateCountNew(t, got, name); c != want {
++			t.Errorf("range %s: got count %d, want %d", name, c, want)
++		}
++	}
++	if got.Total != 4 {
++		t.Errorf("total: got %d, want 4 (four nested objects have a date)", got.Total)
++	}
++	if got.Other != 1 {
++		t.Errorf("other: got %d, want 1 (the nested object dated 2050)", got.Other)
++	}
++	if got.Missing != 2 {
++		t.Errorf("missing: got %d, want 2 (two hits have no date at all)", got.Missing)
++	}
++}
+diff --git a/search/facets_builder_test.go b/search/facets_builder_test.go
+index 6815b1a..b93184d 100644
+--- a/search/facets_builder_test.go
++++ b/search/facets_builder_test.go
+@@ -288,7 +288,7 @@ func TestNumericFacetResultsMerge(t *testing.T) {
+ 		Field:   "rating",
+ 		Total:   200,
+ 		Missing: 50,
+-		Other:   51,
++		Other:   50,
+ 		NumericRanges: []*NumericRangeFacet{
+ 			{
+ 				Name:  "low",
+@@ -392,7 +392,7 @@ func TestDateFacetResultsMerge(t *testing.T) {
+ 		Field:   "birthday",
+ 		Total:   200,
+ 		Missing: 50,
+-		Other:   51,
++		Other:   50,
+ 		DateRanges: []*DateRangeFacet{
+ 			{
+ 				Name:  "low",
+diff --git a/test.sh b/test.sh
+new file mode 100755
+index 0000000..d16efc4
+--- /dev/null
++++ b/test.sh
+@@ -0,0 +1,63 @@
++#!/usr/bin/env bash
++# Usage: ./test.sh [--output_path <junit.xml>] [base|new]
++set -uo pipefail
++
++OUTPUT_PATH=""
++if [ "${1:-}" = "--output_path" ]; then
++  OUTPUT_PATH="$2"
++  shift 2
++  case "$OUTPUT_PATH" in
++    /*) ;;
++    *) OUTPUT_PATH="$PWD/$OUTPUT_PATH" ;;
++  esac
++fi
++
++[ -f go.mod ] || cd "$(dirname "$0")"
++
++MODE="${1:-}"
++
++if [ -n "$OUTPUT_PATH" ] && [ -z "$MODE" ]; then
++  echo "--output_path needs a mode: base or new" >&2
++  exit 2
++fi
++
++if [ -n "$MODE" ]; then
++  TEST_LOG="$(mktemp)"
++  STATUS=0
++
++  run_tests() {
++    go test -count=1 -v "$@" 2>&1 | tee -a "$TEST_LOG"
++    status=${PIPESTATUS[0]}
++    if [ "$status" -ne 0 ]; then
++      STATUS=$status
++    fi
++  }
++
++  case "$MODE" in
++    base)
++      run_tests -tags Bv28feebas -timeout 120s ./search/facet/ ./search/collector/
++      ;;
++    new)
++      run_tests -tags Bv28feenew -run 'Bv28fee' -timeout 120s ./search/facet/
++      ;;
++    *)
++      echo "unknown mode: $MODE (expected base or new)" >&2
++      exit 2
++      ;;
++  esac
++
++  if [ -n "$OUTPUT_PATH" ]; then
++    go-junit-report < "$TEST_LOG" > "$OUTPUT_PATH"
++    junit_status=$?
++    if [ "$junit_status" -ne 0 ] && [ "$STATUS" -eq 0 ]; then
++      echo "go-junit-report failed (exit $junit_status)" >&2
++      STATUS=$junit_status
++    fi
++  fi
++
++  exit "$STATUS"
++fi
++
++set +u +o pipefail
++set -e
++go test -count=1 -timeout 120s ./...
+diff --git a/search/facet/facet_value_terms_test.go b/search/facet/facet_value_terms_test.go
+new file mode 100644
+index 00000000..c125acd2
+--- /dev/null
++++ b/search/facet/facet_value_terms_test.go
+@@ -0,0 +1,190 @@
++//go:build Bv28feenew
++
++package facet_test
++
++import (
++	"os"
++	"testing"
++	"time"
++
++	"github.com/blevesearch/bleve/v2"
++	"github.com/blevesearch/bleve/v2/mapping"
++)
++
++// valueIdx returns an index whose mapping declares "price" as a number and
++// "day" as a date, plus nested "items" with a number "price" and a date "day".
++func valueIdx(t *testing.T, docs map[string]interface{}) bleve.Index {
++	t.Helper()
++	dir, err := os.MkdirTemp("", "bleve-facet-values-*")
++	if err != nil {
++		t.Fatal(err)
++	}
++	t.Cleanup(func() { os.RemoveAll(dir) })
++	im := bleve.NewIndexMapping()
++	im.DefaultMapping.AddFieldMappingsAt("price", bleve.NewNumericFieldMapping())
++	im.DefaultMapping.AddFieldMappingsAt("day", bleve.NewDateTimeFieldMapping())
++	items := bleve.NewNestedDocumentMapping()
++	items.AddFieldMappingsAt("price", bleve.NewNumericFieldMapping())
++	items.AddFieldMappingsAt("day", bleve.NewDateTimeFieldMapping())
++	im.DefaultMapping.AddSubDocumentMapping("items", items)
++	idx, err := bleve.New(dir, im)
++	if err != nil {
++		t.Fatal(err)
++	}
++	t.Cleanup(func() { idx.Close() })
++	indexNestedNew(t, idx, docs)
++	return idx
++}
++
++func valueFacet(field string) func(size int) *bleve.FacetRequest {
++	return func(size int) *bleve.FacetRequest {
++		return bleve.NewFacetRequest(field, size)
++	}
++}
++
++func valueLine(t *testing.T, idx bleve.Index, fr *bleve.FacetRequest) string {
++	t.Helper()
++	req := bleve.NewSearchRequest(bleve.NewMatchAllQuery())
++	req.AddFacet("f", fr)
++	res, err := idx.Search(req)
++	if err != nil {
++		t.Fatal(err)
++	}
++	if res.Facets["f"] == nil {
++		t.Fatal("no facet result")
++	}
++	return facetLine(res.Facets["f"])
++}
++
++func day(y, m, d int) time.Time { return time.Date(y, time.Month(m), d, 0, 0, 0, 0, time.UTC) }
++
++// A term facet on a number field lists each number once, written out.
++func TestTermFacetOnNumberFieldBv28fee(t *testing.T) {
++	idx := valueIdx(t, map[string]interface{}{
++		"a": map[string]interface{}{"price": []interface{}{1.0, 2.5}},
++		"b": map[string]interface{}{"price": 1.0},
++		"c": map[string]interface{}{"price": -3.0},
++		"e": map[string]interface{}{"name": "no price"},
++	})
++	got := valueLine(t, idx, bleve.NewFacetRequest("price", 10))
++	want := "total=4 missing=1 other=0 1:2 -3:1 2.5:1"
++	if got != want {
++		t.Errorf("got  %s\nwant %s", got, want)
++	}
++}
++
++// A term facet on a date field lists each date once, as RFC 3339 in UTC.
++func TestTermFacetOnDateFieldBv28fee(t *testing.T) {
++	idx := valueIdx(t, map[string]interface{}{
++		"a": map[string]interface{}{"day": []interface{}{day(2001, 6, 1), day(2002, 1, 15)}},
++		"b": map[string]interface{}{"day": day(2001, 6, 1)},
++		"c": map[string]interface{}{"name": "no day"},
++		// the same instant as 2002-01-15 00:00 UTC, and one more given with an offset
++		"d": map[string]interface{}{"day": []interface{}{
++			time.Date(2002, 1, 15, 5, 30, 0, 0, time.FixedZone("IST", 5*3600+1800)),
++			time.Date(2003, 7, 4, 10, 0, 0, 0, time.FixedZone("PDT", -7*3600)),
++		}},
++	})
++	got := valueLine(t, idx, bleve.NewFacetRequest("day", 10))
++	want := "total=5 missing=1 other=0 2001-06-01T00:00:00Z:2 2002-01-15T00:00:00Z:2 2003-07-04T17:00:00Z:1"
++	if got != want {
++		t.Errorf("got  %s\nwant %s", got, want)
++	}
++}
++
++// Trimming the terms of a number field moves the rest into Other.
++func TestTermFacetOnNumberFieldTrimBv28fee(t *testing.T) {
++	idx := valueIdx(t, map[string]interface{}{
++		"a": map[string]interface{}{"price": []interface{}{7.0, 8.0}},
++		"b": map[string]interface{}{"price": 7.0},
++		"c": map[string]interface{}{"price": []interface{}{7.0, 9.0}},
++	})
++	got := valueLine(t, idx, bleve.NewFacetRequest("price", 1))
++	want := "total=5 missing=0 other=2 7:3"
++	if got != want {
++		t.Errorf("got  %s\nwant %s", got, want)
++	}
++}
++
++// Nested objects count on their own for number and date terms too.
++func TestTermFacetOnNestedValuesBv28fee(t *testing.T) {
++	idx := valueIdx(t, map[string]interface{}{
++		"r1": map[string]interface{}{"items": []interface{}{
++			item("price", 4.0, "day", day(2003, 3, 3)),
++			item("price", 4.0, "day", day(2003, 3, 3)),
++			item("price", 0.5),
++		}},
++		"r2": map[string]interface{}{"items": []interface{}{item("price", 4.0)}},
++		"r3": map[string]interface{}{"name": "no items"},
++	})
++	if got, want := valueLine(t, idx, bleve.NewFacetRequest("items.price", 10)),
++		"total=4 missing=1 other=0 4:3 0.5:1"; got != want {
++		t.Errorf("items.price:\n got  %s\n want %s", got, want)
++	}
++	if got, want := valueLine(t, idx, bleve.NewFacetRequest("items.day", 10)),
++		"total=2 missing=2 other=0 2003-03-03T00:00:00Z:2"; got != want {
++		t.Errorf("items.day:\n got  %s\n want %s", got, want)
++	}
++}
++
++// A field declared in a document type's mapping is read as a number too.
++func TestTermFacetOnTypedNumberFieldBv28fee(t *testing.T) {
++	dir := t.TempDir()
++	im := mapping.NewIndexMapping()
++	product := bleve.NewDocumentMapping()
++	product.AddFieldMappingsAt("weight", bleve.NewNumericFieldMapping())
++	im.AddDocumentMapping("product", product)
++	idx, err := bleve.New(dir+"/idx", im)
++	if err != nil {
++		t.Fatal(err)
++	}
++	defer idx.Close()
++	b := idx.NewBatch()
++	b.Index("p1", map[string]interface{}{"type": "product", "weight": []interface{}{12.0, 30.0}})
++	b.Index("p2", map[string]interface{}{"type": "product", "weight": 12.0})
++	if err := idx.Batch(b); err != nil {
++		t.Fatal(err)
++	}
++	if got, want := valueLine(t, idx, bleve.NewFacetRequest("weight", 10)),
++		"total=3 missing=0 other=0 12:2 30:1"; got != want {
++		t.Errorf("got  %s\nwant %s", got, want)
++	}
++}
++
++// An alias gives the same number and date terms as one index.
++func TestTermFacetOnValuesAliasSameAsOneIndexBv28fee(t *testing.T) {
++	a := map[string]interface{}{
++		"a1": map[string]interface{}{"price": []interface{}{1.0, 2.5}, "day": day(2001, 6, 1)},
++		"a2": map[string]interface{}{"price": 1.0, "day": day(2001, 6, 1)},
++		"a3": map[string]interface{}{"price": 6.0},
++	}
++	b := map[string]interface{}{
++		"b1": map[string]interface{}{"price": 2.5, "day": []interface{}{day(2002, 2, 2), day(2001, 6, 1)}},
++		"b2": map[string]interface{}{"price": []interface{}{6.0, 2.5}},
++		"b3": map[string]interface{}{"day": day(2002, 2, 2)},
++	}
++	alias := bleve.NewIndexAlias(valueIdx(t, a), valueIdx(t, b))
++	defer alias.Close()
++	one := valueIdx(t, mergeValues(a, b))
++	checkSameFacets(t, alias, one, []int{1, 2, 3}, valueFacet("price"))
++	checkSameFacets(t, alias, one, []int{1, 2}, valueFacet("day"))
++
++	if got, want := valueLine(t, alias, bleve.NewFacetRequest("price", 10)),
++		"total=7 missing=1 other=0 2.5:3 1:2 6:2"; got != want {
++		t.Errorf("price:\n got  %s\n want %s", got, want)
++	}
++	if got, want := valueLine(t, alias, bleve.NewFacetRequest("day", 10)),
++		"total=5 missing=2 other=0 2001-06-01T00:00:00Z:3 2002-02-02T00:00:00Z:2"; got != want {
++		t.Errorf("day:\n got  %s\n want %s", got, want)
++	}
++}
++
++func mergeValues(sets ...map[string]interface{}) map[string]interface{} {
++	rv := map[string]interface{}{}
++	for _, s := range sets {
++		for k, v := range s {
++			rv[k] = v
++		}
++	}
++	return rv
++}

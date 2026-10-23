@@ -1,0 +1,563 @@
+diff --git a/index_alias_impl.go b/index_alias_impl.go
+index c58891d6..30d4cd2f 100644
+--- a/index_alias_impl.go
++++ b/index_alias_impl.go
+@@ -17,6 +17,7 @@ package bleve
+ import (
+ 	"context"
+ 	"fmt"
++	"math"
+ 	"sort"
+ 	"sync"
+ 	"time"
+@@ -607,7 +608,25 @@ func (i *indexAliasImpl) Swap(in, out []Index) {
+ // Perhaps that part needs to be optional,
+ // could be slower in remote usages.
+ func createChildSearchRequest(req *SearchRequest, preSearchData map[string]interface{}) *SearchRequest {
+-	return copySearchRequest(req, preSearchData)
++	rv := copySearchRequest(req, preSearchData)
++	// every child has to report all of its ranges and terms, a child's local
++	// top N is not the global one, the size limit is applied once the children
++	// have been merged. The terms builder already counts every term before it
++	// trims, so this only changes how many of them a child hands back.
++	if len(req.Facets) > 0 {
++		facets := make(FacetsRequest, len(req.Facets))
++		for name, fr := range req.Facets {
++			childFacet := *fr
++			if n := len(fr.NumericRanges) + len(fr.DateTimeRanges); n > 0 {
++				childFacet.Size = n
++			} else {
++				childFacet.Size = math.MaxInt
++			}
++			facets[name] = &childFacet
++		}
++		rv.Facets = facets
++	}
++	return rv
+ }
+ 
+ type asyncSearchResult struct {
+diff --git a/index_impl.go b/index_impl.go
+index f9d90994..657451ca 100644
+--- a/index_impl.go
++++ b/index_impl.go
+@@ -940,6 +940,15 @@ func (i *indexImpl) SearchInContext(ctx context.Context, req *SearchRequest) (sr
+ 				// build terms facet
+ 				facetBuilder := facet.NewTermsFacetBuilder(facetRequest.Field, facetRequest.Size)
+ 
++				// a number or a date field has one term per value, not its
++				// encoded precision steps
++				switch i.m.FieldMappingForPath(facetRequest.Field).Type {
++				case "number":
++					facetBuilder.SetValueType(facet.TermsNumber)
++				case "datetime":
++					facetBuilder.SetValueType(facet.TermsDateTime)
++				}
++
+ 				// Set prefix filter if provided
+ 				if facetRequest.TermPrefix != "" {
+ 					facetBuilder.SetPrefixFilter(facetRequest.TermPrefix)
+diff --git a/search/collector/topn.go b/search/collector/topn.go
+index 296984fe..acd9acba 100644
+--- a/search/collector/topn.go
++++ b/search/collector/topn.go
+@@ -637,6 +637,10 @@ func (hc *TopNCollector) visitFieldTerms(reader index.IndexReader, d *search.Doc
+ 		if err != nil {
+ 			return err
+ 		}
++		// the facets count every nested document on its own
++		if hc.facetsBuilder != nil {
++			hc.facetsBuilder.EndNestedDoc()
++		}
+ 	}
+ 	// now visit the doc values for this document
+ 	err := hc.dvReader.VisitDocValues(d.IndexInternalID, v)
+diff --git a/search/facet/facet_builder_datetime.go b/search/facet/facet_builder_datetime.go
+index 9fe4cf4c..b428d943 100644
+--- a/search/facet/facet_builder_datetime.go
++++ b/search/facet/facet_builder_datetime.go
+@@ -47,8 +47,12 @@ type DateTimeFacetBuilder struct {
+ 	termsCount map[string]int
+ 	total      int
+ 	missing    int
++	other      int
+ 	ranges     map[string]*dateTimeRange
+ 	sawValue   bool
++	inRange    bool
++	seenRanges map[string]bool
++	hitValue   bool
+ }
+ 
+ func NewDateTimeFacetBuilder(field string, size int) *DateTimeFacetBuilder {
+@@ -57,6 +61,7 @@ func NewDateTimeFacetBuilder(field string, size int) *DateTimeFacetBuilder {
+ 		field:      field,
+ 		termsCount: make(map[string]int),
+ 		ranges:     make(map[string]*dateTimeRange, 0),
++		seenRanges: make(map[string]bool),
+ 	}
+ }
+ 
+@@ -74,6 +79,11 @@ func (fb *DateTimeFacetBuilder) Size() int {
+ 			size.SizeOfPtr + reflectStaticSizedateTimeRange
+ 	}
+ 
++	for k := range fb.seenRanges {
++		sizeInBytes += size.SizeOfString + len(k) +
++			size.SizeOfBool
++	}
++
+ 	return sizeInBytes
+ }
+ 
+@@ -90,36 +100,69 @@ func (fb *DateTimeFacetBuilder) Field() string {
+ }
+ 
+ func (fb *DateTimeFacetBuilder) UpdateVisitor(term []byte) {
+-	fb.sawValue = true
+ 	// only consider the values which are shifted 0
+ 	prefixCoded := numeric.PrefixCoded(term)
+ 	shift, err := prefixCoded.Shift()
+-	if err == nil && shift == 0 {
+-		i64, err := prefixCoded.Int64()
+-		if err == nil {
+-			t := time.Unix(0, i64)
+-
+-			// look at each of the ranges for a match
+-			for rangeName, r := range fb.ranges {
+-				if (r.start.IsZero() || t.After(r.start) || t.Equal(r.start)) && (r.end.IsZero() || t.Before(r.end)) {
+-					fb.termsCount[rangeName] = fb.termsCount[rangeName] + 1
+-					fb.total++
+-				}
++	if err != nil || shift != 0 {
++		return
++	}
++	i64, err := prefixCoded.Int64()
++	if err != nil {
++		return
++	}
++	t := time.Unix(0, i64)
++	fb.sawValue = true
++	fb.hitValue = true
++
++	// look at each of the ranges for a match
++	for rangeName, r := range fb.ranges {
++		if (r.start.IsZero() || t.After(r.start) || t.Equal(r.start)) && (r.end.IsZero() || t.Before(r.end)) {
++			if !fb.seenRanges[rangeName] {
++				fb.termsCount[rangeName] = fb.termsCount[rangeName] + 1
++				fb.seenRanges[rangeName] = true
+ 			}
++			fb.inRange = true
+ 		}
+ 	}
+ }
+ 
+ func (fb *DateTimeFacetBuilder) StartDoc() {
+-	fb.sawValue = false
++	fb.hitValue = false
++	fb.resetDoc()
++}
++
++// EndNestedDoc counts the nested document whose values were just visited, a
++// nested document is counted on its own, like the hit it belongs to
++func (fb *DateTimeFacetBuilder) EndNestedDoc() {
++	fb.countDoc()
++	fb.resetDoc()
+ }
+ 
+ func (fb *DateTimeFacetBuilder) EndDoc() {
+-	if !fb.sawValue {
++	fb.countDoc()
++	if !fb.hitValue {
+ 		fb.missing++
+ 	}
+ }
+ 
++func (fb *DateTimeFacetBuilder) countDoc() {
++	if !fb.sawValue {
++		return
++	}
++	fb.total++
++	if !fb.inRange {
++		fb.other++
++	}
++}
++
++func (fb *DateTimeFacetBuilder) resetDoc() {
++	fb.sawValue = false
++	fb.inRange = false
++	for rangeName := range fb.seenRanges {
++		delete(fb.seenRanges, rangeName)
++	}
++}
++
+ func (fb *DateTimeFacetBuilder) Result() *search.FacetResult {
+ 	rv := search.FacetResult{
+ 		Field:   fb.field,
+@@ -127,13 +170,14 @@ func (fb *DateTimeFacetBuilder) Result() *search.FacetResult {
+ 		Missing: fb.missing,
+ 	}
+ 
+-	rv.DateRanges = make([]*search.DateRangeFacet, 0, len(fb.termsCount))
++	rv.Other = fb.other
++
++	rv.DateRanges = make([]*search.DateRangeFacet, 0, len(fb.ranges))
+ 
+-	for term, count := range fb.termsCount {
+-		dateRange := fb.ranges[term]
++	for name, dateRange := range fb.ranges {
+ 		tf := &search.DateRangeFacet{
+-			Name:  term,
+-			Count: count,
++			Name:  name,
++			Count: fb.termsCount[name],
+ 		}
+ 		if !dateRange.start.IsZero() {
+ 			start := dateRange.start.Format(time.RFC3339Nano)
+@@ -153,11 +197,5 @@ func (fb *DateTimeFacetBuilder) Result() *search.FacetResult {
+ 		rv.DateRanges = rv.DateRanges[:fb.size]
+ 	}
+ 
+-	notOther := 0
+-	for _, nr := range rv.DateRanges {
+-		notOther += nr.Count
+-	}
+-	rv.Other = fb.total - notOther
+-
+ 	return &rv
+ }
+diff --git a/search/facet/facet_builder_numeric.go b/search/facet/facet_builder_numeric.go
+index 13839428..e113a83e 100644
+--- a/search/facet/facet_builder_numeric.go
++++ b/search/facet/facet_builder_numeric.go
+@@ -15,6 +15,7 @@
+ package facet
+ 
+ import (
++	"math"
+ 	"reflect"
+ 	"sort"
+ 
+@@ -46,8 +47,12 @@ type NumericFacetBuilder struct {
+ 	termsCount map[string]int
+ 	total      int
+ 	missing    int
++	other      int
+ 	ranges     map[string]*numericRange
+ 	sawValue   bool
++	inRange    bool
++	seenRanges map[string]bool
++	hitValue   bool
+ }
+ 
+ func NewNumericFacetBuilder(field string, size int) *NumericFacetBuilder {
+@@ -56,6 +61,7 @@ func NewNumericFacetBuilder(field string, size int) *NumericFacetBuilder {
+ 		field:      field,
+ 		termsCount: make(map[string]int),
+ 		ranges:     make(map[string]*numericRange, 0),
++		seenRanges: make(map[string]bool),
+ 	}
+ }
+ 
+@@ -73,6 +79,11 @@ func (fb *NumericFacetBuilder) Size() int {
+ 			size.SizeOfPtr + reflectStaticSizenumericRange
+ 	}
+ 
++	for k := range fb.seenRanges {
++		sizeInBytes += size.SizeOfString + len(k) +
++			size.SizeOfBool
++	}
++
+ 	return sizeInBytes
+ }
+ 
+@@ -89,36 +100,73 @@ func (fb *NumericFacetBuilder) Field() string {
+ }
+ 
+ func (fb *NumericFacetBuilder) UpdateVisitor(term []byte) {
+-	fb.sawValue = true
+ 	// only consider the values which are shifted 0
+ 	prefixCoded := numeric.PrefixCoded(term)
+ 	shift, err := prefixCoded.Shift()
+-	if err == nil && shift == 0 {
+-		i64, err := prefixCoded.Int64()
+-		if err == nil {
+-			f64 := numeric.Int64ToFloat64(i64)
+-
+-			// look at each of the ranges for a match
+-			for rangeName, r := range fb.ranges {
+-				if (r.min == nil || f64 >= *r.min) && (r.max == nil || f64 < *r.max) {
+-					fb.termsCount[rangeName] = fb.termsCount[rangeName] + 1
+-					fb.total++
+-				}
++	if err != nil || shift != 0 {
++		return
++	}
++	i64, err := prefixCoded.Int64()
++	if err != nil {
++		return
++	}
++	f64 := numeric.Int64ToFloat64(i64)
++	if math.IsNaN(f64) {
++		// not a real number, so it cannot sit in any range
++		return
++	}
++	fb.sawValue = true
++	fb.hitValue = true
++
++	// look at each of the ranges for a match
++	for rangeName, r := range fb.ranges {
++		if (r.min == nil || f64 >= *r.min) && (r.max == nil || f64 < *r.max) {
++			if !fb.seenRanges[rangeName] {
++				fb.termsCount[rangeName] = fb.termsCount[rangeName] + 1
++				fb.seenRanges[rangeName] = true
+ 			}
++			fb.inRange = true
+ 		}
+ 	}
+ }
+ 
+ func (fb *NumericFacetBuilder) StartDoc() {
+-	fb.sawValue = false
++	fb.hitValue = false
++	fb.resetDoc()
++}
++
++// EndNestedDoc counts the nested document whose values were just visited, a
++// nested document is counted on its own, like the hit it belongs to
++func (fb *NumericFacetBuilder) EndNestedDoc() {
++	fb.countDoc()
++	fb.resetDoc()
+ }
+ 
+ func (fb *NumericFacetBuilder) EndDoc() {
+-	if !fb.sawValue {
++	fb.countDoc()
++	if !fb.hitValue {
+ 		fb.missing++
+ 	}
+ }
+ 
++func (fb *NumericFacetBuilder) countDoc() {
++	if !fb.sawValue {
++		return
++	}
++	fb.total++
++	if !fb.inRange {
++		fb.other++
++	}
++}
++
++func (fb *NumericFacetBuilder) resetDoc() {
++	fb.sawValue = false
++	fb.inRange = false
++	for rangeName := range fb.seenRanges {
++		delete(fb.seenRanges, rangeName)
++	}
++}
++
+ func (fb *NumericFacetBuilder) Result() *search.FacetResult {
+ 	rv := search.FacetResult{
+ 		Field:   fb.field,
+@@ -126,13 +174,14 @@ func (fb *NumericFacetBuilder) Result() *search.FacetResult {
+ 		Missing: fb.missing,
+ 	}
+ 
+-	rv.NumericRanges = make([]*search.NumericRangeFacet, 0, len(fb.termsCount))
++	rv.Other = fb.other
+ 
+-	for term, count := range fb.termsCount {
+-		numericRange := fb.ranges[term]
++	rv.NumericRanges = make([]*search.NumericRangeFacet, 0, len(fb.ranges))
++
++	for name, numericRange := range fb.ranges {
+ 		tf := &search.NumericRangeFacet{
+-			Name:  term,
+-			Count: count,
++			Name:  name,
++			Count: fb.termsCount[name],
+ 			Min:   numericRange.min,
+ 			Max:   numericRange.max,
+ 		}
+@@ -147,11 +196,5 @@ func (fb *NumericFacetBuilder) Result() *search.FacetResult {
+ 		rv.NumericRanges = rv.NumericRanges[:fb.size]
+ 	}
+ 
+-	notOther := 0
+-	for _, nr := range rv.NumericRanges {
+-		notOther += nr.Count
+-	}
+-	rv.Other = fb.total - notOther
+-
+ 	return &rv
+ }
+diff --git a/search/facet/facet_builder_terms.go b/search/facet/facet_builder_terms.go
+index 43cfcadf..c8bead0e 100644
+--- a/search/facet/facet_builder_terms.go
++++ b/search/facet/facet_builder_terms.go
+@@ -16,14 +16,30 @@ package facet
+ 
+ import (
+ 	"bytes"
++	"math"
+ 	"reflect"
+ 	"regexp"
+ 	"sort"
++	"strconv"
++	"time"
+ 
++	"github.com/blevesearch/bleve/v2/numeric"
+ 	"github.com/blevesearch/bleve/v2/search"
+ 	"github.com/blevesearch/bleve/v2/size"
+ )
+ 
++// TermsValueType says how the indexed terms of a faceted field are read
++type TermsValueType int
++
++const (
++	// TermsText facets on the indexed terms as they are
++	TermsText TermsValueType = iota
++	// TermsNumber facets on the numbers of a numeric field
++	TermsNumber
++	// TermsDateTime facets on the dates of a datetime field
++	TermsDateTime
++)
++
+ var reflectStaticSizeTermsFacetBuilder int
+ 
+ func init() {
+@@ -40,6 +56,8 @@ type TermsFacetBuilder struct {
+ 	total       int
+ 	missing     int
+ 	sawValue    bool
++	valueType   TermsValueType
++	valueBuf    []byte
+ }
+ 
+ func NewTermsFacetBuilder(field string, size int) *TermsFacetBuilder {
+@@ -53,7 +71,7 @@ func NewTermsFacetBuilder(field string, size int) *TermsFacetBuilder {
+ func (fb *TermsFacetBuilder) Size() int {
+ 	sizeInBytes := reflectStaticSizeTermsFacetBuilder + size.SizeOfPtr +
+ 		len(fb.field) +
+-		len(fb.prefixBytes) +
++		len(fb.prefixBytes) + cap(fb.valueBuf) +
+ 		size.SizeOfPtr // regex pointer (does not include actual regexp.Regexp object size)
+ 
+ 	// Estimate regex object size if present.
+@@ -89,7 +107,44 @@ func (fb *TermsFacetBuilder) SetRegexFilter(regex *regexp.Regexp) {
+ 	fb.regex = regex
+ }
+ 
++// SetValueType makes the builder read the field as numbers or dates, so every
++// value is one readable term instead of its encoded precision steps
++func (fb *TermsFacetBuilder) SetValueType(valueType TermsValueType) {
++	fb.valueType = valueType
++}
++
++// readableTerm turns the full precision term of a number or a date into its
++// text, the other precision steps and NaN are not values of their own
++func (fb *TermsFacetBuilder) readableTerm(term []byte) ([]byte, bool) {
++	valid, shift := numeric.ValidPrefixCodedTermBytes(term)
++	if !valid || shift != 0 {
++		return nil, false
++	}
++	i64, err := numeric.PrefixCoded(term).Int64()
++	if err != nil {
++		return nil, false
++	}
++	switch fb.valueType {
++	case TermsNumber:
++		f64 := numeric.Int64ToFloat64(i64)
++		if math.IsNaN(f64) {
++			return nil, false
++		}
++		fb.valueBuf = strconv.AppendFloat(fb.valueBuf[:0], f64, 'f', -1, 64)
++	case TermsDateTime:
++		fb.valueBuf = time.Unix(0, i64).UTC().AppendFormat(fb.valueBuf[:0], time.RFC3339Nano)
++	}
++	return fb.valueBuf, true
++}
++
+ func (fb *TermsFacetBuilder) UpdateVisitor(term []byte) {
++	if fb.valueType != TermsText {
++		var ok bool
++		if term, ok = fb.readableTerm(term); !ok {
++			return
++		}
++	}
++
+ 	// Total represents all terms visited, not just matching ones.
+ 	// This is necessary for the "Other" calculation.
+ 	fb.total++
+diff --git a/search/facets_builder.go b/search/facets_builder.go
+index 4b1f2db7..b5da9561 100644
+--- a/search/facets_builder.go
++++ b/search/facets_builder.go
+@@ -108,6 +108,22 @@ func (fb *FacetsBuilder) EndDoc() {
+ 	}
+ }
+ 
++// NestedDocFacetBuilder is implemented by the facet builders that count every
++// nested document of a hit as a document of its own
++type NestedDocFacetBuilder interface {
++	EndNestedDoc()
++}
++
++// EndNestedDoc is called once all the values of one nested document of the
++// current hit have been visited
++func (fb *FacetsBuilder) EndNestedDoc() {
++	for _, facetBuilder := range fb.facets {
++		if nb, ok := facetBuilder.(NestedDocFacetBuilder); ok {
++			nb.EndNestedDoc()
++		}
++	}
++}
++
+ func (fb *FacetsBuilder) UpdateVisitor(field string, term []byte) {
+ 	if facetBuilders, ok := fb.facetsByField[field]; ok {
+ 		for _, facetBuilder := range facetBuilders {
+@@ -201,6 +217,11 @@ type NumericRangeFacet struct {
+ }
+ 
+ func (nrf *NumericRangeFacet) Same(other *NumericRangeFacet) bool {
++	// two ranges the caller named differently stay distinct buckets even
++	// when their bounds agree
++	if nrf.Name != other.Name {
++		return false
++	}
+ 	if nrf.Min == nil && other.Min != nil {
+ 		return false
+ 	}
+@@ -254,6 +275,11 @@ type DateRangeFacet struct {
+ }
+ 
+ func (drf *DateRangeFacet) Same(other *DateRangeFacet) bool {
++	// two ranges the caller named differently stay distinct buckets even
++	// when their bounds agree
++	if drf.Name != other.Name {
++		return false
++	}
+ 	if drf.Start == nil && other.Start != nil {
+ 		return false
+ 	}
+@@ -363,19 +389,13 @@ func (fr *FacetResult) Fixup(size int) {
+ 	} else if fr.NumericRanges != nil {
+ 		sort.Sort(fr.NumericRanges)
+ 		if len(fr.NumericRanges) > size {
+-			moveToOther := fr.NumericRanges[size:]
+-			for _, mto := range moveToOther {
+-				fr.Other += mto.Count
+-			}
++			// documents in a trimmed range still have a usable value in a
++			// named range, so Other does not grow when the result is trimmed
+ 			fr.NumericRanges = fr.NumericRanges[0:size]
+ 		}
+ 	} else if fr.DateRanges != nil {
+ 		sort.Sort(fr.DateRanges)
+ 		if len(fr.DateRanges) > size {
+-			moveToOther := fr.DateRanges[size:]
+-			for _, mto := range moveToOther {
+-				fr.Other += mto.Count
+-			}
+ 			fr.DateRanges = fr.DateRanges[0:size]
+ 		}
+ 	}
