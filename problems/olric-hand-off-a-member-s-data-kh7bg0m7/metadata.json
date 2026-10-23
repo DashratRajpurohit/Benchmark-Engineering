@@ -1,0 +1,17 @@
+{
+  "problemId": "kh7bg0m784ja79bppp7pe1hkpx8fcbtw",
+  "title": "Hand off a member's data when it leaves the cluster",
+  "status": "draft",
+  "version": 0,
+  "versionId": "kd7146dt5y5n15gzcm43bq2gy98fd4xq",
+  "isLocked": false,
+  "language": "go",
+  "difficulty": "hard",
+  "category": "bugfix",
+  "repoUrl": "https://github.com/olric-data/olric",
+  "commitHash": "c49c44a8816b472943068b47916da9f26d15a349",
+  "githubIssueUrl": null,
+  "estimatedLOC": null,
+  "testOutputMode": null,
+  "downloadedAt": "2026-10-24T17:10:06.279Z"
+}

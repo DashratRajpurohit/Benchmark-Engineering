@@ -1,0 +1,1643 @@
+diff --git a/internal/cluster/balancer/balancer.go b/internal/cluster/balancer/balancer.go
+index 8c44c2d..5437ded 100644
+--- a/internal/cluster/balancer/balancer.go
++++ b/internal/cluster/balancer/balancer.go
+@@ -16,6 +16,7 @@ package balancer
+ 
+ import (
+ 	"context"
++	"errors"
+ 	"strings"
+ 	"sync"
+ 	"time"
+@@ -67,7 +68,13 @@ func (b *Balancer) isAlive() bool {
+ 	return true
+ }
+ 
+-func (b *Balancer) scanPartition(sign uint64, part *partitions.Partition, owners ...discovery.Member) {
++// contextMover is implemented by the fragments whose transfers can be stopped
++// with a context.
++type contextMover interface {
++	MoveContext(ctx context.Context, part *partitions.Partition, name string, owners []discovery.Member) error
++}
++
++func (b *Balancer) scanPartition(ctx context.Context, sign uint64, part *partitions.Partition, owners ...discovery.Member) {
+ 	ownersStr := func() string {
+ 		var names []string
+ 		for _, owner := range owners {
+@@ -79,28 +86,35 @@ func (b *Balancer) scanPartition(sign uint64, part *partitions.Partition, owners
+ 	part.Map().Range(func(rawName, rawFragment interface{}) bool {
+ 		f := rawFragment.(partitions.Fragment)
+ 		if f.Stats().Length == 0 {
+-			return false
++			// Nothing to move here, but the other DMaps of the partition may
++			// still have keys.
++			return !b.breakLoop(ctx, sign)
+ 		}
+ 		name := strings.TrimPrefix(rawName.(string), "dmap.")
+ 
+ 		b.log.V(2).Printf("[INFO] Moving %s fragment: %s (kind: %s) on PartID: %d to %s",
+ 			f.Name(), name, part.Kind(), part.ID(), ownersStr)
+ 
+-		err := f.Move(part, name, owners)
++		var err error
++		if m, ok := f.(contextMover); ok {
++			err = m.MoveContext(ctx, part, name, owners)
++		} else {
++			err = f.Move(part, name, owners)
++		}
+ 		if err != nil {
+ 			b.log.V(2).Printf("[ERROR] Failed to move %s fragment: %s on PartID: %d to %s: %v",
+ 				f.Name(), name, part.ID(), ownersStr, err)
+ 		}
+ 
+ 		// if this returns true, the iteration continues
+-		return !b.breakLoop(sign)
++		return !b.breakLoop(ctx, sign)
+ 	})
+ }
+ 
+-func (b *Balancer) primaryCopies() {
++func (b *Balancer) primaryCopies(ctx context.Context) {
+ 	sign := b.rt.Signature()
+ 	for partID := uint64(0); partID < b.config.PartitionCount; partID++ {
+-		if b.breakLoop(sign) {
++		if b.breakLoop(ctx, sign) {
+ 			break
+ 		}
+ 
+@@ -121,15 +135,20 @@ func (b *Balancer) primaryCopies() {
+ 		}
+ 
+ 		// This is a previous owner. Move the keys.
+-		b.scanPartition(sign, part, owner)
++		b.scanPartition(ctx, sign, part, owner)
+ 	}
+ }
+ 
+-func (b *Balancer) breakLoop(sign uint64) bool {
++func (b *Balancer) breakLoop(ctx context.Context, sign uint64) bool {
+ 	if !b.isAlive() {
+ 		return true
+ 	}
+ 
++	if ctx.Err() != nil {
++		// The caller doesn't wait for the data to move anymore.
++		return true
++	}
++
+ 	if sign != b.rt.Signature() {
+ 		// Routing table is updated. Just quit. Another balancer goroutine
+ 		// will work on the new table immediately.
+@@ -139,11 +158,11 @@ func (b *Balancer) breakLoop(sign uint64) bool {
+ 	return false
+ }
+ 
+-func (b *Balancer) backupCopies() {
++func (b *Balancer) backupCopies(ctx context.Context) {
+ 	sign := b.rt.Signature()
+ LOOP:
+ 	for partID := uint64(0); partID < b.config.PartitionCount; partID++ {
+-		if b.breakLoop(sign) {
++		if b.breakLoop(ctx, sign) {
+ 			break
+ 		}
+ 
+@@ -180,11 +199,11 @@ LOOP:
+ 			continue LOOP
+ 		}
+ 
+-		b.scanPartition(sign, part, currentOwners...)
++		b.scanPartition(ctx, sign, part, currentOwners...)
+ 	}
+ }
+ 
+-func (b *Balancer) triggerBalancer() {
++func (b *Balancer) triggerBalancer(ctx context.Context) {
+ 	b.Lock()
+ 	defer b.Unlock()
+ 
+@@ -193,15 +212,122 @@ func (b *Balancer) triggerBalancer() {
+ 		return
+ 	}
+ 
+-	b.primaryCopies()
++	b.primaryCopies(ctx)
+ 
+ 	if b.config.ReplicaCount > config.MinimumReplicaCount {
+-		b.backupCopies()
++		b.backupCopies(ctx)
+ 	}
+ }
+ 
+ func (b *Balancer) BalanceEagerly() {
+-	b.triggerBalancer()
++	b.triggerBalancer(b.ctx)
++}
++
++// ErrOwnsPartitions is returned by Drain when the routing table gives
++// partitions to this member again while it is leaving. It happens when the
++// cluster coordinator changes and the new one doesn't know about the leave.
++var ErrOwnsPartitions = errors.New("the routing table gives partitions to this member")
++
++// ownsPartitions reports whether the routing table gives any partition to this
++// member.
++func (b *Balancer) ownsPartitions() bool {
++	this := b.rt.This()
++	for partID := uint64(0); partID < b.config.PartitionCount; partID++ {
++		part := b.primary.PartitionByID(partID)
++		if part.OwnerCount() != 0 && part.Owner().CompareByID(this) {
++			return true
++		}
++	}
++	return false
++}
++
++func (b *Balancer) hasPrimaryCopies() bool {
++	for partID := uint64(0); partID < b.config.PartitionCount; partID++ {
++		if b.primary.PartitionByID(partID).Length() != 0 {
++			return true
++		}
++	}
++	return false
++}
++
++// lock acquires the balancer lock unless ctx is done first. A balancing pass
++// that is already running may take long, so it doesn't block on the lock.
++func (b *Balancer) lock(ctx context.Context) error {
++	for !b.TryLock() {
++		select {
++		case <-ctx.Done():
++			return ctx.Err()
++		case <-time.After(10 * time.Millisecond):
++		}
++	}
++	return nil
++}
++
++// Drain moves the primary copies this member holds to the owners in the
++// current routing table. Backup copies are left to the regular balancing runs.
++// It returns nil when no primary copy is left, or when this is the only member
++// of the cluster and there is nobody to move them to. If ctx is done before
++// that, it returns the error of ctx without waiting for a move that is going on.
++func (b *Balancer) Drain(ctx context.Context) error {
++	var empty bool
++	for {
++		if b.rt.Discovery().NumMembers() <= 1 {
++			return nil
++		}
++
++		if b.ownsPartitions() {
++			return ErrOwnsPartitions
++		}
++
++		left, err := b.drainOnce(ctx)
++		if err != nil {
++			return err
++		}
++
++		if left {
++			empty = false
++			if err := ctx.Err(); err != nil {
++				return err
++			}
++		} else if empty || ctx.Err() != nil {
++			return nil
++		} else {
++			// A write that was routed here before the routing table changed may
++			// still land, so the partitions have to stay empty for one more round.
++			empty = true
++		}
++
++		select {
++		case <-ctx.Done():
++		case <-time.After(100 * time.Millisecond):
++		}
++	}
++}
++
++// drainOnce moves the primary copies that are here and reports whether some of
++// them are left. Moving and counting them waits for the fragments that other
++// operations hold, during a network call for example, so this runs in its own
++// goroutine and drainOnce returns the error of ctx as soon as ctx is done. The
++// goroutine stops at its next check of ctx then.
++func (b *Balancer) drainOnce(ctx context.Context) (bool, error) {
++	left := make(chan bool, 1)
++	b.wg.Add(1)
++	go func() {
++		defer b.wg.Done()
++
++		if err := b.lock(ctx); err == nil {
++			b.primaryCopies(ctx)
++			b.Unlock()
++		}
++		left <- b.hasPrimaryCopies()
++	}()
++
++	select {
++	case l := <-left:
++		return l, nil
++	case <-ctx.Done():
++		return false, ctx.Err()
++	}
+ }
+ 
+ func (b *Balancer) balance() {
+@@ -214,7 +340,7 @@ func (b *Balancer) balance() {
+ 		timer.Reset(b.config.TriggerBalancerInterval)
+ 		select {
+ 		case <-timer.C:
+-			b.triggerBalancer()
++			b.triggerBalancer(b.ctx)
+ 		case <-b.ctx.Done():
+ 			return
+ 		}
+diff --git a/internal/cluster/routingtable/handlers.go b/internal/cluster/routingtable/handlers.go
+index f969e16..6943175 100644
+--- a/internal/cluster/routingtable/handlers.go
++++ b/internal/cluster/routingtable/handlers.go
+@@ -21,4 +21,6 @@ import (
+ func (r *RoutingTable) RegisterHandlers() {
+ 	r.server.ServeMux().HandleFunc(protocol.Internal.UpdateRouting, r.updateRoutingCommandHandler)
+ 	r.server.ServeMux().HandleFunc(protocol.Internal.LengthOfPart, r.lengthOfPartCommandHandler)
++	r.server.ServeMux().HandleFunc(protocol.Internal.Leave, r.leaveCommandHandler)
++	r.server.ServeMux().HandleFunc(protocol.Internal.CancelLeave, r.cancelLeaveCommandHandler)
+ }
+diff --git a/internal/cluster/routingtable/leave.go b/internal/cluster/routingtable/leave.go
+new file mode 100644
+index 0000000..9aabd31
+--- /dev/null
++++ b/internal/cluster/routingtable/leave.go
+@@ -0,0 +1,255 @@
++// Copyright 2018-2026 The Olric Authors
++//
++// Licensed under the Apache License, Version 2.0 (the "License");
++// you may not use this file except in compliance with the License.
++// You may obtain a copy of the License at
++//
++//     http://www.apache.org/licenses/LICENSE-2.0
++//
++// Unless required by applicable law or agreed to in writing, software
++// distributed under the License is distributed on an "AS IS" BASIS,
++// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++// See the License for the specific language governing permissions and
++// limitations under the License.
++
++package routingtable
++
++import (
++	"context"
++	"errors"
++	"time"
++
++	"github.com/olric-data/olric/internal/protocol"
++	"github.com/redis/go-redis/v9"
++	"github.com/tidwall/redcon"
++)
++
++var (
++	// ErrNotCoordinator is returned when a request that only the cluster coordinator
++	// can serve reaches another member.
++	ErrNotCoordinator = errors.New("this member is not the cluster coordinator")
++
++	// ErrLastMember is returned when a member asks to leave, but no other member is
++	// left to take over its partitions.
++	ErrLastMember = errors.New("no other member can take over the partitions")
++)
++
++func (r *RoutingTable) markLeaving(name string, memberID uint64) error {
++	r.leavingMtx.Lock()
++	defer r.leavingMtx.Unlock()
++
++	// The hash ring must never be empty, someone has to own the partitions.
++	var taker bool
++	for _, member := range r.consistent.GetMembers() {
++		if member.String() != name {
++			taker = true
++			break
++		}
++	}
++	if !taker {
++		return ErrLastMember
++	}
++
++	r.leaving[memberID] = struct{}{}
++	r.consistent.Remove(name)
++	return nil
++}
++
++// forgetLeaving drops the leaving mark of a member that is gone, so a member that
++// restarts with the same name gets partitions again.
++func (r *RoutingTable) forgetLeaving(memberID uint64) {
++	r.leavingMtx.Lock()
++	defer r.leavingMtx.Unlock()
++
++	delete(r.leaving, memberID)
++}
++
++// unmarkLeaving puts a member that is still in the cluster back into the
++// partition distribution.
++func (r *RoutingTable) unmarkLeaving(memberID uint64) {
++	r.forgetLeaving(memberID)
++
++	r.Members().RLock()
++	defer r.Members().RUnlock()
++
++	member, err := r.Members().Get(memberID)
++	if err != nil {
++		// The member is already gone.
++		return
++	}
++	r.consistent.Add(member)
++}
++
++// keepLeavingMembers puts the leaving members back into the hash ring, after all
++// the other members are gone. The caller must hold the lock of the members list.
++func (r *RoutingTable) keepLeavingMembers() {
++	r.leavingMtx.Lock()
++	defer r.leavingMtx.Unlock()
++
++	for memberID := range r.leaving {
++		if member, err := r.Members().Get(memberID); err == nil {
++			r.consistent.Add(member)
++		}
++		delete(r.leaving, memberID)
++	}
++}
++
++func (r *RoutingTable) isLeaving(memberID uint64) bool {
++	r.leavingMtx.Lock()
++	defer r.leavingMtx.Unlock()
++
++	_, ok := r.leaving[memberID]
++	return ok
++}
++
++func (r *RoutingTable) leaveCommandHandler(conn redcon.Conn, cmd redcon.Command) {
++	// The command handlers of the routing table service should wait for the cluster join event.
++	<-r.joined
++
++	leaveCmd, err := protocol.ParseLeaveCommand(cmd)
++	if err != nil {
++		protocol.WriteError(conn, err)
++		return
++	}
++
++	if !r.discovery.IsCoordinator() {
++		protocol.WriteError(conn, ErrNotCoordinator)
++		return
++	}
++
++	if err := r.markLeaving(leaveCmd.Name, leaveCmd.MemberID); err != nil {
++		protocol.WriteError(conn, err)
++		return
++	}
++	r.log.V(2).Printf("[INFO] %s is leaving the cluster", leaveCmd.Name)
++	r.updateRouting()
++	conn.WriteString(protocol.StatusOK)
++}
++
++func (r *RoutingTable) cancelLeaveCommandHandler(conn redcon.Conn, cmd redcon.Command) {
++	// The command handlers of the routing table service should wait for the cluster join event.
++	<-r.joined
++
++	cancelLeaveCmd, err := protocol.ParseCancelLeaveCommand(cmd)
++	if err != nil {
++		protocol.WriteError(conn, err)
++		return
++	}
++
++	if !r.discovery.IsCoordinator() {
++		protocol.WriteError(conn, ErrNotCoordinator)
++		return
++	}
++
++	r.log.V(2).Printf("[INFO] Member %d stays in the cluster", cancelLeaveCmd.MemberID)
++	r.unmarkLeaving(cancelLeaveCmd.MemberID)
++	r.updateRouting()
++	conn.WriteString(protocol.StatusOK)
++}
++
++// onCoordinator runs local if this member is the cluster coordinator. Otherwise,
++// it sends the command that newCmd builds to the coordinator. The coordinator may
++// be leaving at the same time, so it is looked up again at each attempt.
++func (r *RoutingTable) onCoordinator(ctx context.Context, local func() error, newCmd func() *redis.StatusCmd) error {
++	for {
++		if err := ctx.Err(); err != nil {
++			return err
++		}
++
++		err := r.tryOnCoordinator(ctx, local, newCmd)
++		if err == nil || errors.Is(err, ErrLastMember) {
++			return err
++		}
++		r.log.V(3).Printf("[DEBUG] Failed to reach the cluster coordinator: %v", err)
++
++		select {
++		case <-ctx.Done():
++		case <-time.After(100 * time.Millisecond):
++		}
++	}
++}
++
++func (r *RoutingTable) tryOnCoordinator(ctx context.Context, local func() error, newCmd func() *redis.StatusCmd) error {
++	if r.discovery.IsCoordinator() {
++		return local()
++	}
++
++	// Wait for the command sent before, also if its caller stopped waiting for
++	// the reply, so the coordinator can't get a Leave after the CancelLeave that
++	// follows it.
++	select {
++	case r.leaveCmds <- struct{}{}:
++	case <-ctx.Done():
++		return ctx.Err()
++	}
++
++	// The client keeps reading the reply until its own read timeout, even when
++	// ctx is done, so the command runs in its own goroutine.
++	errCh := make(chan error, 1)
++	go func() {
++		defer func() { <-r.leaveCmds }()
++
++		cmd := newCmd()
++		rc := r.client.Get(r.discovery.GetCoordinator().String())
++		if err := rc.Process(ctx, cmd); err != nil {
++			errCh <- protocol.ConvertError(err)
++			return
++		}
++		errCh <- protocol.ConvertError(cmd.Err())
++	}()
++
++	select {
++	case err := <-errCh:
++		return err
++	case <-ctx.Done():
++		return ctx.Err()
++	}
++}
++
++// updateRoutingContext works like updateRouting, but it returns the error of ctx
++// if ctx is done first. The update goes on then. It computes the routing table
++// from the members when it runs, so it can't bring back a state that a later
++// change replaced.
++func (r *RoutingTable) updateRoutingContext(ctx context.Context) error {
++	done := make(chan struct{})
++	r.wg.Add(1)
++	go func() {
++		defer r.wg.Done()
++		defer close(done)
++
++		r.updateRouting()
++	}()
++
++	select {
++	case <-done:
++		return nil
++	case <-ctx.Done():
++		return ctx.Err()
++	}
++}
++
++// Leave takes this member out of the partition distribution. The coordinator
++// assigns its partitions to the other members and pushes the new routing table,
++// so the balancer can hand the data off before the member stops. It returns
++// ErrLastMember if no other member can take over the partitions.
++func (r *RoutingTable) Leave(ctx context.Context) error {
++	return r.onCoordinator(ctx, func() error {
++		if err := r.markLeaving(r.this.Name, r.this.ID); err != nil {
++			return err
++		}
++		return r.updateRoutingContext(ctx)
++	}, func() *redis.StatusCmd {
++		return protocol.NewLeave(r.this.Name, r.this.ID).Command(ctx)
++	})
++}
++
++// CancelLeave puts this member back into the partition distribution after Leave,
++// so it keeps serving the data it couldn't hand off.
++func (r *RoutingTable) CancelLeave(ctx context.Context) error {
++	return r.onCoordinator(ctx, func() error {
++		r.unmarkLeaving(r.this.ID)
++		return r.updateRoutingContext(ctx)
++	}, func() *redis.StatusCmd {
++		return protocol.NewCancelLeave(r.this.ID).Command(ctx)
++	})
++}
+diff --git a/internal/cluster/routingtable/routingtable.go b/internal/cluster/routingtable/routingtable.go
+index 11503f6..494fb79 100644
+--- a/internal/cluster/routingtable/routingtable.go
++++ b/internal/cluster/routingtable/routingtable.go
+@@ -76,6 +76,15 @@ type RoutingTable struct {
+ 	ctx    context.Context
+ 	cancel context.CancelFunc
+ 	wg     sync.WaitGroup
++
++	// leaving holds the IDs of the members that are handing off their data
++	// before leaving the cluster. They get no partitions.
++	leavingMtx sync.Mutex
++	leaving    map[uint64]struct{}
++
++	// leaveCmds lets one Leave or CancelLeave command of this member go to the
++	// coordinator at a time, so the coordinator gets them in the order they were sent.
++	leaveCmds chan struct{}
+ }
+ 
+ func registerErrors() {
+@@ -83,6 +92,8 @@ func registerErrors() {
+ 	protocol.SetError("CLUSTERJOIN", ErrClusterJoin)
+ 	protocol.SetError("SERVERGONE", ErrServerGone)
+ 	protocol.SetError("OPERATIONTIMEOUT", ErrOperationTimeout)
++	protocol.SetError("NOTCOORDINATOR", ErrNotCoordinator)
++	protocol.SetError("LASTMEMBER", ErrLastMember)
+ }
+ 
+ func New(e *environment.Environment) *RoutingTable {
+@@ -111,6 +122,8 @@ func New(e *environment.Environment) *RoutingTable {
+ 		server:     e.Get("server").(*server.Server),
+ 		pushPeriod: c.RoutingTablePushInterval,
+ 		joined:     make(chan struct{}),
++		leaving:    make(map[uint64]struct{}),
++		leaveCmds:  make(chan struct{}, 1),
+ 		ctx:        ctx,
+ 		cancel:     cancel,
+ 	}
+@@ -268,7 +281,9 @@ func (r *RoutingTable) processClusterEvent(event *discovery.ClusterEvent) {
+ 	switch event.Event {
+ 	case memberlist.NodeJoin:
+ 		r.Members().Add(member)
+-		r.consistent.Add(member)
++		if !r.isLeaving(member.ID) {
++			r.consistent.Add(member)
++		}
+ 		r.log.V(2).Printf("[INFO] Node joined: %s", member)
+ 
+ 		if r.config.EnableClusterEventsChannel {
+@@ -281,7 +296,12 @@ func (r *RoutingTable) processClusterEvent(event *discovery.ClusterEvent) {
+ 			return
+ 		}
+ 		r.Members().Delete(member.ID)
++		r.forgetLeaving(member.ID)
+ 		r.consistent.Remove(event.NodeName)
++		if len(r.consistent.GetMembers()) == 0 {
++			// Nobody else can take over the partitions of the leaving members.
++			r.keepLeavingMembers()
++		}
+ 		// Don't try to used closed sockets again.
+ 		r.log.V(2).Printf("[INFO] Node left: %s", event.NodeName)
+ 		if err := r.client.Close(event.NodeName); err != nil {
+@@ -298,6 +318,7 @@ func (r *RoutingTable) processClusterEvent(event *discovery.ClusterEvent) {
+ 		r.Members().Range(func(id uint64, item discovery.Member) bool {
+ 			if member.CompareByName(item) {
+ 				r.Members().Delete(id)
++				r.forgetLeaving(id)
+ 				r.consistent.Remove(event.NodeName)
+ 				if err := r.client.Close(event.NodeName); err != nil {
+ 					r.log.V(2).Printf("[ERROR] Failed to remove the node from pool %s: %v", event.NodeName, err)
+@@ -306,7 +327,9 @@ func (r *RoutingTable) processClusterEvent(event *discovery.ClusterEvent) {
+ 			return true
+ 		})
+ 		r.Members().Add(member)
+-		r.consistent.Add(member)
++		if !r.isLeaving(member.ID) {
++			r.consistent.Add(member)
++		}
+ 		r.log.V(2).Printf("[INFO] Node updated: %s", member)
+ 	default:
+ 		r.log.V(2).Printf("[ERROR] Unknown event received: %v", event)
+diff --git a/internal/dmap/atomic.go b/internal/dmap/atomic.go
+index 53b3ba1..b7dec23 100644
+--- a/internal/dmap/atomic.go
++++ b/internal/dmap/atomic.go
+@@ -22,14 +22,62 @@ import (
+ 	"time"
+ 
+ 	"github.com/olric-data/olric/internal/cluster/partitions"
++	"github.com/olric-data/olric/internal/discovery"
+ 	"github.com/olric-data/olric/internal/protocol"
+ 	"github.com/olric-data/olric/internal/resp"
+ 	"github.com/olric-data/olric/internal/util"
+ 	"github.com/olric-data/olric/pkg/storage"
++	"github.com/redis/go-redis/v9"
+ )
+ 
++// onOwner runs an operation that reads a key and writes it back on the owner of
++// the partition of the key: local when this member is the owner, remote on the
++// owner otherwise. When the partition is given to another member while the
++// operation runs, it fails with errPartitionMoved and the whole operation runs
++// again on the new owner. Sending only the value it has already computed there
++// would overwrite the changes the new owner has made in the meantime.
++func (dm *DMap) onOwner(key string, local func() error, remote func(owner discovery.Member) error) error {
++	hkey := partitions.HKey(dm.name, key)
++	for {
++		owner := dm.s.primary.PartitionByHKey(hkey).Owner()
++		var err error
++		if owner.CompareByName(dm.s.rt.This()) {
++			err = local()
++		} else {
++			err = remote(owner)
++		}
++		if !errors.Is(err, errPartitionMoved) {
++			return err
++		}
++	}
++}
++
++// getForUpdate reads the key for an operation that writes it back afterwards.
++// It runs on the partition owner, and fails with errPartitionMoved if this
++// member doesn't own the partition anymore.
++func (dm *DMap) getForUpdate(e *env) (storage.Entry, error) {
++	e.hkey = partitions.HKey(e.dmap, e.key)
++	this := dm.s.rt.This()
++	if !dm.s.primary.PartitionByHKey(e.hkey).Owner().CompareByName(this) {
++		return nil, errPartitionMoved
++	}
++	// The value is computed from what is read now, so the entry gets a newer
++	// timestamp than the one read.
++	e.timestamp = time.Now().UnixNano()
++	return dm.getOnOwner(e.ctx, e.hkey, e.key, this)
++}
++
++// putForUpdate writes the value that an operation computed from what
++// getForUpdate read. It writes on this member only, and fails with
++// errPartitionMoved if the partition has been given to another member in the
++// meantime instead of sending the value to the new owner.
++func (dm *DMap) putForUpdate(e *env) error {
++	e.hkey = partitions.HKey(e.dmap, e.key)
++	return dm.putOnCluster(e)
++}
++
+ func (dm *DMap) loadCurrentAtomicInt(e *env) (int, int64, error) {
+-	entry, err := dm.Get(e.ctx, e.key)
++	entry, err := dm.getForUpdate(e)
+ 	if errors.Is(err, ErrKeyNotFound) {
+ 		return 0, 0, nil
+ 	}
+@@ -47,6 +95,8 @@ func (dm *DMap) loadCurrentAtomicInt(e *env) (int, int64, error) {
+ 	return int(nr), entry.TTL(), nil
+ }
+ 
++// atomicIncrDecr runs Incr or Decr on this member, the partition owner. Use
++// incrDecr to run it on the owner.
+ func (dm *DMap) atomicIncrDecr(cmd string, e *env, delta int) (int, error) {
+ 	atomicKey := e.dmap + e.key
+ 	dm.s.locker.Lock(atomicKey)
+@@ -87,7 +137,7 @@ func (dm *DMap) atomicIncrDecr(cmd string, e *env, delta int) (int, error) {
+ 		e.putConfig.HasPX = true
+ 		e.putConfig.PX = time.Until(time.UnixMilli(ttl))
+ 	}
+-	err = dm.put(e)
++	err = dm.putForUpdate(e)
+ 	if err != nil {
+ 		return 0, err
+ 	}
+@@ -97,21 +147,77 @@ func (dm *DMap) atomicIncrDecr(cmd string, e *env, delta int) (int, error) {
+ 
+ // Incr atomically increments key by delta. The return value is the new value after being incremented or an error.
+ func (dm *DMap) Incr(ctx context.Context, key string, delta int) (int, error) {
+-	e := newEnv(ctx)
+-	e.dmap = dm.name
+-	e.key = key
+-	return dm.atomicIncrDecr(protocol.DMap.Incr, e, delta)
++	return dm.incrDecr(ctx, protocol.DMap.Incr, key, delta)
+ }
+ 
+ // Decr atomically decrements key by delta. The return value is the new value after being decremented or an error.
+ func (dm *DMap) Decr(ctx context.Context, key string, delta int) (int, error) {
+-	e := newEnv(ctx)
+-	e.dmap = dm.name
+-	e.key = key
+-	return dm.atomicIncrDecr(protocol.DMap.Decr, e, delta)
++	return dm.incrDecr(ctx, protocol.DMap.Decr, key, delta)
++}
++
++// incrDecr runs Incr or Decr on the owner of the partition of the key, so the
++// counter is read and written at the same place.
++func (dm *DMap) incrDecr(ctx context.Context, cmd, key string, delta int) (int, error) {
++	var updated int
++	err := dm.onOwner(key, func() error {
++		e := newEnv(ctx)
++		e.dmap = dm.name
++		e.key = key
++		var err error
++		updated, err = dm.atomicIncrDecr(cmd, e, delta)
++		return err
++	}, func(owner discovery.Member) error {
++		var c *redis.IntCmd
++		if cmd == protocol.DMap.Decr {
++			c = protocol.NewDecr(dm.name, key, delta).Command(ctx)
++		} else {
++			c = protocol.NewIncr(dm.name, key, delta).Command(ctx)
++		}
++		rc := dm.s.client.Get(owner.String())
++		if err := rc.Process(ctx, c); err != nil {
++			return protocol.ConvertError(err)
++		}
++		v, err := c.Result()
++		if err != nil {
++			return protocol.ConvertError(err)
++		}
++		updated = int(v)
++		return nil
++	})
++	return updated, err
+ }
+ 
++// getPut runs GetPut on the owner of the partition of the key.
+ func (dm *DMap) getPut(e *env) (storage.Entry, error) {
++	var old storage.Entry
++	err := dm.onOwner(e.key, func() error {
++		var err error
++		old, err = dm.getPutOnThisOwner(e)
++		return err
++	}, func(owner discovery.Member) error {
++		c := protocol.NewGetPut(e.dmap, e.key, e.value).SetRaw().Command(e.ctx)
++		rc := dm.s.client.Get(owner.String())
++		err := rc.Process(e.ctx, c)
++		if errors.Is(err, redis.Nil) {
++			old = nil
++			return nil
++		}
++		if err != nil {
++			return protocol.ConvertError(err)
++		}
++		raw, err := c.Bytes()
++		if err != nil {
++			return protocol.ConvertError(err)
++		}
++		old = dm.engine.NewEntry()
++		old.Decode(raw)
++		return nil
++	})
++	return old, err
++}
++
++// getPutOnThisOwner runs GetPut on this member, the partition owner.
++func (dm *DMap) getPutOnThisOwner(e *env) (storage.Entry, error) {
+ 	atomicKey := e.dmap + e.key
+ 	dm.s.locker.Lock(atomicKey)
+ 	defer func() {
+@@ -121,14 +227,14 @@ func (dm *DMap) getPut(e *env) (storage.Entry, error) {
+ 		}
+ 	}()
+ 
+-	entry, err := dm.Get(e.ctx, e.key)
++	entry, err := dm.getForUpdate(e)
+ 	if errors.Is(err, ErrKeyNotFound) {
+ 		err = nil
+ 	}
+ 	if err != nil {
+ 		return nil, err
+ 	}
+-	err = dm.put(e)
++	err = dm.putForUpdate(e)
+ 	if err != nil {
+ 		return nil, err
+ 	}
+@@ -170,6 +276,7 @@ func (dm *DMap) GetPut(ctx context.Context, key string, value interface{}) (stor
+ 	return raw, nil
+ }
+ 
++// atomicIncrByFloat runs IncrByFloat on this member, the partition owner.
+ func (dm *DMap) atomicIncrByFloat(e *env, delta float64) (float64, error) {
+ 	atomicKey := e.dmap + e.key
+ 	dm.s.locker.Lock(atomicKey)
+@@ -181,7 +288,7 @@ func (dm *DMap) atomicIncrByFloat(e *env, delta float64) (float64, error) {
+ 	}()
+ 
+ 	var current float64
+-	entry, err := dm.Get(e.ctx, e.key)
++	entry, err := dm.getForUpdate(e)
+ 	if errors.Is(err, ErrKeyNotFound) {
+ 		err = nil
+ 	}
+@@ -210,7 +317,7 @@ func (dm *DMap) atomicIncrByFloat(e *env, delta float64) (float64, error) {
+ 	e.value = make([]byte, valueBuf.Len())
+ 	copy(e.value, valueBuf.Bytes())
+ 
+-	err = dm.put(e)
++	err = dm.putForUpdate(e)
+ 	if err != nil {
+ 		return 0, err
+ 	}
+@@ -220,10 +327,28 @@ func (dm *DMap) atomicIncrByFloat(e *env, delta float64) (float64, error) {
+ 
+ // IncrByFloat atomically increments key by delta. The return value is the new value after being incremented or an error.
+ func (dm *DMap) IncrByFloat(ctx context.Context, key string, delta float64) (float64, error) {
+-	e := newEnv(ctx)
+-	e.dmap = dm.name
+-	e.key = key
+-	return dm.atomicIncrByFloat(e, delta)
++	var latest float64
++	err := dm.onOwner(key, func() error {
++		e := newEnv(ctx)
++		e.dmap = dm.name
++		e.key = key
++		var err error
++		latest, err = dm.atomicIncrByFloat(e, delta)
++		return err
++	}, func(owner discovery.Member) error {
++		c := protocol.NewIncrByFloat(dm.name, key, delta).Command(ctx)
++		rc := dm.s.client.Get(owner.String())
++		if err := rc.Process(ctx, c); err != nil {
++			return protocol.ConvertError(err)
++		}
++		v, err := c.Result()
++		if err != nil {
++			return protocol.ConvertError(err)
++		}
++		latest = v
++		return nil
++	})
++	return latest, err
+ }
+ 
+ // compareAndSwap performs the CAS on the partition owner: it takes the fine-
+@@ -248,7 +373,7 @@ func (dm *DMap) compareAndSwap(e *env, expected []byte) (bool, storage.Entry, er
+ 		}
+ 	}()
+ 
+-	current, err := dm.Get(e.ctx, e.key)
++	current, err := dm.getForUpdate(e)
+ 	if errors.Is(err, ErrKeyNotFound) {
+ 		current = nil
+ 		err = nil
+@@ -272,8 +397,8 @@ func (dm *DMap) compareAndSwap(e *env, expected []byte) (bool, storage.Entry, er
+ 		}
+ 	}
+ 
+-	// Matched; write the new value. dm.put handles replication.
+-	if err := dm.put(e); err != nil {
++	// Matched; write the new value. putForUpdate handles replication.
++	if err := dm.putForUpdate(e); err != nil {
+ 		return false, nil, err
+ 	}
+ 	return true, nil, nil
+@@ -316,46 +441,55 @@ func (dm *DMap) CompareAndSwap(
+ 		cfg = &PutConfig{}
+ 	}
+ 
+-	hkey := partitions.HKey(dm.name, key)
+-	member := dm.s.primary.PartitionByHKey(hkey).Owner()
+-	if member.CompareByName(dm.s.rt.This()) {
+-		// Local (owner) path.
++	return dm.compareAndSwapOnOwner(ctx, key, expected, encoded, cfg)
++}
++
++// compareAndSwapOnOwner runs CompareAndSwap on the owner of the partition of the
++// key, so the atomic-key lock runs there. This makes CompareAndSwap cluster-wide
++// serializing for the key.
++func (dm *DMap) compareAndSwapOnOwner(ctx context.Context, key string, expected, value []byte, cfg *PutConfig) (bool, storage.Entry, error) {
++	var (
++		swapped bool
++		current storage.Entry
++	)
++	err := dm.onOwner(key, func() error {
+ 		e := newEnv(ctx)
+ 		e.dmap = dm.name
+ 		e.key = key
+-		e.value = encoded
++		e.value = value
+ 		e.putConfig = cfg
+-		return dm.compareAndSwap(e, expected)
+-	}
+-
+-	// Remote path: dispatch DM.CAS to the owner so the atomic-key lock runs
+-	// there. This makes CompareAndSwap cluster-wide serializing for the key,
+-	// stricter than GetPut/Incr which only lock locally.
+-	casCmd := protocol.NewCompareAndSwap(dm.name, key, expected, encoded)
+-	switch {
+-	case cfg.HasEX:
+-		casCmd.SetEX(cfg.EX.Seconds())
+-	case cfg.HasPX:
+-		casCmd.SetPX(cfg.PX.Milliseconds())
+-	case cfg.HasEXAT:
+-		casCmd.SetEXAT(cfg.EXAT.Seconds())
+-	case cfg.HasPXAT:
+-		casCmd.SetPXAT(cfg.PXAT.Milliseconds())
+-	}
+-	cmd := casCmd.Command(ctx)
+-	rc := dm.s.client.Get(member.String())
+-	if err := rc.Process(ctx, cmd); err != nil {
+-		return false, nil, protocol.ConvertError(err)
+-	}
+-	if err := cmd.Err(); err != nil {
+-		return false, nil, protocol.ConvertError(err)
+-	}
++		var err error
++		swapped, current, err = dm.compareAndSwap(e, expected)
++		return err
++	}, func(owner discovery.Member) error {
++		casCmd := protocol.NewCompareAndSwap(dm.name, key, expected, value)
++		switch {
++		case cfg.HasEX:
++			casCmd.SetEX(cfg.EX.Seconds())
++		case cfg.HasPX:
++			casCmd.SetPX(cfg.PX.Milliseconds())
++		case cfg.HasEXAT:
++			casCmd.SetEXAT(cfg.EXAT.Seconds())
++		case cfg.HasPXAT:
++			casCmd.SetPXAT(cfg.PXAT.Milliseconds())
++		}
++		cmd := casCmd.Command(ctx)
++		rc := dm.s.client.Get(owner.String())
++		if err := rc.Process(ctx, cmd); err != nil {
++			return protocol.ConvertError(err)
++		}
++		if err := cmd.Err(); err != nil {
++			return protocol.ConvertError(err)
++		}
+ 
+-	items, err := cmd.Slice()
+-	if err != nil {
+-		return false, nil, protocol.ConvertError(err)
+-	}
+-	return decodeCompareAndSwapReply(items, dm.engine.NewEntry)
++		items, err := cmd.Slice()
++		if err != nil {
++			return protocol.ConvertError(err)
++		}
++		swapped, current, err = decodeCompareAndSwapReply(items, dm.engine.NewEntry)
++		return err
++	})
++	return swapped, current, err
+ }
+ 
+ // decodeCompareAndSwapReply parses the two-element reply from DM.CAS.
+diff --git a/internal/dmap/atomic_handlers.go b/internal/dmap/atomic_handlers.go
+index 8896f2d..617b560 100644
+--- a/internal/dmap/atomic_handlers.go
++++ b/internal/dmap/atomic_handlers.go
+@@ -28,10 +28,7 @@ func (s *Service) incrDecrCommon(cmd, dmap, key string, delta int) (int, error)
+ 		return 0, err
+ 	}
+ 
+-	e := newEnv(s.ctx)
+-	e.dmap = dm.name
+-	e.key = key
+-	return dm.atomicIncrDecr(cmd, e, delta)
++	return dm.incrDecr(s.ctx, cmd, key, delta)
+ }
+ 
+ func (s *Service) incrCommandHandler(conn redcon.Conn, cmd redcon.Command) {
+@@ -126,13 +123,7 @@ func (s *Service) compareAndSwapCommandHandler(conn redcon.Conn, cmd redcon.Comm
+ 		pc.PXAT = time.Duration(casCmd.PXAT * int64(time.Millisecond))
+ 	}
+ 
+-	e := newEnv(s.ctx)
+-	e.dmap = casCmd.DMap
+-	e.key = casCmd.Key
+-	e.value = casCmd.Value
+-	e.putConfig = &pc
+-
+-	swapped, current, err := dm.compareAndSwap(e, casCmd.Expected)
++	swapped, current, err := dm.compareAndSwapOnOwner(s.ctx, casCmd.Key, casCmd.Expected, casCmd.Value, &pc)
+ 	if err != nil {
+ 		protocol.WriteError(conn, err)
+ 		return
+@@ -164,10 +155,7 @@ func (s *Service) incrByFloatCommandHandler(conn redcon.Conn, cmd redcon.Command
+ 		return
+ 	}
+ 
+-	e := newEnv(s.ctx)
+-	e.dmap = dm.name
+-	e.key = incrCmd.Key
+-	latest, err := dm.atomicIncrByFloat(e, incrCmd.Delta)
++	latest, err := dm.IncrByFloat(s.ctx, incrCmd.Key, incrCmd.Delta)
+ 	if err != nil {
+ 		protocol.WriteError(conn, err)
+ 		return
+diff --git a/internal/dmap/balance.go b/internal/dmap/balance.go
+index faf5e9d..1e0dbc1 100644
+--- a/internal/dmap/balance.go
++++ b/internal/dmap/balance.go
+@@ -64,6 +64,13 @@ func (dm *DMap) mergeFragments(part *partitions.Partition, fp *fragmentPack) err
+ 	f.Lock()
+ 	defer f.Unlock()
+ 
++	// Only the owner takes primary copies. A member that has handed its own
++	// over because it's leaving the cluster would stop with them, so the sender
++	// keeps them and moves them to the owner in its routing table later.
++	if part.Kind() == partitions.PRIMARY && !part.Owner().CompareByName(dm.s.rt.This()) {
++		return errPartitionMoved
++	}
++
+ 	return f.storage.Import(fp.Payload, func(hkey uint64, entry storage.Entry) error {
+ 		return dm.fragmentMergeFunction(f, hkey, entry)
+ 	})
+diff --git a/internal/dmap/delete.go b/internal/dmap/delete.go
+index 627e636..d262f03 100644
+--- a/internal/dmap/delete.go
++++ b/internal/dmap/delete.go
+@@ -18,6 +18,7 @@ import (
+ 	"context"
+ 	"errors"
+ 
++	"github.com/olric-data/olric/config"
+ 	"github.com/olric-data/olric/internal/cluster/partitions"
+ 	"github.com/olric-data/olric/internal/discovery"
+ 	"github.com/olric-data/olric/internal/protocol"
+@@ -100,6 +101,12 @@ func (dm *DMap) deleteOnCluster(hkey uint64, key string, f *fragment) error {
+ 		return err
+ 	}
+ 
++	return dm.deleteOnThisOwner(hkey, key, f)
++}
++
++// deleteOnThisOwner deletes the key from the backups and from the fragment of
++// this member, the partition owner. It is not a thread-safe function.
++func (dm *DMap) deleteOnThisOwner(hkey uint64, key string, f *fragment) error {
+ 	if dm.s.config.ReplicaCount != 0 {
+ 		err := dm.deleteBackupOnCluster(hkey, key)
+ 		if err != nil {
+@@ -107,7 +114,7 @@ func (dm *DMap) deleteOnCluster(hkey uint64, key string, f *fragment) error {
+ 		}
+ 	}
+ 
+-	err = f.storage.Delete(hkey)
++	err := f.storage.Delete(hkey)
+ 	if err != nil {
+ 		return err
+ 	}
+@@ -121,6 +128,19 @@ func (dm *DMap) deleteOnCluster(hkey uint64, key string, f *fragment) error {
+ func (dm *DMap) deleteKey(key string) error {
+ 	hkey := partitions.HKey(dm.name, key)
+ 	part := dm.getPartitionByHKey(hkey, partitions.PRIMARY)
++
++	// Delete the key on the previous owners of the partition first, without
++	// holding the lock of the fragment here: a previous owner that is moving the
++	// partition to this member needs that lock to hand its data over. A key it
++	// has handed over already is found here below, so it can't come back later.
++	owners := dm.s.primary.PartitionOwnersByHKey(hkey)
++	if len(owners) == 0 {
++		panic("partition owners list cannot be empty")
++	}
++	if err := dm.deleteFromPreviousOwners(key, owners); err != nil {
++		return err
++	}
++
+ 	f, err := dm.loadOrCreateFragment(part)
+ 	if err != nil {
+ 		return err
+@@ -129,14 +149,28 @@ func (dm *DMap) deleteKey(key string) error {
+ 	f.Lock()
+ 	defer f.Unlock()
+ 
++	// The partition may have been given to another member, and its data moved
++	// there, while this delete waited for the lock.
++	if !part.Owner().CompareByName(dm.s.rt.This()) {
++		return errPartitionMoved
++	}
++
+ 	// Check the HKey before trying to delete it.
+ 	if !f.storage.Check(hkey) {
++		// A previous owner may still have had the key, it is deleted there
++		// above. Its backups may have it too, delete them as well, or a read
++		// that asks the replicas would find it again.
++		if dm.s.config.ReplicaCount > config.MinimumReplicaCount {
++			if err := dm.deleteBackupOnCluster(hkey, key); err != nil {
++				return err
++			}
++		}
+ 		// DeleteMisses is the number of deletions reqs for missing keys
+ 		DeleteMisses.Increase(1)
+ 		return nil
+ 	}
+ 
+-	return dm.deleteOnCluster(hkey, key, f)
++	return dm.deleteOnThisOwner(hkey, key, f)
+ }
+ 
+ func (dm *DMap) deleteKeys(ctx context.Context, keys ...string) (int, error) {
+@@ -150,7 +184,12 @@ func (dm *DMap) deleteKeys(ctx context.Context, keys ...string) (int, error) {
+ 	for member, distributedKeys := range members {
+ 		if member.CompareByName(dm.s.rt.This()) {
+ 			for _, key := range distributedKeys {
+-				if err := dm.deleteKey(key); err != nil {
++				err := dm.deleteKey(key)
++				if errors.Is(err, errPartitionMoved) {
++					// Delete it on the new owner of the partition.
++					_, err = dm.deleteKeys(ctx, key)
++				}
++				if err != nil {
+ 					return 0, err
+ 				}
+ 			}
+diff --git a/internal/dmap/eviction.go b/internal/dmap/eviction.go
+index d0fd2f6..add0245 100644
+--- a/internal/dmap/eviction.go
++++ b/internal/dmap/eviction.go
+@@ -102,6 +102,13 @@ func (s *Service) evictKeysAtBackground() {
+ func (s *Service) evictKeys() {
+ 	partID := uint64(rand.Intn(int(s.config.PartitionCount)))
+ 	part := s.primary.PartitionByID(partID)
++	if part.OwnerCount() > 1 {
++		// The partition is moving between members. Expiring a key deletes it on
++		// the previous owners while the fragment is locked, and a previous owner
++		// that hands the partition over here waits for that lock. Expire the
++		// keys of this partition once the move is over.
++		return
++	}
+ 	part.Map().Range(func(name, tmp interface{}) bool {
+ 		dmapName := strings.TrimPrefix(name.(string), "dmap.")
+ 		f := tmp.(*fragment)
+diff --git a/internal/dmap/fragment.go b/internal/dmap/fragment.go
+index 8ab638f..36cec19 100644
+--- a/internal/dmap/fragment.go
++++ b/internal/dmap/fragment.go
+@@ -74,9 +74,49 @@ func (f *fragment) Name() string {
+ }
+ 
+ func (f *fragment) Move(part *partitions.Partition, name string, owners []discovery.Member) error {
+-	f.Lock()
++	return f.MoveContext(f.service.ctx, part, name, owners)
++}
++
++// lockContext acquires the lock of the fragment unless ctx is done first. In that
++// case, the lock is released as soon as it is acquired.
++func (f *fragment) lockContext(ctx context.Context) error {
++	locked := make(chan struct{})
++	go func() {
++		f.Lock()
++		close(locked)
++	}()
++
++	select {
++	case <-locked:
++		return nil
++	case <-ctx.Done():
++		go func() {
++			<-locked
++			f.Unlock()
++		}()
++		return ctx.Err()
++	}
++}
++
++// MoveContext works like Move, but it also stops the transfer when ctx is done.
++func (f *fragment) MoveContext(ctx context.Context, part *partitions.Partition, name string, owners []discovery.Member) error {
++	// Stop the transfer when the caller gives up or the service is closed.
++	ctx, cancel := context.WithCancel(ctx)
++	defer cancel()
++	stop := context.AfterFunc(f.service.ctx, cancel)
++	defer stop()
++
++	// Another operation may hold the fragment for a while, during a network call
++	// for example. Don't wait for it after the caller gave up.
++	if err := f.lockContext(ctx); err != nil {
++		return err
++	}
+ 	defer f.Unlock()
+ 
++	if err := ctx.Err(); err != nil {
++		return err
++	}
++
+ 	i := f.storage.TransferIterator()
+ 	if !i.Next() {
+ 		return nil
+@@ -114,9 +154,9 @@ func (f *fragment) Move(part *partitions.Partition, name string, owners []discov
+ 			go f.service.publishEvent(e)
+ 		}
+ 
+-		cmd := protocol.NewMoveFragment(value).Command(f.service.ctx)
++		cmd := protocol.NewMoveFragment(value).Command(ctx)
+ 		rc := f.service.client.Get(owner.String())
+-		err = rc.Process(f.service.ctx, cmd)
++		err = rc.Process(ctx, cmd)
+ 		if err != nil {
+ 			return err
+ 		}
+diff --git a/internal/dmap/get.go b/internal/dmap/get.go
+index 29bab29..49d4797 100644
+--- a/internal/dmap/get.go
++++ b/internal/dmap/get.go
+@@ -146,8 +146,9 @@ func (dm *DMap) lookupOnThisNode(hkey uint64, key string) *version {
+ 	return dm.valueToVersion(value)
+ }
+ 
+-// lookupOnOwners collects versions of a key/value pair on the partition owner
+-// by including previous partition owners.
++// lookupOnOwners collects versions of a key/value pair on the owners of the
++// partition: the previous ones and the current one, which is this member unless
++// it serves a read that was sent here by a member with an older routing table.
+ func (dm *DMap) lookupOnOwners(hkey uint64, key string) []*version {
+ 	owners := dm.s.primary.PartitionOwnersByHKey(hkey)
+ 	if len(owners) == 0 {
+@@ -159,35 +160,61 @@ func (dm *DMap) lookupOnOwners(hkey uint64, key string) []*version {
+ 		mtx      sync.Mutex
+ 		versions []*version
+ 	)
+-	versions = append(versions, dm.lookupOnThisNode(hkey, key))
+-
+-	// Run a query on the previous owners.
+-	// Traverse in reverse order. Except from the latest host, this one.
+-	for i := len(owners) - 2; i >= 0; i-- {
+-		owner := owners[i]
+-
+-		wg.Add(1)
+-		go func(member *discovery.Member) {
+-			defer wg.Done()
+-
+-			v, err := dm.lookupOnPreviousOwner(member, key)
++	this := dm.s.rt.This()
++	lookup := func(member discovery.Member) {
++		var v *version
++		if member.CompareByName(this) {
++			v = dm.lookupOnThisNode(hkey, key)
++		} else {
++			var err error
++			v, err = dm.lookupOnPreviousOwner(&member, key)
+ 			if err != nil {
+ 				if dm.s.log.V(6).Ok() {
+-					dm.s.log.V(6).Printf("[ERROR] Failed to call get on a previous "+
++					dm.s.log.V(6).Printf("[ERROR] Failed to call get on a "+
+ 						"primary owner: %s: %v", member, err)
+ 				}
++				// Ignore failed owners. The balancer will wipe out
++				// the data on those hosts.
+ 				return
+ 			}
+-
+-			mtx.Lock()
+-			// Ignore failed owners. The balancer will wipe out
+-			// the data on those hosts.
+-			versions = append(versions, v)
+-			mtx.Unlock()
+-		}(&owner)
++		}
++		mtx.Lock()
++		versions = append(versions, v)
++		mtx.Unlock()
+ 	}
+ 
++	// The data of a partition moves from its previous owners to the current
++	// one, the last one in the list, and a member drops the data it has moved
++	// only after the receiver has merged it. So ask the previous owners first
++	// and the current owner after them: a key that is moving between two owners
++	// is then found on one of them.
++	current := owners[len(owners)-1]
++	askedHere := current.CompareByName(this)
++	for i := len(owners) - 2; i >= 0; i-- {
++		owner := owners[i]
++		if owner.CompareByName(current) {
++			continue
++		}
++		if owner.CompareByName(this) {
++			askedHere = true
++		}
++		wg.Add(1)
++		go func(member discovery.Member) {
++			defer wg.Done()
++			lookup(member)
++		}(owner)
++	}
++	if !askedHere {
++		// This member doesn't own the partition, but it may still keep a copy.
++		wg.Add(1)
++		go func() {
++			defer wg.Done()
++			lookup(this)
++		}()
++	}
+ 	wg.Wait()
++
++	lookup(current)
+ 	return versions
+ }
+ 
+@@ -357,7 +384,9 @@ func (dm *DMap) getOnCluster(hkey uint64, key string) (storage.Entry, error) {
+ 		return nil, ErrKeyNotFound
+ 	}
+ 
+-	if dm.s.config.ReadRepair {
++	// Only the partition owner repairs the copies. A member that serves a read
++	// it got from a member with an older routing table doesn't write them.
++	if dm.s.config.ReadRepair && dm.s.primary.PartitionByHKey(hkey).Owner().CompareByName(dm.s.rt.This()) {
+ 		// Parallel read operations may propagate different versions of
+ 		// the same key/value pair. The rule is simple: last write wins.
+ 		dm.readRepair(winner, versions)
+@@ -370,8 +399,44 @@ func (dm *DMap) getOnCluster(hkey uint64, key string) (storage.Entry, error) {
+ // of the returned value.
+ func (dm *DMap) Get(ctx context.Context, key string) (storage.Entry, error) {
+ 	hkey := partitions.HKey(dm.name, key)
+-	member := dm.s.primary.PartitionByHKey(hkey).Owner()
++	for {
++		member := dm.s.primary.PartitionByHKey(hkey).Owner()
++		entry, err := dm.getOnOwner(ctx, hkey, key, member)
++		if err != nil && ctx.Err() == nil &&
++			!dm.s.primary.PartitionByHKey(hkey).Owner().CompareByName(member) {
++			// The partition was given to another member while the request ran.
++			// A member moves the data of a partition only after it learns about
++			// the new owner, so ask the new owner.
++			continue
++		}
++		return entry, err
++	}
++}
++
++// getForwarded serves a read that was sent to this member because the sender
++// takes it for the partition owner. It reads the key here and on the other
++// owners of the partition, and doesn't forward the read again: while members
++// install a new routing table, two of them can take each other for the owner
++// and would send a read back and forth.
++func (dm *DMap) getForwarded(key string) (storage.Entry, error) {
++	hkey := partitions.HKey(dm.name, key)
++	entry, err := dm.getOnCluster(hkey, key)
++	if errors.Is(err, ErrKeyNotFound) {
++		GetMisses.Increase(1)
++	}
++	if err != nil {
++		return nil, err
++	}
++
++	// number of keys that have been requested and found present
++	GetHits.Increase(1)
++
++	return entry, nil
++}
+ 
++// getOnOwner reads the key on the given partition owner, on this member or by
++// redirecting the request to it.
++func (dm *DMap) getOnOwner(ctx context.Context, hkey uint64, key string, member discovery.Member) (storage.Entry, error) {
+ 	// We are on the partition owner
+ 	if member.CompareByName(dm.s.rt.This()) {
+ 		entry, err := dm.getOnCluster(hkey, key)
+diff --git a/internal/dmap/get_handlers.go b/internal/dmap/get_handlers.go
+index 3f091ff..e28bb62 100644
+--- a/internal/dmap/get_handlers.go
++++ b/internal/dmap/get_handlers.go
+@@ -32,7 +32,7 @@ func (s *Service) getCommandHandler(conn redcon.Conn, cmd redcon.Command) {
+ 		return
+ 	}
+ 
+-	raw, err := dm.Get(s.ctx, getCmd.Key)
++	raw, err := dm.getForwarded(getCmd.Key)
+ 	if err != nil {
+ 		protocol.WriteError(conn, err)
+ 		return
+diff --git a/internal/dmap/put.go b/internal/dmap/put.go
+index 2576672..65c6e6a 100644
+--- a/internal/dmap/put.go
++++ b/internal/dmap/put.go
+@@ -300,6 +300,13 @@ func (dm *DMap) putOnCluster(e *env) error {
+ 	f.Lock()
+ 	defer f.Unlock()
+ 
++	// The partition may have been given to another member, and its data moved
++	// there, while this write waited for the lock. Writing here now would leave
++	// the key on a member that is no longer asked for it.
++	if !part.Owner().CompareByName(dm.s.rt.This()) {
++		return errPartitionMoved
++	}
++
+ 	if err = dm.checkPutConditions(e); err != nil {
+ 		return err
+ 	}
+@@ -335,6 +342,11 @@ func (dm *DMap) putOnCluster(e *env) error {
+ }
+ 
+ func (dm *DMap) writePutCommand(e *env) (*redis.StatusCmd, error) {
++	if e.putConfig.OnlyUpdateTTL {
++		// Expire carries no value, so it goes to the owner as a TTL update.
++		return protocol.NewPExpire(e.dmap, e.key, e.timeout).Command(dm.s.ctx), nil
++	}
++
+ 	cmd := protocol.NewPut(e.dmap, e.key, e.value)
+ 	switch {
+ 	case e.putConfig.HasEX:
+@@ -359,7 +371,19 @@ func (dm *DMap) writePutCommand(e *env) (*redis.StatusCmd, error) {
+ 
+ // put controls every write operation in Olric. It redirects the requests to its owner,
+ // if the key belongs to another host.
++// put writes the key on the owner of its partition. The value doesn't depend
++// on what the key holds, so when the partition is given to another member
++// while the write runs, the same write is sent to the new owner.
+ func (dm *DMap) put(e *env) error {
++	for {
++		err := dm.putOnOwner(e)
++		if !errors.Is(err, errPartitionMoved) {
++			return err
++		}
++	}
++}
++
++func (dm *DMap) putOnOwner(e *env) error {
+ 	e.hkey = partitions.HKey(e.dmap, e.key)
+ 	member := dm.s.primary.PartitionByHKey(e.hkey).Owner()
+ 	if member.CompareByName(dm.s.rt.This()) {
+diff --git a/internal/dmap/service.go b/internal/dmap/service.go
+index 598340e..ff70301 100644
+--- a/internal/dmap/service.go
++++ b/internal/dmap/service.go
+@@ -35,6 +35,11 @@ import (
+ 
+ var errFragmentNotFound = errors.New("fragment not found")
+ 
++// errPartitionMoved is returned by an operation that was about to change a key
++// on this member while the partition of the key has been given to another
++// member. The operation is sent to the new owner then.
++var errPartitionMoved = errors.New("partition was given to another member")
++
+ type storageMap struct {
+ 	engines map[string]storage.Engine
+ 	configs map[string]map[string]interface{}
+@@ -68,6 +73,7 @@ func registerErrors() {
+ 	protocol.SetError("ENTRYTOOLARGE", ErrEntryTooLarge)
+ 	protocol.SetError("KEYNOTFOUND", ErrKeyNotFound)
+ 	protocol.SetError("KEYFOUND", ErrKeyFound)
++	protocol.SetError("PARTITIONMOVED", errPartitionMoved)
+ }
+ 
+ func NewService(e *environment.Environment) (service.Service, error) {
+diff --git a/internal/protocol/commands.go b/internal/protocol/commands.go
+index 96a2ff8..02ba0c3 100644
+--- a/internal/protocol/commands.go
++++ b/internal/protocol/commands.go
+@@ -31,12 +31,16 @@ type InternalCommands struct {
+ 	UpdateRouting       string
+ 	LengthOfPart        string
+ 	ClusterRoutingTable string
++	Leave               string
++	CancelLeave         string
+ }
+ 
+ var Internal = &InternalCommands{
+ 	MoveFragment:  "internal.node.movefragment",
+ 	UpdateRouting: "internal.node.updaterouting",
+ 	LengthOfPart:  "internal.node.lengthofpart",
++	Leave:         "internal.node.leave",
++	CancelLeave:   "internal.node.cancelleave",
+ }
+ 
+ type GenericCommands struct {
+diff --git a/internal/protocol/system.go b/internal/protocol/system.go
+index f9113b8..e5c2b77 100644
+--- a/internal/protocol/system.go
++++ b/internal/protocol/system.go
+@@ -235,3 +235,69 @@ func ParseAuthCommand(cmd redcon.Command) (*Auth, error) {
+ 		util.BytesToString(cmd.Args[1]),
+ 	), nil
+ }
++
++// Leave asks the cluster coordinator to stop assigning partitions to a member
++// because it is leaving the cluster. MemberID tells this run of the member apart
++// from a later one that has the same name.
++type Leave struct {
++	Name     string
++	MemberID uint64
++}
++
++func NewLeave(name string, memberID uint64) *Leave {
++	return &Leave{
++		Name:     name,
++		MemberID: memberID,
++	}
++}
++
++func (l *Leave) Command(ctx context.Context) *redis.StatusCmd {
++	var args []interface{}
++	args = append(args, Internal.Leave)
++	args = append(args, l.Name)
++	args = append(args, l.MemberID)
++	return redis.NewStatusCmd(ctx, args...)
++}
++
++func ParseLeaveCommand(cmd redcon.Command) (*Leave, error) {
++	if len(cmd.Args) < 3 {
++		return nil, errWrongNumber(cmd.Args)
++	}
++	memberID, err := strconv.ParseUint(util.BytesToString(cmd.Args[2]), 10, 64)
++	if err != nil {
++		return nil, err
++	}
++
++	return NewLeave(util.BytesToString(cmd.Args[1]), memberID), nil
++}
++
++// CancelLeave asks the cluster coordinator to assign partitions to a member again
++// after it couldn't hand off all of its data.
++type CancelLeave struct {
++	MemberID uint64
++}
++
++func NewCancelLeave(memberID uint64) *CancelLeave {
++	return &CancelLeave{
++		MemberID: memberID,
++	}
++}
++
++func (c *CancelLeave) Command(ctx context.Context) *redis.StatusCmd {
++	var args []interface{}
++	args = append(args, Internal.CancelLeave)
++	args = append(args, c.MemberID)
++	return redis.NewStatusCmd(ctx, args...)
++}
++
++func ParseCancelLeaveCommand(cmd redcon.Command) (*CancelLeave, error) {
++	if len(cmd.Args) < 2 {
++		return nil, errWrongNumber(cmd.Args)
++	}
++	memberID, err := strconv.ParseUint(util.BytesToString(cmd.Args[1]), 10, 64)
++	if err != nil {
++		return nil, err
++	}
++
++	return NewCancelLeave(memberID), nil
++}
+diff --git a/olric.go b/olric.go
+index 60250e2..81909c5 100644
+--- a/olric.go
++++ b/olric.go
+@@ -407,7 +407,12 @@ func (db *Olric) Start() error {
+ 	return errGr.Wait()
+ }
+ 
+-// Shutdown stops background servers and leaves the cluster.
++// Shutdown stops background servers and leaves the cluster. Before that, it
++// hands the primary copies of this member over to the members that take over its
++// partitions, unless it is the only member. If ctx is done before all of them are
++// handed over, Shutdown returns the error and this member keeps running with the
++// data it still has, so Shutdown can be called again. Taking the partitions back
++// in that case is bounded by config.LeaveTimeout.
+ func (db *Olric) Shutdown(ctx context.Context) error {
+ 	select {
+ 	case <-db.ctx.Done():
+@@ -416,6 +421,13 @@ func (db *Olric) Shutdown(ctx context.Context) error {
+ 	default:
+ 	}
+ 
++	// Keep running if the data couldn't be handed off, so no key is lost and
++	// Shutdown can be called again.
++	if err := db.leaveCluster(ctx); err != nil {
++		db.log.V(2).Printf("[ERROR] Failed to hand off data before leaving the cluster: %v", err)
++		return err
++	}
++
+ 	db.cancel()
+ 
+ 	var latestError error
+@@ -465,6 +477,63 @@ func (db *Olric) Shutdown(ctx context.Context) error {
+ 	return latestError
+ }
+ 
++// leaveCluster hands the primary copies of this member over to the members that
++// take over its partitions, so a graceful shutdown doesn't lose any keys. Backup
++// copies are not waited for.
++func (db *Olric) leaveCluster(ctx context.Context) error {
++	for {
++		if !db.rt.IsBootstrapped() || db.rt.Discovery().NumMembers() <= 1 {
++			return nil
++		}
++
++		if err := ctx.Err(); err != nil {
++			return err
++		}
++
++		err := db.rt.Leave(ctx)
++		if errors.Is(err, routingtable.ErrLastMember) {
++			// The other members are leaving as well, so none of them can take
++			// the data. Wait until they are gone and this is the only member.
++			select {
++			case <-ctx.Done():
++			case <-time.After(100 * time.Millisecond):
++			}
++			continue
++		}
++		if err == nil {
++			err = db.balancer.Drain(ctx)
++			if errors.Is(err, balancer.ErrOwnsPartitions) {
++				// A new cluster coordinator gave partitions to this member again
++				// because it doesn't know about the leave. Tell it once more.
++				select {
++				case <-ctx.Done():
++				case <-time.After(100 * time.Millisecond):
++				}
++				continue
++			}
++		}
++		if err != nil {
++			db.takePartitionsBack()
++			return err
++		}
++		return nil
++	}
++}
++
++// takePartitionsBack puts this member back into the partition distribution after
++// a handoff that failed, so it keeps serving the data that is still here. The
++// members that already got some of it stay in the owner lists of those partitions
++// as previous owners, and reads ask every owner (see DMap.lookupOnOwners), so no
++// key becomes unreadable while the balancer moves that data back.
++func (db *Olric) takePartitionsBack() {
++	ctx, cancel := context.WithTimeout(context.Background(), db.config.LeaveTimeout)
++	defer cancel()
++
++	if err := db.rt.CancelLeave(ctx); err != nil {
++		db.log.V(2).Printf("[ERROR] Failed to take the partitions back: %v", err)
++	}
++}
++
+ func convertDMapError(err error) error {
+ 	switch {
+ 	case errors.Is(err, dmap.ErrKeyFound):

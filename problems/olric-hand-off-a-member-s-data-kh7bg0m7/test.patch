@@ -1,0 +1,504 @@
+diff --git a/graceful_leave_ea098b_test.go b/graceful_leave_ea098b_test.go
+new file mode 100644
+index 0000000..2023030
+--- /dev/null
++++ b/graceful_leave_ea098b_test.go
+@@ -0,0 +1,422 @@
++// Copyright 2018-2026 The Olric Authors
++//
++// Licensed under the Apache License, Version 2.0 (the "License");
++// you may not use this file except in compliance with the License.
++// You may obtain a copy of the License at
++//
++//     http://www.apache.org/licenses/LICENSE-2.0
++//
++// Unless required by applicable law or agreed to in writing, software
++// distributed under the License is distributed on an "AS IS" BASIS,
++// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++// See the License for the specific language governing permissions and
++// limitations under the License.
++
++//go:build gracefulleave
++
++package olric_test
++
++import (
++	"context"
++	"errors"
++	"fmt"
++	"io"
++	"net"
++	"strconv"
++	"sync"
++	"sync/atomic"
++	"testing"
++	"time"
++
++	"github.com/hashicorp/memberlist"
++	"github.com/olric-data/olric"
++	"github.com/olric-data/olric/config"
++	"github.com/stretchr/testify/assert"
++	"github.com/stretchr/testify/require"
++)
++
++func freePort(t *testing.T) int {
++	l, err := net.Listen("tcp", "127.0.0.1:0")
++	require.NoError(t, err)
++	defer l.Close()
++	return l.Addr().(*net.TCPAddr).Port
++}
++
++type member struct {
++	db   *olric.Olric
++	name string
++	peer string
++}
++
++// startMember starts an Olric member that joins the given peers and stops it
++// at the end of the test, unless the test already stopped it.
++func startMember(t *testing.T, replicaCount int, peers ...member) member {
++	c := config.New("local")
++	c.PartitionCount = 23
++	c.ReplicaCount = replicaCount
++	c.ReadQuorum = 1
++	c.WriteQuorum = 1
++	c.LogOutput = io.Discard
++	c.LeaveTimeout = 500 * time.Millisecond
++
++	mc := memberlist.DefaultLocalConfig()
++	mc.BindAddr = "127.0.0.1"
++	mc.BindPort = freePort(t)
++	c.MemberlistConfig = mc
++	c.BindAddr = "127.0.0.1"
++	c.BindPort = freePort(t)
++	c.MemberlistConfig.Name = net.JoinHostPort(c.BindAddr, strconv.Itoa(c.BindPort))
++	for _, p := range peers {
++		c.Peers = append(c.Peers, p.peer)
++	}
++
++	started := make(chan struct{})
++	c.Started = func() { close(started) }
++	require.NoError(t, c.Sanitize())
++	require.NoError(t, c.Validate())
++
++	db, err := olric.New(c)
++	require.NoError(t, err)
++	go func() {
++		if err := db.Start(); err != nil {
++			panic(fmt.Sprintf("failed to start olric: %v", err))
++		}
++	}()
++	select {
++	case <-started:
++	case <-time.After(10 * time.Second):
++		t.Fatal("olric did not start in 10 seconds")
++	}
++	t.Cleanup(func() {
++		ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
++		defer cancel()
++		_ = db.Shutdown(ctx)
++	})
++	return member{
++		db:   db,
++		name: c.MemberlistConfig.Name,
++		peer: net.JoinHostPort(mc.BindAddr, strconv.Itoa(mc.BindPort)),
++	}
++}
++
++func waitForMembers(t *testing.T, db *olric.Olric, n int) {
++	require.Eventually(t, func() bool {
++		members, err := db.NewEmbeddedClient().Members(context.Background())
++		return err == nil && len(members) == n
++	}, 10*time.Second, 50*time.Millisecond)
++}
++
++func putKeys(t *testing.T, m member, n int) {
++	dm, err := m.db.NewEmbeddedClient().NewDMap("leave")
++	require.NoError(t, err)
++	for i := 0; i < n; i++ {
++		require.NoError(t, dm.Put(context.Background(), fmt.Sprintf("key-%d", i), i))
++	}
++}
++
++// requireEveryKey reads every key that putKeys stored through each of the given members.
++func requireEveryKey(t *testing.T, n int, members ...member) {
++	for _, m := range members {
++		dm, err := m.db.NewEmbeddedClient().NewDMap("leave")
++		require.NoError(t, err)
++		for i := 0; i < n; i++ {
++			key := fmt.Sprintf("key-%d", i)
++			gr, err := dm.Get(context.Background(), key)
++			if errors.Is(err, olric.ErrKeyNotFound) {
++				// A member may need a moment to learn about a change in the cluster.
++				// A key that is really gone doesn't come back.
++				if !assert.Eventually(t, func() bool {
++					gr, err = dm.Get(context.Background(), key)
++					return err == nil
++				}, 5*time.Second, 10*time.Millisecond) {
++					t.Fatalf("key-%d was lost when a member left the cluster", i)
++				}
++			}
++			require.NoError(t, err)
++			v, err := gr.Int()
++			require.NoError(t, err)
++			require.Equal(t, i, v)
++		}
++	}
++}
++
++func startThreeMembers(t *testing.T) (member, member, member) {
++	a := startMember(t, 1)
++	b := startMember(t, 1, a)
++	c := startMember(t, 1, a, b)
++	waitForMembers(t, a.db, 3)
++	waitForMembers(t, c.db, 3)
++	return a, b, c
++}
++
++func TestGracefulLeaveHandsOffEveryKey(t *testing.T) {
++	a, b, c := startThreeMembers(t)
++	putKeys(t, a, 1000)
++
++	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
++	defer cancel()
++	require.NoError(t, b.db.Shutdown(ctx))
++	waitForMembers(t, a.db, 2)
++
++	requireEveryKey(t, 1000, a, c)
++}
++
++func TestGracefulLeaveKeepsMemberWhenContextEnds(t *testing.T) {
++	a, b, c := startThreeMembers(t)
++	putKeys(t, a, 1000)
++
++	expired, cancel := context.WithDeadline(context.Background(), time.Now().Add(-time.Second))
++	defer cancel()
++	require.Error(t, b.db.Shutdown(expired))
++
++	members, err := a.db.NewEmbeddedClient().Members(context.Background())
++	require.NoError(t, err)
++	require.Len(t, members, 3)
++	requireEveryKey(t, 1000, a, c)
++
++	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
++	defer cancel()
++	require.NoError(t, b.db.Shutdown(ctx))
++	waitForMembers(t, a.db, 2)
++
++	requireEveryKey(t, 1000, a, c)
++}
++
++// ownsPartitions reports whether the routing table assigns any partition to the named member.
++func ownsPartitions(rt olric.RoutingTable, name string) bool {
++	for _, route := range rt {
++		if n := len(route.PrimaryOwners); n > 0 && route.PrimaryOwners[n-1] == name {
++			return true
++		}
++	}
++	return false
++}
++
++func TestGracefulLeaveContextEndsDuringHandOff(t *testing.T) {
++	a, b, c := startThreeMembers(t)
++	const n = 20000
++	putKeys(t, a, n)
++
++	// End the context once the partitions of b are given to the other members,
++	// which is while its data is being handed off.
++	ctx, cancel := context.WithCancel(context.Background())
++	defer cancel()
++	go func() {
++		defer cancel()
++		ec := a.db.NewEmbeddedClient()
++		ticker := time.NewTicker(time.Millisecond)
++		defer ticker.Stop()
++		for {
++			rt, err := ec.RoutingTable(context.Background())
++			if err == nil && !ownsPartitions(rt, b.name) {
++				return
++			}
++			select {
++			case <-ctx.Done():
++				return
++			case <-ticker.C:
++			}
++		}
++	}()
++
++	if err := b.db.Shutdown(ctx); err == nil {
++		waitForMembers(t, a.db, 2)
++		requireEveryKey(t, n, a, c)
++		return
++	}
++
++	members, err := a.db.NewEmbeddedClient().Members(context.Background())
++	require.NoError(t, err)
++	require.Len(t, members, 3)
++	requireEveryKey(t, n, a, c)
++
++	retry, cancelRetry := context.WithTimeout(context.Background(), 20*time.Second)
++	defer cancelRetry()
++	require.NoError(t, b.db.Shutdown(retry))
++	waitForMembers(t, a.db, 2)
++	requireEveryKey(t, n, a, c)
++}
++
++func startFourMembers(t *testing.T) (member, member, member, member) {
++	a := startMember(t, 1)
++	b := startMember(t, 1, a)
++	c := startMember(t, 1, a, b)
++	d := startMember(t, 1, a, b, c)
++	for _, m := range []member{a, b, c, d} {
++		waitForMembers(t, m.db, 4)
++	}
++	return a, b, c, d
++}
++
++func shutdownWithin(t *testing.T, m member, d time.Duration) error {
++	ctx, cancel := context.WithTimeout(context.Background(), d)
++	defer cancel()
++	return m.db.Shutdown(ctx)
++}
++
++// readContinuously reads every key that putKeys stored through m, over and over,
++// until stop is closed. It sends the reads that failed when it stops.
++func readContinuously(t *testing.T, m member, n int, stop <-chan struct{}) <-chan []string {
++	dm, err := m.db.NewEmbeddedClient().NewDMap("leave")
++	require.NoError(t, err)
++	failed := make(chan []string, 1)
++	go func() {
++		var errs []string
++		for {
++			for i := 0; i < n; i++ {
++				select {
++				case <-stop:
++					failed <- errs
++					return
++				default:
++				}
++				key := fmt.Sprintf("key-%d", i)
++				if _, err := dm.Get(context.Background(), key); err != nil {
++					errs = append(errs, fmt.Sprintf("%s: %v", key, err))
++				}
++			}
++		}
++	}()
++	return failed
++}
++
++func TestGracefulLeaveKeysStayReadableDuringHandOff(t *testing.T) {
++	a, b, c, d := startFourMembers(t)
++	const n = 5000
++	putKeys(t, a, n)
++
++	stop := make(chan struct{})
++	readers := []<-chan []string{
++		readContinuously(t, a, n, stop),
++		readContinuously(t, d, n, stop),
++	}
++	require.NoError(t, shutdownWithin(t, b, 30*time.Second))
++	require.NoError(t, shutdownWithin(t, c, 30*time.Second))
++	waitForMembers(t, a.db, 2)
++	close(stop)
++
++	for _, reader := range readers {
++		errs := <-reader
++		if len(errs) > 0 {
++			t.Fatalf("%d reads failed while members were leaving the cluster, the first one: %s", len(errs), errs[0])
++		}
++	}
++	requireEveryKey(t, n, a, d)
++}
++
++func TestGracefulLeaveKeepsChangesMadeDuringHandOff(t *testing.T) {
++	a, b, c, d := startFourMembers(t)
++	const counters = 300
++	dm, err := a.db.NewEmbeddedClient().NewDMap("counters")
++	require.NoError(t, err)
++
++	// succeeded counts the increments that returned without an error, tried
++	// counts all of them, as a failed one may still have been applied.
++	var succeeded, tried [counters]atomic.Int64
++	for i := 0; i < counters; i++ {
++		tried[i].Add(1)
++		_, err := dm.Incr(context.Background(), fmt.Sprintf("counter-%d", i), 1)
++		require.NoError(t, err)
++		succeeded[i].Add(1)
++	}
++
++	stop := make(chan struct{})
++	var wg sync.WaitGroup
++	wg.Add(1)
++	go func() {
++		defer wg.Done()
++		for {
++			for i := 0; i < counters; i++ {
++				select {
++				case <-stop:
++					return
++				default:
++				}
++				tried[i].Add(1)
++				if _, err := dm.Incr(context.Background(), fmt.Sprintf("counter-%d", i), 1); err == nil {
++					succeeded[i].Add(1)
++				}
++			}
++		}
++	}()
++	require.NoError(t, shutdownWithin(t, b, 30*time.Second))
++	require.NoError(t, shutdownWithin(t, c, 30*time.Second))
++	close(stop)
++	wg.Wait()
++	waitForMembers(t, a.db, 2)
++
++	for _, m := range []member{a, d} {
++		rd, err := m.db.NewEmbeddedClient().NewDMap("counters")
++		require.NoError(t, err)
++		for i := 0; i < counters; i++ {
++			gr, err := rd.Get(context.Background(), fmt.Sprintf("counter-%d", i))
++			require.NoError(t, err)
++			v, err := gr.Int()
++			require.NoError(t, err)
++			if int64(v) < succeeded[i].Load() || int64(v) > tried[i].Load() {
++				t.Fatalf("counter-%d is %d after the members left, but %d increments succeeded and %d were tried",
++					i, v, succeeded[i].Load(), tried[i].Load())
++			}
++		}
++	}
++}
++
++func TestGracefulLeaveTwoMembersLeaveTogether(t *testing.T) {
++	a, b, c := startThreeMembers(t)
++	putKeys(t, a, 2000)
++
++	var wg sync.WaitGroup
++	errs := make([]error, 2)
++	for i, m := range []member{b, c} {
++		wg.Add(1)
++		go func(i int, m member) {
++			defer wg.Done()
++			errs[i] = shutdownWithin(t, m, 30*time.Second)
++		}(i, m)
++	}
++	wg.Wait()
++	require.NoError(t, errs[0])
++	require.NoError(t, errs[1])
++	waitForMembers(t, a.db, 1)
++	requireEveryKey(t, 2000, a)
++}
++
++func TestGracefulLeaveCoordinatorLeavesWithAnotherMember(t *testing.T) {
++	// a is the cluster coordinator, the oldest member.
++	a, b, c, d := startFourMembers(t)
++	putKeys(t, c, 3000)
++
++	var wg sync.WaitGroup
++	errs := make([]error, 2)
++	for i, m := range []member{a, b} {
++		wg.Add(1)
++		go func(i int, m member) {
++			defer wg.Done()
++			errs[i] = shutdownWithin(t, m, 30*time.Second)
++		}(i, m)
++	}
++	wg.Wait()
++	require.NoError(t, errs[0])
++	require.NoError(t, errs[1])
++	waitForMembers(t, c.db, 2)
++	requireEveryKey(t, 3000, c, d)
++}
++
++func TestGracefulLeaveEveryMemberLeavesTogether(t *testing.T) {
++	a, b, c := startThreeMembers(t)
++	putKeys(t, a, 1000)
++
++	var wg sync.WaitGroup
++	errs := make([]error, 3)
++	for i, m := range []member{a, b, c} {
++		wg.Add(1)
++		go func(i int, m member) {
++			defer wg.Done()
++			errs[i] = shutdownWithin(t, m, 30*time.Second)
++		}(i, m)
++	}
++	wg.Wait()
++	for i, err := range errs {
++		require.NoError(t, err, "member %d didn't leave", i)
++	}
++}
+diff --git a/test.sh b/test.sh
+new file mode 100755
+index 0000000..c16dfd8
+--- /dev/null
++++ b/test.sh
+@@ -0,0 +1,70 @@
++#!/usr/bin/env bash
++# Usage:
++#   ./test.sh [--output_path <junit.xml>] <base|new>
++#
++# base  runs the existing tests of every package, one package at a time like
++#       `make test` does, because the cluster tests bind local ports. It
++#       leaves out the tests that need a non-loopback network interface, the
++#       timing sensitive integration tests, the timing sensitive tests of
++#       unexported cluster client helpers, and two checks whose result depends
++#       on how fast other cluster members start or stop under load.
++# new   runs the cluster membership tests in graceful_leave_ea098b_test.go,
++#       which are compiled only with -tags gracefulleave.
++set -uo pipefail
++
++ORIG_PWD="$(pwd)"
++
++OUTPUT_PATH=""
++if [ "${1:-}" = "--output_path" ]; then
++  OUTPUT_PATH="$2"
++  shift 2
++  case "$OUTPUT_PATH" in
++    /*) : ;;
++    *) OUTPUT_PATH="$ORIG_PWD/$OUTPUT_PATH" ;;
++  esac
++fi
++
++MODE="${1:-new}"
++
++[ -f go.mod ] || cd "$(dirname "$0")"
++
++TEST_LOG="$(mktemp)"
++STATUS=0
++
++run_tests() {
++  go test -count=1 -v "$@" 2>&1 | tee -a "$TEST_LOG"
++  status=${PIPESTATUS[0]}
++  if [ "$status" -ne 0 ]; then
++    STATUS=$status
++  fi
++}
++
++case "$MODE" in
++  base)
++    # Package paths have no spaces, so splitting the list on words is safe.
++    internal_pkgs="$(go list ./internal/... | grep -v '/internal/cluster/routingtable$')"
++    # shellcheck disable=SC2086
++    run_tests -p 1 -timeout 1800s ./events/... $internal_pkgs ./pkg/... ./stats/...
++    run_tests -timeout 600s -run '^Test(Members_|RoutingTable_([a-z]|[A-KM-Z]))' ./internal/cluster/routingtable
++    run_tests -timeout 600s -run '^Test(Config(_DMap|_Initialize)?|Engine_.*)$' ./config
++    run_tests -timeout 1800s -run '^Test(EmbeddedClient_[A-HJ-Z]|ClusterClient_[A-Z]|DMap|Olric|PubSub|Stats|AuthCommandHandler|Future)' .
++    ;;
++  new)
++    run_tests -timeout 600s -tags gracefulleave -run 'GracefulLeave' .
++    ;;
++  *)
++    echo "unknown mode: $MODE (expected base or new)" >&2
++    exit 2
++    ;;
++esac
++
++if [ -n "$OUTPUT_PATH" ]; then
++  go-junit-report -set-exit-code < "$TEST_LOG" > "$OUTPUT_PATH"
++  junit_status=$?
++  if [ "$junit_status" -ne 0 ] && [ "$STATUS" -eq 0 ]; then
++    echo "go-junit-report failed to convert the test log (exit $junit_status)" >&2
++    STATUS=$junit_status
++  fi
++fi
++
++exit "$STATUS"
