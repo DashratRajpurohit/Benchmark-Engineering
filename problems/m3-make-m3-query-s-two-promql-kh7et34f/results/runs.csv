@@ -1,0 +1,78 @@
+label,agent,agentType,verdict,stale,reEvalRound,fault,filesModified,solutionLOC,agentMessages,sequenceLength,executionTimeSeconds,environmentBlocker,createdIST,id
+Nova #1,Nova,antigravity,FAIL_MISSED_REQUIREMENT,True,,agent,12,1128,604,828722,3063.633842,True,2026-10-21T20:18:20.076000+05:30,rd72mzp75cjcrrghzhzdnfvg118gqxc6
+Orion #1,Orion,codex_cli,FAIL_TEST_BROKEN,True,,problem,12,901,67,154640,1844.115347,True,2026-10-21T20:18:29.585000+05:30,rd71p5b90fhd7xdhdytpq32x4h8gp02y
+Nova #1,Nova,antigravity,PASS_LEGITIMATE,True,,pass,14,784,1209,1675518,7112.512674,True,2026-10-21T23:40:10.750000+05:30,rd736bt0pznkg7q7snchx9qz0x8gqqpy
+Orion #1,Orion,codex_cli,PASS_LEGITIMATE,True,,pass,13,635,76,158842,1707.845525,True,2026-10-21T23:40:20.184000+05:30,rd75bv12thyb01tgmrt94ccvkn8gqz0b
+Vega #1,Vega,claude_code,PASS_LEGITIMATE,True,,pass,17,1340,154,316338,1819.327773,True,2026-10-22T00:11:25.088000+05:30,rd7cm74tktsedprkr3g9xrxe218gqw75
+Nova #1,Nova,antigravity,FAIL_MISSED_REQUIREMENT,True,,agent,18,1167,1658,1960369,6976.220662,False,2026-10-22T17:04:23.831000+05:30,rd78vv2w4g944ebz6xvra5br7n8grw48
+Orion #1,Orion,codex_cli,FAIL_MISSED_REQUIREMENT,True,,agent,14,592,69,136593,1535.43889,True,2026-10-22T17:04:33.632000+05:30,rd79bba1a3bq7ry360ts86ahcn8gsydw
+Vega #1,Vega,claude_code,FAIL_MISSED_REQUIREMENT,True,,agent,15,1284,194,298597,2154.394678,False,2026-10-22T17:04:42.156000+05:30,rd76cp3dsatjv6rmtvxtjtns3n8gsbjf
+Vega #3,Vega,claude_code,FAIL_MISSED_REQUIREMENT,True,,agent,17,1277,206,355708,2274.970771,True,2026-10-22T17:54:18.622000+05:30,rd7bqfd8maqnfm6m5rmbh4wz4x8grgfc
+Vega #2,Vega,claude_code,FAIL_MISSED_REQUIREMENT,True,,agent,15,1257,173,282228,1808.202017,False,2026-10-22T17:54:18.622000+05:30,rd7cyx4cen3tzkwqpsrnmnjb358grj9d
+Vega #1,Vega,claude_code,FAIL_MISSED_REQUIREMENT,True,,agent,18,1373,223,342892,2380.695504,True,2026-10-22T17:54:18.622000+05:30,rd72p7v7yzrewkanfrff7j4xb98gss4q
+Orion #3,Orion,codex_cli,FAIL_MISSED_REQUIREMENT,True,,agent,14,644,65,123655,1425.006149,True,2026-10-22T17:58:43.190000+05:30,rd72ag8720agsaqmhn8fa59jy98gsdfr
+Orion #2,Orion,codex_cli,FAIL_MISSED_REQUIREMENT,True,,agent,19,825,77,185741,2477.926965,True,2026-10-22T17:58:43.190000+05:30,rd726e177hfqgegp6m93wthf1h8grzba
+Orion #1,Orion,codex_cli,FAIL_MISSED_REQUIREMENT,True,,agent,16,692,58,133332,1443.214173,True,2026-10-22T17:58:43.190000+05:30,rd78jk3qdwxqtjy786vaggs5fx8gry8x
+Nova #3,Nova,antigravity,FAIL_MISSED_REQUIREMENT,True,,agent,15,709,1027,1395859,4361.545096,False,2026-10-22T17:59:15.302000+05:30,rd7b971sk4pd3re4qwe4cnkxmx8gskc9
+Nova #2,Nova,antigravity,FAIL_MISSED_REQUIREMENT,True,,agent,16,773,1137,1668271,6046.375275,False,2026-10-22T17:59:15.302000+05:30,rd7dmjebf4x0gxckj8k57gvsn58gr3xz
+Nova #1,Nova,antigravity,FAIL_WRONG_LOGIC,True,,agent,17,1305,963,1400033,3975.804681,False,2026-10-22T17:59:15.302000+05:30,rd72kkwskdq0nv3s23abrg8rdh8gsq1c
+Nova #1 · re-eval 1,Nova,antigravity,FAIL_MISSED_REQUIREMENT,True,1,agent,18,1167,1658,1960369,439.999596,False,2026-10-22T22:20:30.194000+05:30,rd71xr3df1fhgd071eqgpy4p698gr20c
+Orion #1 · re-eval 1,Orion,codex_cli,FAIL_MISSED_REQUIREMENT,True,1,agent,14,592,69,136593,438.4883,True,2026-10-22T22:20:30.194000+05:30,rd7dtm9cvar7tcaecr4enfjym18grrpm
+Vega #1 · re-eval 1,Vega,claude_code,FAIL_MISSED_REQUIREMENT,True,1,agent,15,1284,194,298597,534.142297,False,2026-10-22T22:20:30.194000+05:30,rd7bb84zqwthgdygwafabf40b98grc4v
+Vega #3 · re-eval 1,Vega,claude_code,PASS_LEGITIMATE,True,1,pass,17,1277,206,355708,408.232723,True,2026-10-22T22:20:30.194000+05:30,rd75s4j16p38vyq6yrcjwek25h8gsjqh
+Vega #2 · re-eval 1,Vega,claude_code,FAIL_MISSED_REQUIREMENT,True,1,agent,15,1257,173,282228,398.431558,False,2026-10-22T22:20:30.194000+05:30,rd7fxartmqqkr67yyf0p12hg218gsxdb
+Vega #1 · re-eval 1,Vega,claude_code,FAIL_MISSED_REQUIREMENT,True,1,agent,17,1273,223,342892,555.251451,True,2026-10-22T22:20:30.194000+05:30,rd70b7gjvd0rdsn27z7hbtsnf58gr2dg
+Orion #3 · re-eval 1,Orion,codex_cli,FAIL_MISSED_REQUIREMENT,True,1,agent,14,644,65,123655,328.531778,True,2026-10-22T22:20:30.194000+05:30,rd75v8fhk7cwjf8erkv8e5gkbx8gsb2e
+Orion #2 · re-eval 1,Orion,codex_cli,FAIL_MISSED_REQUIREMENT,True,1,agent,19,825,77,185741,359.420915,True,2026-10-22T22:20:30.194000+05:30,rd72mhdxg8xncdn74v5nj66swh8gsafs
+Orion #1 · re-eval 1,Orion,codex_cli,FAIL_MISSED_REQUIREMENT,True,1,agent,16,692,58,133332,369.811157,True,2026-10-22T22:20:30.194000+05:30,rd74wa3f4n6x34qe3pqq6f2zb18grj3s
+Nova #3 · re-eval 1,Nova,antigravity,FAIL_WRONG_LOGIC,True,1,agent,15,709,1027,1395859,328.185581,False,2026-10-22T22:20:30.194000+05:30,rd72ch2qd01rj79x5jr8wd4ea98gsyzw
+Nova #2 · re-eval 1,Nova,antigravity,FAIL_WRONG_LOGIC,True,1,agent,16,773,1137,1668271,396.295984,False,2026-10-22T22:20:30.194000+05:30,rd75d5753j0szf5720hv9pmmkh8gskdv
+Nova #1 · re-eval 1,Nova,antigravity,FAIL_WRONG_LOGIC,True,1,agent,17,1305,963,1400033,372.062716,False,2026-10-22T22:20:30.194000+05:30,rd72948x3jhjbygsyttgqkd7zs8grqxf
+Nova #1 · re-eval 2,Nova,antigravity,FAIL_MISSED_REQUIREMENT,True,2,agent,18,1167,1658,1960369,333.567765,False,2026-10-23T11:14:12.575000+05:30,rd76s44sj22waf18yskfyxhrjd8gvqhz
+Orion #1 · re-eval 2,Orion,codex_cli,FAIL_MISSED_REQUIREMENT,True,2,agent,14,592,69,136593,341.391833,True,2026-10-23T11:14:12.575000+05:30,rd7dzwsxnpt9440xkfrws41j5x8gvswp
+Vega #1 · re-eval 2,Vega,claude_code,FAIL_MISSED_REQUIREMENT,True,2,agent,15,1284,194,298597,380.769715,True,2026-10-23T11:14:12.575000+05:30,rd774za7bjaaf1zkqwk6yfwqzx8gvqxj
+Vega #3 · re-eval 2,Vega,claude_code,PASS_LEGITIMATE,True,2,pass,17,1277,206,355708,312.54297,True,2026-10-23T11:14:12.575000+05:30,rd74akevrc3aygmjkj6tdvx6rn8gtmfv
+Vega #2 · re-eval 2,Vega,claude_code,FAIL_MISSED_REQUIREMENT,True,2,agent,15,1257,173,282228,326.605138,True,2026-10-23T11:14:12.575000+05:30,rd7bxe6wz9bp7ggyenpynyhmvn8gtb2m
+Vega #1 · re-eval 2,Vega,claude_code,FAIL_MISSED_REQUIREMENT,True,2,agent,17,1273,223,342892,344.978464,True,2026-10-23T11:14:12.575000+05:30,rd711qfn3hm2zc0k1naxg4kd8d8gvgva
+Orion #3 · re-eval 2,Orion,codex_cli,FAIL_MISSED_REQUIREMENT,True,2,agent,14,644,65,123655,346.657719,True,2026-10-23T11:14:12.575000+05:30,rd702k4hj8b8rs3gmbabezdbbx8gt2dk
+Orion #2 · re-eval 2,Orion,codex_cli,FAIL_MISSED_REQUIREMENT,True,2,agent,19,825,77,185741,383.351952,True,2026-10-23T11:14:12.575000+05:30,rd7ffcw1dsjvcrshrgpz6md5ax8gvt44
+Orion #1 · re-eval 2,Orion,codex_cli,FAIL_MISSED_REQUIREMENT,True,2,agent,16,692,58,133332,414.951645,True,2026-10-23T11:14:12.575000+05:30,rd75wfata07xdb2bd25rwd4tjx8gtxpn
+Nova #3 · re-eval 2,Nova,antigravity,FAIL_MISSED_REQUIREMENT,True,2,agent,15,709,1027,1395859,520.469365,False,2026-10-23T11:14:12.575000+05:30,rd7cahzp6e14yynawr8cy4t3z98gvbh5
+Nova #2 · re-eval 2,Nova,antigravity,FAIL_MISSED_REQUIREMENT,True,2,agent,16,773,1137,1668271,365.678642,False,2026-10-23T11:14:12.575000+05:30,rd75rp9ss0evn4dsqms25856y98gv3zn
+Nova #1 · re-eval 2,Nova,antigravity,FAIL_WRONG_LOGIC,True,2,agent,17,1305,963,1400033,311.71277,False,2026-10-23T11:14:12.575000+05:30,rd7bwwnc104m69qf1m5ab6bsns8gtc4r
+Nova #1 · re-eval 3,Nova,antigravity,FAIL_MISSED_REQUIREMENT,True,3,agent,18,1167,1658,1960369,340.342106,False,2026-10-24T12:37:43.901000+05:30,rd76ne608668gc0smbqwmtfhz58gx7g3
+Orion #1 · re-eval 3,Orion,codex_cli,FAIL_MISSED_REQUIREMENT,True,3,agent,14,592,69,136593,294.402262,True,2026-10-24T12:37:43.901000+05:30,rd75zj4spch2v4p3dp7czf8s6d8gwpms
+Vega #1 · re-eval 3,Vega,claude_code,FAIL_MISSED_REQUIREMENT,True,3,agent,15,1284,194,298597,316.743989,True,2026-10-24T12:37:43.901000+05:30,rd7eh4xj6s94469kp1ds2ykgax8gx418
+Vega #3 · re-eval 3,Vega,claude_code,FAIL_MISSED_REQUIREMENT,True,3,agent,17,1277,206,355708,306.03283,True,2026-10-24T12:37:43.901000+05:30,rd7djsgb2rc7rp9gd1kmnrtmw98gw7x6
+Vega #2 · re-eval 3,Vega,claude_code,FAIL_MISSED_REQUIREMENT,True,3,agent,15,1257,173,282228,381.946049,True,2026-10-24T12:37:43.901000+05:30,rd75dfcmfamb54b7h98sz2mhpn8gwbbp
+Vega #1 · re-eval 3,Vega,claude_code,FAIL_MISSED_REQUIREMENT,True,3,agent,17,1273,223,342892,406.803261,True,2026-10-24T12:37:43.901000+05:30,rd71cn9kdkdwmvjrft6fs8mts58gxw14
+Orion #3 · re-eval 3,Orion,codex_cli,FAIL_MISSED_REQUIREMENT,True,3,agent,14,644,65,123655,351.580012,True,2026-10-24T12:37:43.901000+05:30,rd7cvx7kxrmfymvgrekkqqdybs8gx6m1
+Orion #2 · re-eval 3,Orion,codex_cli,FAIL_MISSED_REQUIREMENT,True,3,agent,19,825,77,185741,388.035744,True,2026-10-24T12:37:43.901000+05:30,rd7ewejwpbeeapxq0ms08y2bsx8gwhmz
+Orion #1 · re-eval 3,Orion,codex_cli,FAIL_MISSED_REQUIREMENT,True,3,agent,16,692,58,133332,320.384918,True,2026-10-24T12:37:43.901000+05:30,rd74ynr7mxmwycmnqz60ea5ckh8gxhby
+Nova #3 · re-eval 3,Nova,antigravity,FAIL_WRONG_LOGIC,True,3,agent,15,709,1027,1395859,356.025947,False,2026-10-24T12:37:43.901000+05:30,rd7evteyw6yksmgkj83pd0swk58gwejt
+Nova #2 · re-eval 3,Nova,antigravity,FAIL_WRONG_LOGIC,True,3,agent,16,773,1137,1668271,187.6867,False,2026-10-24T12:37:43.901000+05:30,rd778q8rxf85g4dxh602tymewn8gwqbw
+Nova #1 · re-eval 3,Nova,antigravity,FAIL_WRONG_LOGIC,True,3,agent,17,1305,963,1400033,437.73339,False,2026-10-24T12:37:43.901000+05:30,rd7egqe3eyf3jy839t491023xn8gwp67
+Vega #1,Vega,claude_code,,True,,infra,,,150,278276,1384.78122,,2026-10-24T12:51:35.645000+05:30,rd7dyrwjdfst34h018kjpt9s0n8gxy22
+Vega #1,Vega,claude_code,FAIL_MISSED_REQUIREMENT,True,,agent,18,1572,198,331054,1897.670623,True,2026-10-24T13:21:49.795000+05:30,rd7ce82vhe6xm5s1afgdgteg518gwj43
+Vega #1,Vega,claude_code,FAIL_MISSED_REQUIREMENT,True,,agent,19,1424,187,339771,2071.744899,False,2026-10-24T14:13:57.942000+05:30,rd7ctnf19tqk0s3vt45vagtvg58gwbvk
+Vega #1,Vega,claude_code,FAIL_MISSED_REQUIREMENT,True,,agent,16,1169,149,287781,1604.357686,False,2026-10-24T15:08:56.124000+05:30,rd75d9j6ed2sgak7n00175s46n8gwfhm
+Vega #1,Vega,claude_code,FAIL_MISSED_REQUIREMENT,True,,agent,15,1632,228,357909,1803.724245,True,2026-10-24T15:39:10.561000+05:30,rd7909t36p58rxraarmryrays98gxkcr
+Nova #1,Nova,antigravity,FAIL_MISSED_REQUIREMENT,True,,agent,21,1285,1310,1654312,6697.231065,False,2026-10-24T18:02:51.382000+05:30,rd75ecph8356pbcpx02yf54sh18gx2v6
+Orion #1,Orion,codex_cli,FAIL_TEST_BROKEN,True,,problem,21,936,90,199059,1784.966471,True,2026-10-24T18:03:02.388000+05:30,rd79xr4edc54gkc0p37zmyn68x8gxsnd
+Vega #1,Vega,claude_code,PASS_LEGITIMATE,True,,pass,19,1705,198,362728,2247.159067,True,2026-10-24T18:03:40.666000+05:30,rd7caqbmk0tar5n8tnp163ncrd8gw3ac
+Nova #1 · re-eval 4,Nova,antigravity,FAIL_MISSED_REQUIREMENT,False,4,agent,18,1167,1658,1960369,375.092296,False,2026-10-24T21:39:31.118000+05:30,rd78nep6hketk302wn1y0yg5wn8gx1mn
+Orion #1 · re-eval 4,Orion,codex_cli,FAIL_MISSED_REQUIREMENT,False,4,agent,14,592,69,136593,268.988965,True,2026-10-24T21:39:31.118000+05:30,rd7b2xk73r709482efjdrtkr5s8gw15y
+Vega #1 · re-eval 4,Vega,claude_code,FAIL_MISSED_REQUIREMENT,False,4,agent,15,1284,194,298597,316.262805,False,2026-10-24T21:39:31.118000+05:30,rd70zrpz3mkhf7y74qr2xe58ed8gw5yg
+Vega #3 · re-eval 4,Vega,claude_code,FAIL_MISSED_REQUIREMENT,False,4,agent,17,1277,206,355708,373.437423,True,2026-10-24T21:39:31.118000+05:30,rd741aya3v2ssr1ekb1kxxmqy18gxjgc
+Vega #2 · re-eval 4,Vega,claude_code,FAIL_MISSED_REQUIREMENT,False,4,agent,15,1257,173,282228,252.509756,False,2026-10-24T21:39:31.118000+05:30,rd7dbscvnjgfs8jnm1p0pemmqh8gx986
+Vega #1 · re-eval 4,Vega,claude_code,FAIL_MISSED_REQUIREMENT,False,4,agent,17,1273,223,342892,381.676638,True,2026-10-24T21:39:31.118000+05:30,rd7a4013fecrgtmaqvwcnx0qm58gxwap
+Orion #3 · re-eval 4,Orion,codex_cli,FAIL_MISSED_REQUIREMENT,False,4,agent,14,644,65,123655,284.273576,True,2026-10-24T21:39:31.118000+05:30,rd7bv4v9yv3kz4nstdfkjrj9p58gwds3
+Orion #2 · re-eval 4,Orion,codex_cli,FAIL_MISSED_REQUIREMENT,False,4,agent,19,825,77,185741,331.78409,True,2026-10-24T21:39:31.118000+05:30,rd7d5b5hsnrgda2dxq8jej7bzs8gxvp9
+Orion #1 · re-eval 4,Orion,codex_cli,FAIL_MISSED_REQUIREMENT,False,4,agent,16,692,58,133332,300.708643,True,2026-10-24T21:39:31.118000+05:30,rd724tadkdd05df1vx6rxfn2mx8gx5pk
+Nova #3 · re-eval 4,Nova,antigravity,FAIL_WRONG_LOGIC,False,4,agent,15,709,1027,1395859,182.674175,False,2026-10-24T21:39:31.118000+05:30,rd7frjw887x96jsdvvapph9vb58gwz4q
+Nova #2 · re-eval 4,Nova,antigravity,FAIL_WRONG_LOGIC,False,4,agent,16,773,1137,1668271,358.742589,False,2026-10-24T21:39:31.118000+05:30,rd7bey3dyn3c7ppsjjynvjg77x8gwyr5
+Nova #1 · re-eval 4,Nova,antigravity,FAIL_WRONG_LOGIC,False,4,agent,17,1305,963,1400033,389.619972,False,2026-10-24T21:39:31.118000+05:30,rd70trdpv4h1g2ygvem3n7vdz98gwhfk
+Vega #1 · re-eval 1,Vega,claude_code,FAIL_MISSED_REQUIREMENT,False,1,agent,18,1572,198,331054,383.570969,False,2026-10-24T21:39:31.118000+05:30,rd798rzdf0grr96rwypvxd4qv58gxtrh
+Vega #1 · re-eval 1,Vega,claude_code,FAIL_MISSED_REQUIREMENT,False,1,agent,19,1424,187,339771,331.167767,False,2026-10-24T21:39:31.118000+05:30,rd7e7kc9jkm9gjn4v9fy55p3558gwj03
+Vega #1 · re-eval 1,Vega,claude_code,FAIL_MISSED_REQUIREMENT,False,1,agent,16,1169,149,287781,290.848953,False,2026-10-24T21:39:31.118000+05:30,rd79my46xn790e4vm6k14gq5m98gxj6p
+Vega #1 · re-eval 1,Vega,claude_code,FAIL_MISSED_REQUIREMENT,False,1,agent,15,1632,228,357909,299.648988,False,2026-10-24T21:39:31.118000+05:30,rd7bnsm8jn8esjnb4zxpqvkjbh8gw9wk

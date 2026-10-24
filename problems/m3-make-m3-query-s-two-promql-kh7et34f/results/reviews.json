@@ -1,0 +1,58 @@
+[
+ {
+  "feedback": "Tests: T4: the only timestamp() case pins to 1203, an exact sample time, so an M3 engine that returns the @ time passes, and the only graded pass ships exactly that. For timestamp(http_requests @ 1207) the default engine returns 1203 at every step and so does the reference's M3 engine, while Vega_Orion_2's M3 engine returns 1207, against \"Both engines should accept these queries and handle the modifiers the same way, so they give back the same series with the same values\". It also returns 1846 for timestamp(http_requests @ end()) where the default engine returns 1843. A reference mutant that returns the pinned time passes all 29 and fails both. Add timestamp() cases pinned between samples, such as @ 1207 expecting 1203, and pinned with @ end().\nT1: base mode runs only plan, executor and functions, so the parser/promql, storage/prometheus and server packages this patch changes go unchecked, including TestSelectWithMetaInContext, which test.patch edits but neither mode runs. A reference mutant that stops passing storage result metadata on passes all 29 new cases while that test fails. The three packages pass on the pin, the reference and the graded pass in about six seconds. Add them to base mode.",
+  "fieldBands": {
+   "description": {
+    "band": 3
+   },
+   "solution": {
+    "band": 3
+   },
+   "tests": {
+    "band": 1,
+    "reasoning": "T4: the only timestamp() case pins to 1203, an exact sample time, so an M3 engine that returns the @ time passes, and the only graded pass ships exactly that. For timestamp(http_requests @ 1207) the default engine returns 1203 at every step and so does the reference's M3 engine, while Vega_Orion_2's M3 engine returns 1207, against \"Both engines should accept these queries and handle the modifiers the same way, so they give back the same series with the same values\". It also returns 1846 for timestamp(http_requests @ end()) where the default engine returns 1843. A reference mutant that returns the pinned time passes all 29 and fails both. Add timestamp() cases pinned between samples, such as @ 1207 expecting 1203, and pinned with @ end().\nT1: base mode runs only plan, executor and functions, so the parser/promql, storage/prometheus and server packages this patch changes go unchecked, including TestSelectWithMetaInContext, which test.patch edits but neither mode runs. A reference mutant that stops passing storage result metadata on passes all 29 new cases while that test fails. The three packages pass on the pin, the reference and the graded pass in about six seconds. Add them to base mode."
+   }
+  },
+  "internalNotes": null,
+  "otherNotes": null,
+  "otherNotesTags": null,
+  "outcome": "revision_requested",
+  "overallQuality": 2.333333333333333,
+  "qualityScore": 6,
+  "reasoning": null,
+  "reviewFormatVersion": 2,
+  "reviewId": "m57fn8hq13xwfwzs0wmyxcs0ex8grfcn",
+  "reviewerName": "vishal j",
+  "submittedAt": 1792702573304,
+  "versionNumber": 1,
+  "submittedAtIST": "2026-10-23T02:26:13.304000+05:30"
+ },
+ {
+  "feedback": "Tests: T4: the prev review timestamp gap is unchange. The only timestamp() case still pins @ to 1203, an exact sample time, so the only graded pass, whose M3 engine returns the @ time, passes. For timestamp(http_requests @ 1207), in seconds past the fixture base, the default engine and the reference return 1203 at every step while Vega_Orion_2's M3 engine returns 1207, against \"Both engines should accept these queries and handle the modifiers the same way, so they give back the same series with the same values\". Add that case expecting 1203, and one with @ end() expecting 1843.\nT4: no case puts an offset beside @ on a range selector. Dropping the offset only for a pinned range selector passes all 29 while sum_over_time(http_requests[1m] @ 507 offset 17s) returns the [447, 507] window instead of [430, 490], against \"An offset next to @ counts back from the @ time\". The reference and the graded pass both give [430, 490]. Add that case.",
+  "fieldBands": {
+   "description": {
+    "band": 3
+   },
+   "solution": {
+    "band": 3
+   },
+   "tests": {
+    "band": 1,
+    "reasoning": "T4: the prev review timestamp gap is unchange. The only timestamp() case still pins @ to 1203, an exact sample time, so the only graded pass, whose M3 engine returns the @ time, passes. For timestamp(http_requests @ 1207), in seconds past the fixture base, the default engine and the reference return 1203 at every step while Vega_Orion_2's M3 engine returns 1207, against \"Both engines should accept these queries and handle the modifiers the same way, so they give back the same series with the same values\". Add that case expecting 1203, and one with @ end() expecting 1843.\nT4: no case puts an offset beside @ on a range selector. Dropping the offset only for a pinned range selector passes all 29 while sum_over_time(http_requests[1m] @ 507 offset 17s) returns the [447, 507] window instead of [430, 490], against \"An offset next to @ counts back from the @ time\". The reference and the graded pass both give [430, 490]. Add that case."
+   }
+  },
+  "internalNotes": null,
+  "otherNotes": null,
+  "otherNotesTags": null,
+  "outcome": "revision_requested",
+  "overallQuality": 2.333333333333333,
+  "qualityScore": 6,
+  "reasoning": null,
+  "reviewFormatVersion": 2,
+  "reviewId": "m57aq7me15xbg852v2bbarw0r18gxt1m",
+  "reviewerName": "vishal j",
+  "submittedAt": 1792818769986,
+  "versionNumber": 2,
+  "submittedAtIST": "2026-10-24T10:42:49.986000+05:30"
+ }
+]

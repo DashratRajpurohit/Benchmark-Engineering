@@ -1,0 +1,763 @@
+diff --git a/src/query/storage/prometheus/prometheus_storage_test.go b/src/query/storage/prometheus/prometheus_storage_test.go
+index 07f1551..d170b3f 100644
+--- a/src/query/storage/prometheus/prometheus_storage_test.go
++++ b/src/query/storage/prometheus/prometheus_storage_test.go
+@@ -95,8 +95,14 @@ func TestSelectWithMetaInContext(t *testing.T) {
+ 
+ 	meta := block.NewResultMetadata()
+ 	meta.AddWarning("warn", "warning")
+-	store.EXPECT().FetchProm(ctx, exQuery, gomock.Any()).DoAndReturn(
++	store.EXPECT().FetchProm(ctx, gomock.Any(), gomock.Any()).DoAndReturn(
+ 		func(_ context.Context, arg1 *storage.FetchQuery, _ *storage.FetchOptions) (storage.PromResult, error) {
++			// NB: a sample stamped at the hinted end must be kept, so the fetch
++			// may reach past it.
++			assert.Equal(t, exQuery.TagMatchers, arg1.TagMatchers)
++			assert.Equal(t, exQuery.Start, arg1.Start)
++			assert.Equal(t, exQuery.Interval, arg1.Interval)
++			assert.False(t, arg1.End.Before(exQuery.End))
+ 			return storage.PromResult{
+ 				Metadata: meta,
+ 				PromResult: &prompb.QueryResult{
+diff --git a/src/query/test/atmodifier55b6f8/engines_43834f_test.go b/src/query/test/atmodifier55b6f8/engines_43834f_test.go
+new file mode 100644
+index 0000000..0951810
+--- /dev/null
++++ b/src/query/test/atmodifier55b6f8/engines_43834f_test.go
+@@ -0,0 +1,288 @@
++//go:build atmodifier
++
++package atmodifier55b6f8
++
++import (
++	"fmt"
++	"testing"
++	"time"
++)
++
++// Range queries below run from 1801s to 1846s in 15s steps, so the steps are
++// at 1801s, 1816s, 1831s and 1846s; none of them is a sample time.
++const (
++	start = 1801
++	end   = 1846
++	step  = 15 * time.Second
++)
++
++func TestPinnedSelectors(t *testing.T) {
++	s := newQueryServer(t)
++
++	t.Run("selector pinned to a time", func(t *testing.T) {
++		s.queryRange(t, "http_requests @ "+s.at(507), start, end, step, map[string][]point{
++			"a": constant(503, start, end, step),
++			"b": constant(1006, start, end, step),
++		})
++	})
++
++	t.Run("range function pinned to a time", func(t *testing.T) {
++		s.queryRange(t, "sum_over_time(http_requests[1m] @ "+s.at(507)+")", start, end, step, map[string][]point{
++			"a": constant(sumBetween(447, 507), start, end, step),
++			"b": constant(2*sumBetween(447, 507), start, end, step),
++		})
++	})
++
++	t.Run("pinned time is a sample time", func(t *testing.T) {
++		s.queryRange(t, "http_requests @ "+s.at(503), start, end, step, map[string][]point{
++			"a": constant(503, start, end, step),
++			"b": constant(1006, start, end, step),
++		})
++		s.queryRange(t, "count_over_time(http_requests[55s] @ "+s.at(503)+")", start, end, step, map[string][]point{
++			"a": constant(6, start, end, step),
++			"b": constant(6, start, end, step),
++		})
++	})
++
++	t.Run("offset counts back from the pinned time", func(t *testing.T) {
++		s.queryRange(t, "http_requests @ "+s.at(507)+" offset 2m", start, end, step, map[string][]point{
++			"a": constant(383, start, end, step),
++			"b": constant(766, start, end, step),
++		})
++		s.queryRange(t, "http_requests @ "+s.at(507)+" offset 17s", start, end, step, map[string][]point{
++			"a": constant(483, start, end, step),
++			"b": constant(966, start, end, step),
++		})
++	})
++
++	t.Run("range function pinned with an offset", func(t *testing.T) {
++		s.queryRange(t, "sum_over_time(http_requests[1m] @ "+s.at(507)+" offset 17s)", start, end, step, map[string][]point{
++			"a": constant(sumBetween(430, 490), start, end, step),
++			"b": constant(2*sumBetween(430, 490), start, end, step),
++		})
++	})
++
++	t.Run("two selectors pinned to different times", func(t *testing.T) {
++		q := fmt.Sprintf("http_requests @ %s - http_requests @ %s", s.at(507), s.at(307))
++		s.queryRange(t, q, start, end, step, map[string][]point{
++			"a": constant(503-303, start, end, step),
++			"b": constant(2*(503-303), start, end, step),
++		})
++	})
++
++	t.Run("pinned time outside the range", func(t *testing.T) {
++		s.queryRange(t, "http_requests @ "+s.at(3007), start, end, step, map[string][]point{
++			"a": constant(3003, start, end, step),
++			"b": constant(6006, start, end, step),
++		})
++		s.queryRange(t, "http_requests @ "+s.at(307), 6001, 6046, step, map[string][]point{
++			"a": constant(303, 6001, 6046, step),
++			"b": constant(606, 6001, 6046, step),
++		})
++	})
++
++	t.Run("last sample within the lookback of the pinned time", func(t *testing.T) {
++		// The last samples are at 7193s, 90s before the pinned time, and the
++		// range selector only covers 30s.
++		q := "http_requests @ " + s.at(7283) + " + count_over_time(http_requests[30s])"
++		s.queryRange(t, q, start, end, step, map[string][]point{
++			"a": constant(7193+3, start, end, step),
++			"b": constant(14386+3, start, end, step),
++		})
++	})
++
++	t.Run("pinned and unpinned selectors together", func(t *testing.T) {
++		s.queryRange(t, "http_requests - http_requests @ "+s.at(507), start, end, step, map[string][]point{
++			"a": {{1801, 1793 - 503}, {1816, 1813 - 503}, {1831, 1823 - 503}, {1846, 1843 - 503}},
++			"b": {{1801, 2 * (1793 - 503)}, {1816, 2 * (1813 - 503)}, {1831, 2 * (1823 - 503)}, {1846, 2 * (1843 - 503)}},
++		})
++	})
++
++	t.Run("pinned selector in arithmetic", func(t *testing.T) {
++		s.queryRange(t, "http_requests @ "+s.at(507)+" * 2", start, end, step, map[string][]point{
++			"a": constant(2*503, start, end, step),
++			"b": constant(2*1006, start, end, step),
++		})
++	})
++
++	t.Run("aggregation of a pinned selector", func(t *testing.T) {
++		s.queryRange(t, "sum(http_requests @ "+s.at(507)+")", start, end, step, map[string][]point{
++			"": constant(503+1006, start, end, step),
++		})
++	})
++}
++
++func TestStartAndEnd(t *testing.T) {
++	s := newQueryServer(t)
++
++	t.Run("start of a range query", func(t *testing.T) {
++		s.queryRange(t, "http_requests @ start()", start, end, step, map[string][]point{
++			"a": constant(1793, start, end, step),
++			"b": constant(3586, start, end, step),
++		})
++		s.queryRange(t, "sum_over_time(http_requests[1m] @ start())", start, end, step, map[string][]point{
++			"a": constant(sumBetween(1741, 1801), start, end, step),
++			"b": constant(2*sumBetween(1741, 1801), start, end, step),
++		})
++	})
++
++	t.Run("end of a range query", func(t *testing.T) {
++		s.queryRange(t, "http_requests @ end()", start, end, step, map[string][]point{
++			"a": constant(1843, start, end, step),
++			"b": constant(3686, start, end, step),
++		})
++		s.queryRange(t, "sum_over_time(http_requests[1m] @ end())", start, end, step, map[string][]point{
++			"a": constant(sumBetween(1786, 1846), start, end, step),
++			"b": constant(2*sumBetween(1786, 1846), start, end, step),
++		})
++	})
++
++	t.Run("offset from the start", func(t *testing.T) {
++		s.queryRange(t, "http_requests @ start() offset 1m", start, end, step, map[string][]point{
++			"a": constant(1733, start, end, step),
++			"b": constant(3466, start, end, step),
++		})
++	})
++
++	t.Run("instant query", func(t *testing.T) {
++		for _, q := range []string{
++			"http_requests @ start() - http_requests @ " + s.at(507),
++			"http_requests @ end() - http_requests @ " + s.at(507),
++		} {
++			s.queryInstant(t, q, end, map[string]float64{
++				"a": 1843 - 503,
++				"b": 2 * (1843 - 503),
++			})
++		}
++	})
++}
++
++func TestNegativeOffset(t *testing.T) {
++	s := newQueryServer(t)
++
++	t.Run("instant selector", func(t *testing.T) {
++		s.queryRange(t, "http_requests offset -1m", start, end, step, map[string][]point{
++			"a": {{1801, 1853}, {1816, 1873}, {1831, 1883}, {1846, 1903}},
++			"b": {{1801, 3706}, {1816, 3746}, {1831, 3766}, {1846, 3806}},
++		})
++	})
++
++	t.Run("range selector in a function", func(t *testing.T) {
++		var a, b []point
++		for sec := start; sec <= end; sec += 15 {
++			sum := sumBetween(sec, sec+60)
++			a = append(a, point{sec, sum})
++			b = append(b, point{sec, 2 * sum})
++		}
++
++		s.queryRange(t, "sum_over_time(http_requests[1m] offset -1m)", start, end, step, map[string][]point{
++			"a": a,
++			"b": b,
++		})
++	})
++
++	t.Run("pinned selector", func(t *testing.T) {
++		s.queryRange(t, "http_requests @ "+s.at(507)+" offset -1m", start, end, step, map[string][]point{
++			"a": constant(563, start, end, step),
++			"b": constant(1126, start, end, step),
++		})
++	})
++}
++
++func TestSampleAtTheEvaluatedTime(t *testing.T) {
++	s := newQueryServer(t)
++
++	t.Run("instant query", func(t *testing.T) {
++		s.queryInstant(t, "http_requests", 1803, map[string]float64{"a": 1803, "b": 3606})
++	})
++
++	t.Run("last step of a range query", func(t *testing.T) {
++		s.queryRange(t, "http_requests", 1803, 1863, 30*time.Second, map[string][]point{
++			"a": {{1803, 1803}, {1833, 1833}, {1863, 1863}},
++			"b": {{1803, 3606}, {1833, 3666}, {1863, 3726}},
++		})
++	})
++
++	t.Run("end of a range selector", func(t *testing.T) {
++		s.queryInstant(t, "count_over_time(http_requests[55s])", 1803, map[string]float64{"a": 6, "b": 6})
++	})
++}
++
++func TestOffsetThatIsNotWholeSteps(t *testing.T) {
++	s := newQueryServer(t)
++
++	t.Run("instant selector", func(t *testing.T) {
++		s.queryRange(t, "http_requests offset 17s", start, end, step, map[string][]point{
++			"a": {{1801, 1783}, {1816, 1793}, {1831, 1813}, {1846, 1823}},
++			"b": {{1801, 3566}, {1816, 3586}, {1831, 3626}, {1846, 3646}},
++		})
++		s.queryRange(t, "http_requests offset 22s", start, end, step, map[string][]point{
++			"a": {{1801, 1773}, {1816, 1793}, {1831, 1803}, {1846, 1823}},
++			"b": {{1801, 3546}, {1816, 3586}, {1831, 3606}, {1846, 3646}},
++		})
++	})
++
++	t.Run("range selector in a function", func(t *testing.T) {
++		var a, b []point
++		for sec := start; sec <= end; sec += 15 {
++			sum := sumBetween(sec-77, sec-17)
++			a = append(a, point{sec, sum})
++			b = append(b, point{sec, 2 * sum})
++		}
++
++		s.queryRange(t, "sum_over_time(http_requests[1m] offset 17s)", start, end, step, map[string][]point{
++			"a": a,
++			"b": b,
++		})
++
++		a, b = nil, nil
++		for sec := start; sec <= end; sec += 15 {
++			sum := sumBetween(sec-82, sec-22)
++			a = append(a, point{sec, sum})
++			b = append(b, point{sec, 2 * sum})
++		}
++
++		s.queryRange(t, "sum_over_time(http_requests[1m] offset 22s)", start, end, step, map[string][]point{
++			"a": a,
++			"b": b,
++		})
++	})
++}
++
++func TestTimestampOfPinnedSelector(t *testing.T) {
++	s := newQueryServer(t)
++
++	t.Run("pinned to a sample time", func(t *testing.T) {
++		at := float64(s.unix(1203))
++		s.queryRange(t, "timestamp(http_requests @ "+s.at(1203)+")", start, end, step, map[string][]point{
++			"a": constant(at, start, end, step),
++			"b": constant(at, start, end, step),
++			"c": constant(at, start, end, step),
++		})
++	})
++
++	t.Run("pinned between samples", func(t *testing.T) {
++		at := float64(s.unix(1203))
++		s.queryRange(t, "timestamp(http_requests @ "+s.at(1207)+")", start, end, step, map[string][]point{
++			"a": constant(at, start, end, step),
++			"b": constant(at, start, end, step),
++			"c": constant(at, start, end, step),
++		})
++	})
++
++	t.Run("pinned to the end of a range query", func(t *testing.T) {
++		at := float64(s.unix(1843))
++		s.queryRange(t, "timestamp(http_requests @ end())", start, end, step, map[string][]point{
++			"a": constant(at, start, end, step),
++			"b": constant(at, start, end, step),
++		})
++	})
++
++	t.Run("pinned with an offset", func(t *testing.T) {
++		at := float64(s.unix(483))
++		s.queryRange(t, "timestamp(http_requests @ "+s.at(507)+" offset 17s)", start, end, step, map[string][]point{
++			"a": constant(at, start, end, step),
++			"b": constant(at, start, end, step),
++		})
++	})
++}
+diff --git a/src/query/test/atmodifier55b6f8/pkgdoc_32b49e_test.go b/src/query/test/atmodifier55b6f8/pkgdoc_32b49e_test.go
+new file mode 100644
+index 0000000..07c5f49
+--- /dev/null
++++ b/src/query/test/atmodifier55b6f8/pkgdoc_32b49e_test.go
+@@ -0,0 +1,3 @@
++// Package atmodifier55b6f8 holds query tests that are built with the
++// atmodifier tag.
++package atmodifier55b6f8
+diff --git a/src/query/test/atmodifier55b6f8/server_46387e_test.go b/src/query/test/atmodifier55b6f8/server_46387e_test.go
+new file mode 100644
+index 0000000..882ec84
+--- /dev/null
++++ b/src/query/test/atmodifier55b6f8/server_46387e_test.go
+@@ -0,0 +1,356 @@
++//go:build atmodifier
++
++package atmodifier55b6f8
++
++import (
++	"context"
++	"encoding/json"
++	"fmt"
++	"io"
++	"net"
++	"net/http"
++	"net/url"
++	"os"
++	"path/filepath"
++	"strconv"
++	"strings"
++	"testing"
++	"time"
++
++	"github.com/golang/mock/gomock"
++	"github.com/stretchr/testify/require"
++
++	clusterclient "github.com/m3db/m3/src/cluster/client"
++	"github.com/m3db/m3/src/cluster/kv/mem"
++	"github.com/m3db/m3/src/cmd/services/m3query/config"
++	"github.com/m3db/m3/src/dbnode/client"
++	"github.com/m3db/m3/src/dbnode/encoding"
++	"github.com/m3db/m3/src/dbnode/encoding/m3tsz"
++	"github.com/m3db/m3/src/dbnode/namespace"
++	"github.com/m3db/m3/src/dbnode/storage/index"
++	"github.com/m3db/m3/src/dbnode/ts"
++	"github.com/m3db/m3/src/dbnode/x/xio"
++	"github.com/m3db/m3/src/query/server"
++	"github.com/m3db/m3/src/x/checked"
++	xconfig "github.com/m3db/m3/src/x/config"
++	"github.com/m3db/m3/src/x/ident"
++	xtest "github.com/m3db/m3/src/x/test"
++	xtime "github.com/m3db/m3/src/x/time"
++)
++
++const serverConfig = `
++listenAddress: 127.0.0.1:0
++
++logging:
++  level: error
++
++metrics:
++  scope:
++    prefix: "coordinator"
++  prometheus:
++    handlerPath: /metrics
++    listenAddress: "127.0.0.1:0"
++    onError: stderr
++  sanitization: prometheus
++  samplingRate: 1.0
++
++clusters:
++  - namespaces:
++      - namespace: prometheus_metrics
++        type: unaggregated
++        retention: 48h
++
++tagOptions:
++  idScheme: quoted
++`
++
++// engines are the two PromQL engines of the query server: the default one,
++// and the M3 one picked with the M3-Engine header.
++var engines = []string{"", "m3query"}
++
++// queryServer is a query server whose database has http_requests with a
++// sample every 10s, 3s past each 10s mark. Jobs "a" and "b" have samples for
++// two hours from base, valued at their time in seconds since base and twice
++// that. Job "c" only has samples from 1003s to 1293s, valued at three times
++// their time.
++type queryServer struct {
++	addr string
++	base xtime.UnixNano
++}
++
++func newQueryServer(t *testing.T) *queryServer {
++	ctrl := gomock.NewController(xtest.Reporter{T: t})
++	t.Cleanup(ctrl.Finish)
++
++	base := xtime.ToUnixNano(time.Now().Add(-6 * time.Hour).Truncate(time.Hour))
++
++	configFile := filepath.Join(t.TempDir(), "m3query.yml")
++	require.NoError(t, os.WriteFile(configFile, []byte(serverConfig), 0o600))
++	var cfg config.Configuration
++	require.NoError(t, xconfig.LoadFile(&cfg, configFile, xconfig.Options{}))
++
++	session := client.NewMockSession(ctrl)
++	session.EXPECT().Close().AnyTimes()
++	session.EXPECT().IteratorPools().Return(nil, nil).AnyTimes()
++	session.EXPECT().FetchTagged(gomock.Any(), gomock.Any(), gomock.Any(), gomock.Any()).
++		DoAndReturn(func(
++			_ context.Context,
++			_ ident.ID,
++			q index.Query,
++			opts index.QueryOptions,
++		) (encoding.SeriesIterators, client.FetchResponseMetadata, error) {
++			var iters []encoding.SeriesIterator
++			if strings.Contains(fmt.Sprint(q), "http_requests") {
++				for _, job := range []string{"a", "b", "c"} {
++					iter, err := seriesIter(base, job, opts.StartInclusive, opts.EndExclusive)
++					if err != nil {
++						return nil, client.FetchResponseMetadata{}, err
++					}
++					iters = append(iters, iter)
++				}
++			}
++
++			return encoding.NewSeriesIterators(iters),
++				client.FetchResponseMetadata{Exhaustive: true}, nil
++		}).AnyTimes()
++
++	dbClient := client.NewMockClient(ctrl)
++	dbClient.EXPECT().DefaultSession().Return(session, nil).AnyTimes()
++	cfg.Clusters[0].NewClientFromConfig = func(
++		client.Configuration,
++		client.ConfigurationParameters,
++		...client.CustomAdminOption,
++	) (client.Client, error) {
++		return dbClient, nil
++	}
++
++	clusterClient := clusterclient.NewMockClient(ctrl)
++	clusterClient.EXPECT().KV().Return(mem.NewStore(), nil).AnyTimes()
++	clusterClientCh := make(chan clusterclient.Client, 1)
++	clusterClientCh <- clusterClient
++
++	interruptCh := make(chan error)
++	doneCh := make(chan struct{})
++	listenerCh := make(chan net.Listener, 1)
++	go func() {
++		server.Run(server.RunOptions{
++			Config:        cfg,
++			InterruptCh:   interruptCh,
++			ListenerCh:    listenerCh,
++			ClusterClient: clusterClientCh,
++		})
++		close(doneCh)
++	}()
++
++	s := &queryServer{addr: fmt.Sprint((<-listenerCh).Addr()), base: base}
++	t.Cleanup(func() {
++		interruptCh <- fmt.Errorf("test done")
++		<-doneCh
++	})
++
++	require.Eventually(t, func() bool {
++		resp, err := http.Get("http://" + s.addr + "/health") //nolint:noctx
++		if err != nil {
++			return false
++		}
++
++		_ = resp.Body.Close()
++		return resp.StatusCode == http.StatusOK
++	}, 30*time.Second, 50*time.Millisecond)
++
++	return s
++}
++
++func seriesIter(
++	base xtime.UnixNano,
++	job string,
++	start, end xtime.UnixNano,
++) (encoding.SeriesIterator, error) {
++	scale, from, to := 1.0, 3, 2*3600
++	switch job {
++	case "b":
++		scale = 2
++	case "c":
++		scale, from, to = 3, 1003, 1294
++	}
++
++	encoder := m3tsz.NewEncoder(start, checked.NewBytes(nil, nil), true, encoding.NewOptions())
++	var readers [][]xio.BlockReader
++	written := false
++	for sec := from; sec < to; sec += 10 {
++		at := base.Add(time.Duration(sec) * time.Second)
++		if at.Before(start) || !at.Before(end) {
++			continue
++		}
++
++		dp := ts.Datapoint{TimestampNanos: at, Value: scale * float64(sec)}
++		if err := encoder.Encode(dp, xtime.Second, nil); err != nil {
++			return nil, err
++		}
++		written = true
++	}
++
++	if written {
++		readers = append(readers, []xio.BlockReader{{
++			SegmentReader: xio.NewSegmentReader(encoder.Discard()),
++			Start:         start,
++			BlockSize:     end.Sub(start),
++		}})
++	}
++
++	multiReader := encoding.NewMultiReaderIterator(
++		func(r xio.Reader64, _ namespace.SchemaDescr) encoding.ReaderIterator {
++			return m3tsz.NewReaderIterator(r, m3tsz.DefaultIntOptimizationEnabled, encoding.NewOptions())
++		}, nil)
++	multiReader.ResetSliceOfSlices(xio.NewReaderSliceOfSlicesFromBlockReadersIterator(readers), nil)
++
++	tags := ident.NewTags(
++		ident.StringTag("__name__", "http_requests"),
++		ident.StringTag("job", job),
++	)
++	return encoding.NewSeriesIterator(encoding.SeriesIteratorOptions{
++		ID:             ident.StringID(`http_requests{job="` + job + `"}`),
++		Namespace:      ident.StringID("prometheus_metrics"),
++		Tags:           ident.NewTagsIterator(tags),
++		StartInclusive: start,
++		EndExclusive:   end,
++		Replicas:       []encoding.MultiReaderIterator{multiReader},
++	}, nil), nil
++}
++
++// at returns base plus the given number of seconds, as a query parameter.
++func (s *queryServer) at(sec int) string {
++	return strconv.FormatInt(s.unix(sec), 10)
++}
++
++// unix returns base plus the given number of seconds, in seconds since the
++// Unix epoch.
++func (s *queryServer) unix(sec int) int64 {
++	return s.base.Add(time.Duration(sec) * time.Second).Seconds()
++}
++
++// point is a result value at a time in seconds since base.
++type point struct {
++	Sec   int
++	Value float64
++}
++
++// get runs a query on the given engine and returns the points of every
++// result series, keyed by its job label.
++func (s *queryServer) get(
++	t *testing.T,
++	engine, path string,
++	params url.Values,
++) map[string][]point {
++	req, err := http.NewRequestWithContext(context.Background(), http.MethodGet,
++		"http://"+s.addr+path+"?"+params.Encode(), nil)
++	require.NoError(t, err)
++	if engine != "" {
++		req.Header.Set("M3-Engine", engine)
++	}
++
++	resp, err := http.DefaultClient.Do(req)
++	require.NoError(t, err)
++	defer resp.Body.Close()
++	body, err := io.ReadAll(resp.Body)
++	require.NoError(t, err)
++	require.Equal(t, http.StatusOK, resp.StatusCode, "engine %q: %s", engine, body)
++
++	var result struct {
++		Data struct {
++			Result []struct {
++				Metric map[string]string `json:"metric"`
++				Values [][2]interface{}  `json:"values"`
++				Value  [2]interface{}    `json:"value"`
++			} `json:"result"`
++		} `json:"data"`
++	}
++	require.NoError(t, json.Unmarshal(body, &result))
++
++	out := make(map[string][]point)
++	for _, series := range result.Data.Result {
++		values := series.Values
++		if values == nil {
++			values = [][2]interface{}{series.Value}
++		}
++
++		job := series.Metric["job"]
++		for _, v := range values {
++			at, ok := v[0].(float64)
++			require.True(t, ok, "engine %q: %s", engine, body)
++			value, err := strconv.ParseFloat(v[1].(string), 64)
++			require.NoError(t, err)
++			out[job] = append(out[job], point{
++				Sec:   int(at - float64(s.base.Seconds())),
++				Value: value,
++			})
++		}
++	}
++
++	return out
++}
++
++// queryRange checks that both engines return the expected points for a range
++// query from start to end, in seconds since base.
++func (s *queryServer) queryRange(
++	t *testing.T,
++	q string,
++	start, end int,
++	step time.Duration,
++	expected map[string][]point,
++) {
++	for _, engine := range engines {
++		got := s.get(t, engine, "/api/v1/query_range", url.Values{
++			"query": {q},
++			"start": {s.at(start)},
++			"end":   {s.at(end)},
++			"step":  {fmt.Sprint(step)},
++		})
++		require.Equal(t, expected, got, "engine %q: %s", engine, q)
++	}
++}
++
++// queryInstant checks that both engines return the expected values for an
++// instant query at the given time, in seconds since base.
++func (s *queryServer) queryInstant(
++	t *testing.T,
++	q string,
++	at int,
++	expected map[string]float64,
++) {
++	want := make(map[string][]point, len(expected))
++	for job, v := range expected {
++		want[job] = []point{{Sec: at, Value: v}}
++	}
++
++	for _, engine := range engines {
++		got := s.get(t, engine, "/api/v1/query", url.Values{
++			"query": {q},
++			"time":  {s.at(at)},
++		})
++		require.Equal(t, want, got, "engine %q: %s", engine, q)
++	}
++}
++
++// constant returns the given value at every step from start to end.
++func constant(v float64, start, end int, step time.Duration) []point {
++	var out []point
++	for sec := start; sec <= end; sec += int(step / time.Second) {
++		out = append(out, point{Sec: sec, Value: v})
++	}
++
++	return out
++}
++
++// sumBetween returns the sum of the job "a" samples in [from, to], in
++// seconds since base.
++func sumBetween(from, to int) float64 {
++	var sum float64
++	for sec := 3; sec < 2*3600; sec += 10 {
++		if sec >= from && sec <= to {
++			sum += float64(sec)
++		}
++	}
++
++	return sum
++}
+diff --git a/test.sh b/test.sh
+new file mode 100755
+index 0000000..8ac2c29
+--- /dev/null
++++ b/test.sh
+@@ -0,0 +1,72 @@
++#!/usr/bin/env bash
++# Usage:
++#   ./test.sh [--output_path <junit.xml>] <base|new>
++#
++# base  runs the existing tests of the query planner, the query executor, the
++#       query functions, the PromQL parser, the Prometheus storage adapter and
++#       the query server.
++# new   runs the query server tests in src/query/test/atmodifier55b6f8, which
++#       are compiled only with -tags atmodifier.
++set -uo pipefail
++
++ORIG_PWD="$(pwd)"
++
++OUTPUT_PATH=""
++if [ "${1:-}" = "--output_path" ]; then
++  OUTPUT_PATH="$2"
++  shift 2
++  case "$OUTPUT_PATH" in
++    /*) : ;;
++    *) OUTPUT_PATH="$ORIG_PWD/$OUTPUT_PATH" ;;
++  esac
++fi
++
++MODE="${1:-new}"
++
++[ -f go.mod ] || cd "$(dirname "$0")"
++
++TEST_LOG="$(mktemp)"
++STATUS=0
++
++run_tests() {
++  go test -count=1 -v "$@" 2>&1 | tee -a "$TEST_LOG"
++  status=${PIPESTATUS[0]}
++  if [ "$status" -ne 0 ]; then
++    STATUS=$status
++  fi
++}
++
++case "$MODE" in
++  base)
++    packages="./src/query/plan ./src/query/executor/... ./src/query/functions/... \
++      ./src/query/parser/promql ./src/query/storage/prometheus ./src/query/server"
++    # Every existing test of these packages runs, except two. The query
++    # server's multi-process test runs the test binary again as child
++    # processes, and their output can't be told apart from the parent's in the
++    # junit report. The parser's InvalidOffset test is named for offsets this
++    # change makes valid, so solutions rename or fold it into another test.
++    # shellcheck disable=SC2086
++    tests="$(go test -list '^Test' $packages 2>/dev/null | grep '^Test' |
++      grep -vE 'MultiProcess|InvalidOffset' | sed 's/.*/^&$/' | paste -sd'|')"
++    # shellcheck disable=SC2086
++    run_tests -timeout 1200s -run "$tests" $packages
++    ;;
++  new)
++    run_tests -timeout 1200s -tags atmodifier ./src/query/test/atmodifier55b6f8
++    ;;
++  *)
++    echo "unknown mode: $MODE (expected base or new)" >&2
++    exit 2
++    ;;
++esac
++
++if [ -n "$OUTPUT_PATH" ]; then
++  go-junit-report -set-exit-code < "$TEST_LOG" > "$OUTPUT_PATH"
++  junit_status=$?
++  if [ "$junit_status" -ne 0 ] && [ "$STATUS" -eq 0 ]; then
++    echo "go-junit-report failed to convert the test log (exit $junit_status)" >&2
++    STATUS=$junit_status
++  fi
++fi
++
++exit "$STATUS"

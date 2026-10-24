@@ -1,0 +1,17 @@
+{
+  "problemId": "kh7et34f7m9wwer82szkvk01wh8fd762",
+  "title": "Make M3 Query's two PromQL engines agree on time modifiers",
+  "status": "draft",
+  "version": 3,
+  "versionId": "kd7byqe2bfjgtkd0y4nhx48m8n8gx15c",
+  "isLocked": false,
+  "language": "go",
+  "difficulty": "hard",
+  "category": "bugfix",
+  "repoUrl": "https://github.com/m3db/m3",
+  "commitHash": "ea708d3a685f613af7dd0a39571f98d0802c4105",
+  "githubIssueUrl": null,
+  "estimatedLOC": null,
+  "testOutputMode": null,
+  "downloadedAt": "2026-10-24T17:09:46.126Z"
+}

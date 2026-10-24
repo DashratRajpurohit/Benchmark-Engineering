@@ -1,0 +1,33 @@
+{
+ "byAgent": {
+  "antigravity": {
+   "passed": 0,
+   "total": 4
+  },
+  "claude_code": {
+   "passed": 0,
+   "total": 8
+  },
+  "codex_cli": {
+   "passed": 0,
+   "total": 4
+  }
+ },
+ "byModel": {
+  "gemini-4-argon": {
+   "passed": 0,
+   "total": 4
+  },
+  "openai/gpt-6.1-sol": {
+   "passed": 0,
+   "total": 4
+  },
+  "openrouter/anthropic/claude-opus-5-5": {
+   "passed": 0,
+   "total": 8
+  }
+ },
+ "passedRuns": 0,
+ "totalRuns": 16,
+ "updatedAt": 1792858584431
+}

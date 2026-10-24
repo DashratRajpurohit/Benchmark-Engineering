@@ -1,0 +1,187 @@
+{
+ "allPassing": false,
+ "computedDifficulty": "impossible",
+ "criteria": [
+  {
+   "description": "No agent run flagged the task as unfair or broken",
+   "detail": "No fairness issues",
+   "id": "fair",
+   "label": "Fair task",
+   "status": "pass"
+  },
+  {
+   "description": "At least 1 agent run must solve the problem",
+   "detail": "0/16 solved",
+   "guidance": "Consider whether the task is unfair, your description needs more clarity, or your tests are too narrow/broad. Review agent verdicts for specific issues, then adjust and re-run.",
+   "id": "solvable",
+   "label": "Solvable",
+   "status": "fail"
+  },
+  {
+   "description": "At least 4 runs must complete on each of Nova, Orion and Vega",
+   "detail": "Nova 4/4 \u00b7 Orion 4/4 \u00b7 Vega 8/4",
+   "id": "codenameCoverage",
+   "label": "Rollouts on every model",
+   "status": "pass"
+  },
+  {
+   "description": "Exactly one of Nova, Orion or Vega solves it, more than 0% and at most 25% of the time; the other two stay at 0%",
+   "detail": "Nova 0/4 solved \u00b7 Orion 0/4 solved \u00b7 Vega 0/8 solved",
+   "guidance": "No model solved this in enough runs. The requirement needs exactly one of Nova, Orion or Vega to pass (at most 25%) \u2014 loosen over-strict constraints or clarify the description, then re-run.",
+   "id": "passStructure",
+   "label": "Solved by one model only",
+   "status": "fail"
+  },
+  {
+   "description": "Nova runs must average more than 400K tokens of sequence length",
+   "detail": "avg 1.61M over 4 measured run(s)",
+   "id": "novaSequenceLength",
+   "label": "Long horizon",
+   "status": "pass"
+  },
+  {
+   "description": "Cheat rate must be below 20% (across all agents)",
+   "detail": "No cheating detected",
+   "id": "noCheating",
+   "label": "No cheating",
+   "status": "pass"
+  },
+  {
+   "description": "No run should be blocked by environment or verifier issues",
+   "detail": "No environment blockers detected",
+   "id": "noEnvBlocker",
+   "label": "No environment blockers",
+   "status": "pass"
+  }
+ ],
+ "currentSubmissionType": "olympus",
+ "marsAllPassing": null,
+ "marsCriteria": null,
+ "observedPassRate": 0,
+ "olympusV2": true,
+ "olympusV2Pools": {
+  "nova": {
+   "avgPassSequenceLength": null,
+   "avgSequenceLength": 1606133,
+   "codename": "Nova",
+   "measured": 4,
+   "passRate": 0,
+   "passes": 0,
+   "passesMeasured": 0,
+   "running": 0,
+   "working": 4
+  },
+  "strong": [
+   {
+    "avgPassSequenceLength": null,
+    "avgSequenceLength": 144830.25,
+    "codename": "Orion",
+    "measured": 4,
+    "passRate": 0,
+    "passes": 0,
+    "passesMeasured": 0,
+    "running": 0,
+    "working": 4
+   },
+   {
+    "avgPassSequenceLength": null,
+    "avgSequenceLength": 324492.5,
+    "codename": "Vega",
+    "measured": 8,
+    "passRate": 0,
+    "passes": 0,
+    "passesMeasured": 0,
+    "running": 0,
+    "working": 8
+   }
+  ]
+ },
+ "viewer": {
+  "isBeginner": false,
+  "marsLocked": true,
+  "olympusLocked": false,
+  "unlockTierName": null
+ },
+ "readiness": [
+  {
+   "detail": "5/5 passing",
+   "id": "prechecks",
+   "label": "Prechecks",
+   "stale": false,
+   "status": "pass"
+  },
+  {
+   "id": "scopeGate",
+   "label": "Scope Gate",
+   "status": "pass",
+   "verdict": "pass"
+  },
+  {
+   "detail": "7/7 passing",
+   "id": "dynamicChecks",
+   "label": "Quality Checks",
+   "stale": false,
+   "status": "pass"
+  },
+  {
+   "detail": "No fairness issues",
+   "id": "agentFair",
+   "label": "Fair task",
+   "status": "pass"
+  },
+  {
+   "detail": "0/16 solved",
+   "id": "agentSolvable",
+   "label": "Solvable",
+   "status": "fail"
+  },
+  {
+   "detail": "Nova 4/4 \u00b7 Orion 4/4 \u00b7 Vega 8/4",
+   "id": "agentCodenameCoverage",
+   "label": "Rollouts on every model",
+   "status": "pass"
+  },
+  {
+   "detail": "Nova 0/4 solved \u00b7 Orion 0/4 solved \u00b7 Vega 0/8 solved",
+   "id": "agentPassStructure",
+   "label": "Solved by one model only",
+   "status": "fail"
+  },
+  {
+   "detail": "avg 1.61M over 4 measured run(s)",
+   "id": "agentNovaSequenceLength",
+   "label": "Long horizon",
+   "status": "pass"
+  },
+  {
+   "detail": "No cheating detected",
+   "id": "agentNoCheating",
+   "label": "No cheating",
+   "status": "pass"
+  },
+  {
+   "detail": "No environment blockers detected",
+   "id": "agentNoEnvBlocker",
+   "label": "No environment blockers",
+   "status": "pass"
+  },
+  {
+   "detail": "stale, re-run after latest changes",
+   "id": "autoReview",
+   "label": "Auto Review",
+   "status": "fail"
+  },
+  {
+   "detail": "image rebuilds hermetically",
+   "id": "rebuildSafe",
+   "label": "Rebuild-safe",
+   "status": "pass"
+  },
+  {
+   "detail": "image deep-rebuilds from clean source + vendored deps",
+   "id": "harborSafe",
+   "label": "Harbor rebuild-safe",
+   "status": "pass"
+  }
+ ]
+}

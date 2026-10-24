@@ -1,0 +1,5 @@
+M3 Query can run PromQL on two engines: the default one, and the M3 one picked with the `M3-Engine: m3query` header. Right now they disagree on queries using the @ modifier, a negative offset or an offset that isn't a whole number of steps, and some fail with an error. Both engines should accept these queries and handle the modifiers the same way, so they give back the same series with the same values.
+
+A selector with `@ <unix seconds>` is evaluated at that time, and a range query shows that one value at every step. A range selector with @ inside a function uses the window ending at that time. `@ start()` and `@ end()` pin to the start and the end of a range query, and in an instant query both mean the evaluation time. An offset next to @ counts back from the @ time, and a negative offset looks forward by that amount.
+
+An offset that isn't a whole number of steps should still give a point at every step, with the value from exactly that far back. A sample stamped exactly at the time being evaluated, or at the end of a range window, counts.

@@ -1,0 +1,578 @@
+diff --git a/src/query/executor/state.go b/src/query/executor/state.go
+index e6eea17..6a3978c 100644
+--- a/src/query/executor/state.go
++++ b/src/query/executor/state.go
+@@ -161,6 +161,11 @@ func (s *ExecutionState) createNode(
+ 
+ 	transformNode, controller := CreateTransform(step.ID(),
+ 		transformParams, options)
++	parentOptions := options
++	if p, ok := transformParams.(transform.InputTimeSpecParams); ok {
++		parentOptions = options.WithTimeSpec(p.InputTimeSpec(options.TimeSpec()))
++	}
++
+ 	for _, parentID := range step.Parents {
+ 		parentStep, ok := s.plan.Step(parentID)
+ 		if !ok {
+@@ -168,7 +173,7 @@ func (s *ExecutionState) createNode(
+ 				"%s, node: %s", parentID, step.ID())
+ 		}
+ 
+-		parentController, err := s.createNode(parentStep, options)
++		parentController, err := s.createNode(parentStep, parentOptions)
+ 		if err != nil {
+ 			return nil, err
+ 		}
+diff --git a/src/query/executor/transform/types.go b/src/query/executor/transform/types.go
+index cb28b7a..293ac13 100644
+--- a/src/query/executor/transform/types.go
++++ b/src/query/executor/transform/types.go
+@@ -82,6 +82,12 @@ func (o Options) TimeSpec() TimeSpec {
+ 	return o.timeSpec
+ }
+ 
++// WithTimeSpec returns a copy of the options with the given TimeSpec.
++func (o Options) WithTimeSpec(timeSpec TimeSpec) Options {
++	o.timeSpec = timeSpec
++	return o
++}
++
+ // Debug returns the Debug option.
+ func (o Options) Debug() bool {
+ 	return o.debug
+@@ -117,6 +123,14 @@ type TimeSpec struct {
+ 	Now time.Time
+ 	// Step is the step size for the query.
+ 	Step time.Duration
++	// QueryStart is the start of the query as requested, before Start is
++	// moved back to make room for lookback and range windows.
++	QueryStart xtime.UnixNano
++	// QueryEnd is the end of the query as requested; for a range query it is
++	// the end parameter whether or not that step is included.
++	QueryEnd xtime.UnixNano
++	// Lookback is how far back a selector looks for a sample.
++	Lookback time.Duration
+ }
+ 
+ // Bounds transforms the timespec to bounds.
+@@ -134,6 +148,13 @@ type Params interface {
+ 	Node(controller *Controller, opts Options) OpNode
+ }
+ 
++// InputTimeSpecParams are transforms whose inputs are evaluated over a
++// different time range than the transform itself.
++type InputTimeSpecParams interface {
++	Params
++	InputTimeSpec(timeSpec TimeSpec) TimeSpec
++}
++
+ // MetaNode is implemented by function nodes which
+ // can alter metadata for a block.
+ type MetaNode interface {
+diff --git a/src/query/functions/at.go b/src/query/functions/at.go
+new file mode 100644
+index 0000000..dc99af5
+--- /dev/null
++++ b/src/query/functions/at.go
+@@ -0,0 +1,251 @@
++// Copyright (c) 2026 Uber Technologies, Inc.
++//
++// Permission is hereby granted, free of charge, to any person obtaining a copy
++// of this software and associated documentation files (the "Software"), to deal
++// in the Software without restriction, including without limitation the rights
++// to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
++// copies of the Software, and to permit persons to whom the Software is
++// furnished to do so, subject to the following conditions:
++//
++// The above copyright notice and this permission notice shall be included in
++// all copies or substantial portions of the Software.
++//
++// THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
++// IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
++// FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
++// AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
++// LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
++// OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN
++// THE SOFTWARE.
++
++package functions
++
++import (
++	"fmt"
++	"math"
++	"time"
++
++	"github.com/m3db/m3/src/query/block"
++	"github.com/m3db/m3/src/query/executor/transform"
++	"github.com/m3db/m3/src/query/models"
++	"github.com/m3db/m3/src/query/parser"
++	xtime "github.com/m3db/m3/src/x/time"
++)
++
++// AtType evaluates its input at a single time and repeats the result at
++// every step of the query, as the PromQL @ modifier does.
++const AtType = "at"
++
++// AtAnchor is what an AtOp pins its input to.
++type AtAnchor int
++
++const (
++	// AtTime pins to the op's fixed time.
++	AtTime AtAnchor = iota
++	// AtQueryStart pins to the start of the query, as @ start() does.
++	AtQueryStart
++	// AtQueryEnd pins to the end of the query, as @ end() does.
++	AtQueryEnd
++)
++
++// AtOp stores the time its input is evaluated at.
++type AtOp struct {
++	Time   xtime.UnixNano
++	Anchor AtAnchor
++	// Timestamps makes the op return the time of each series' sample at the
++	// pinned time rather than its value, as timestamp() of a pinned selector.
++	Timestamps bool
++	// Offset is the offset of the pinned selector, which has already been
++	// added to the times of its samples.
++	Offset time.Duration
++}
++
++// OpType for the operator.
++func (o AtOp) OpType() string {
++	return AtType
++}
++
++// String representation.
++func (o AtOp) String() string {
++	var at string
++	switch o.Anchor {
++	case AtTime:
++		at = o.Time.String()
++	case AtQueryStart:
++		at = "start()"
++	case AtQueryEnd:
++		at = "end()"
++	}
++
++	return fmt.Sprintf("type: %s, time: %s, timestamps: %v", o.OpType(), at, o.Timestamps)
++}
++
++// at returns the time the input is evaluated at for a query with the given
++// time spec.
++func (o AtOp) at(timeSpec transform.TimeSpec) xtime.UnixNano {
++	switch o.Anchor {
++	case AtQueryStart:
++		return timeSpec.QueryStart
++	case AtQueryEnd:
++		return timeSpec.QueryEnd
++	default:
++		return o.Time
++	}
++}
++
++// InputTimeSpec returns the time spec of an instant query at the op's time,
++// keeping the lookback and range room of the outer query.
++func (o AtOp) InputTimeSpec(timeSpec transform.TimeSpec) transform.TimeSpec {
++	at := o.at(timeSpec)
++	room := timeSpec.QueryStart.Sub(timeSpec.Start)
++	return transform.TimeSpec{
++		Start:      at.Add(-room),
++		End:        at.Add(timeSpec.Step),
++		Now:        timeSpec.Now,
++		Step:       timeSpec.Step,
++		QueryStart: at,
++		QueryEnd:   at,
++		Lookback:   timeSpec.Lookback,
++	}
++}
++
++// Node creates an execution node.
++func (o AtOp) Node(
++	controller *transform.Controller,
++	opts transform.Options,
++) transform.OpNode {
++	return &atNode{
++		op:         o,
++		controller: controller,
++		at:         o.at(opts.TimeSpec()),
++		lookback:   opts.TimeSpec().Lookback,
++		bounds:     opts.TimeSpec().Bounds(),
++	}
++}
++
++type atNode struct {
++	op         AtOp
++	controller *transform.Controller
++	at         xtime.UnixNano
++	lookback   time.Duration
++	bounds     models.Bounds
++}
++
++func (n *atNode) Params() parser.Params {
++	return n.op
++}
++
++// Process the block.
++func (n *atNode) Process(
++	queryCtx *models.QueryContext,
++	ID parser.NodeID,
++	b block.Block,
++) error {
++	return transform.ProcessSimpleBlock(n, n.controller, queryCtx, ID, b)
++}
++
++func (n *atNode) ProcessBlock(
++	queryCtx *models.QueryContext,
++	ID parser.NodeID,
++	b block.Block,
++) (block.Block, error) {
++	valuesAt := n.valuesAt
++	if n.op.Timestamps {
++		valuesAt = n.sampleTimesAt
++	}
++
++	seriesMetas, values, err := valuesAt(b)
++	if err != nil {
++		return nil, err
++	}
++
++	// NB: a series with no value at the pinned time is not in the result, the
++	// same as a series with no sample there.
++	keptMetas := make([]block.SeriesMeta, 0, len(seriesMetas))
++	keptValues := make([]float64, 0, len(values))
++	for i, v := range values {
++		if !math.IsNaN(v) {
++			keptMetas = append(keptMetas, seriesMetas[i])
++			keptValues = append(keptValues, v)
++		}
++	}
++
++	meta := b.Meta()
++	meta.Bounds = n.bounds
++	builder, err := n.controller.BlockBuilder(queryCtx, meta, keptMetas)
++	if err != nil {
++		return nil, err
++	}
++
++	steps := n.bounds.Steps()
++	if err := builder.AddCols(steps); err != nil {
++		return nil, err
++	}
++
++	for i := range steps {
++		if err := builder.AppendValues(i, keptValues); err != nil {
++			return nil, err
++		}
++	}
++
++	return builder.Build(), nil
++}
++
++// valuesAt returns the value of every series of the block at the pinned time.
++func (n *atNode) valuesAt(b block.Block) ([]block.SeriesMeta, []float64, error) {
++	stepIter, err := b.StepIter()
++	if err != nil {
++		return nil, nil, err
++	}
++
++	seriesMetas := stepIter.SeriesMeta()
++	values := make([]float64, len(seriesMetas))
++	for i := range values {
++		values[i] = math.NaN()
++	}
++
++	// NB: find the step by index, since some step iterators report the end
++	// of the step as its time.
++	bounds := b.Meta().Bounds
++	atIndex := -1
++	if !n.at.Before(bounds.Start) {
++		atIndex = int(n.at.Sub(bounds.Start) / bounds.StepSize)
++	}
++
++	for i := 0; stepIter.Next(); i++ {
++		if i == atIndex {
++			copy(values, stepIter.Current().Values())
++		}
++	}
++
++	return seriesMetas, values, stepIter.Err()
++}
++
++// sampleTimesAt returns, in seconds, the time of the sample every series of
++// the block has at the pinned time: its last sample at or before that time
++// and within the lookback. The time is the one the sample was stored with,
++// before the selector's offset.
++func (n *atNode) sampleTimesAt(b block.Block) ([]block.SeriesMeta, []float64, error) {
++	iter, err := b.SeriesIter()
++	if err != nil {
++		return nil, nil, err
++	}
++
++	seriesMetas := iter.SeriesMeta()
++	times := make([]float64, len(seriesMetas))
++	from := n.at.Add(-n.lookback)
++	for i := 0; iter.Next(); i++ {
++		times[i] = math.NaN()
++		for _, dp := range iter.Current().Datapoints() {
++			if dp.Timestamp.After(n.at) {
++				break
++			}
++
++			if !dp.Timestamp.Before(from) && !math.IsNaN(dp.Value) {
++				times[i] = float64(dp.Timestamp.Add(-n.op.Offset)) / float64(time.Second)
++			}
++		}
++	}
++
++	return seriesMetas, times, iter.Err()
++}
+diff --git a/src/query/parser/promql/parse.go b/src/query/parser/promql/parse.go
+index cf5ad85..92f5cd8 100644
+--- a/src/query/parser/promql/parse.go
++++ b/src/query/parser/promql/parse.go
+@@ -27,16 +27,17 @@ import (
+ 	pql "github.com/prometheus/prometheus/promql/parser"
+ 
+ 	"github.com/m3db/m3/src/query/block"
++	"github.com/m3db/m3/src/query/functions"
+ 	"github.com/m3db/m3/src/query/functions/binary"
+ 	"github.com/m3db/m3/src/query/functions/lazy"
+ 	"github.com/m3db/m3/src/query/functions/scalar"
++	"github.com/m3db/m3/src/query/functions/unconsolidated"
+ 	"github.com/m3db/m3/src/query/models"
+ 	"github.com/m3db/m3/src/query/parser"
+ 	xtime "github.com/m3db/m3/src/x/time"
+ )
+ 
+ type promParser struct {
+-	stepSize          time.Duration
+ 	expr              pql.Expr
+ 	tagOpts           models.TagOptions
+ 	parseFunctionExpr ParseFunctionExpr
+@@ -57,7 +58,6 @@ func Parse(
+ 
+ 	return &promParser{
+ 		expr:              expr,
+-		stepSize:          stepSize,
+ 		tagOpts:           tagOpts,
+ 		parseFunctionExpr: parseOptions.FunctionParseExpr(),
+ 	}, nil
+@@ -65,7 +65,6 @@ func Parse(
+ 
+ func (p *promParser) DAG() (parser.Nodes, parser.Edges, error) {
+ 	state := &parseState{
+-		stepSize:          p.stepSize,
+ 		tagOpts:           p.tagOpts,
+ 		parseFunctionExpr: p.parseFunctionExpr,
+ 	}
+@@ -83,11 +82,13 @@ func (p *promParser) String() string {
+ }
+ 
+ type parseState struct {
+-	stepSize          time.Duration
+ 	edges             parser.Edges
+ 	transforms        parser.Nodes
+ 	tagOpts           models.TagOptions
+ 	parseFunctionExpr ParseFunctionExpr
++	// pinnedTimestamps is set while walking the pinned selector of a
++	// timestamp() call.
++	pinnedTimestamps bool
+ }
+ 
+ func (p *parseState) lastTransformID() parser.NodeID {
+@@ -127,11 +128,9 @@ func (p *parseState) addLazyUnaryTransform(unaryOp string) error {
+ }
+ 
+ func (p *parseState) addLazyOffsetTransform(offset time.Duration) error {
+-	// NB: if offset is <= 0, we do not apply any offsets.
++	// NB: if offset is 0, we do not apply any offsets.
+ 	if offset == 0 {
+ 		return nil
+-	} else if offset < 0 {
+-		return fmt.Errorf("offset must be positive, received: %v", offset)
+ 	}
+ 
+ 	var (
+@@ -161,16 +160,30 @@ func (p *parseState) addLazyOffsetTransform(offset time.Duration) error {
+ 	return nil
+ }
+ 
+-func adjustOffset(offset time.Duration, step time.Duration) time.Duration {
+-	// handles case where offset is 0 too.
+-	align := offset % step
+-	if align == 0 {
+-		return offset
++// addAtTransform evaluates the last transform at the time set by the @
++// modifier of the given selector, if it has one.
++func (p *parseState) addAtTransform(selector *pql.VectorSelector) {
++	op := functions.AtOp{
++		Timestamps: p.pinnedTimestamps,
++		Offset:     selector.OriginalOffset,
++	}
++	switch {
++	case selector.Timestamp != nil:
++		op.Time = xtime.UnixNano(*selector.Timestamp * int64(time.Millisecond))
++	case selector.StartOrEnd == pql.START:
++		op.Anchor = functions.AtQueryStart
++	case selector.StartOrEnd == pql.END:
++		op.Anchor = functions.AtQueryEnd
++	default:
++		return
+ 	}
+ 
+-	// NB: Prometheus rounds offsets up to step size, e.g. a 61 second offset with
+-	// a 1 minute stepsize gets rounded to a 2 minute offset.
+-	return offset + step - align
++	opTransform := parser.NewTransformFromOperation(op, p.transformLen())
++	p.edges = append(p.edges, parser.Edge{
++		ParentID: p.lastTransformID(),
++		ChildID:  opTransform.ID,
++	})
++	p.transforms = append(p.transforms, opTransform)
+ }
+ 
+ func (p *parseState) walk(node pql.Node) error {
+@@ -200,9 +213,8 @@ func (p *parseState) walk(node pql.Node) error {
+ 		return nil
+ 
+ 	case *pql.MatrixSelector:
+-		// Align offset to stepSize.
+ 		vectorSelector := n.VectorSelector.(*pql.VectorSelector)
+-		vectorSelector.Offset = adjustOffset(vectorSelector.OriginalOffset, p.stepSize)
++		vectorSelector.Offset = vectorSelector.OriginalOffset
+ 		operation, err := NewSelectorFromMatrix(n, p.tagOpts)
+ 		if err != nil {
+ 			return err
+@@ -215,8 +227,7 @@ func (p *parseState) walk(node pql.Node) error {
+ 		return p.addLazyOffsetTransform(vectorSelector.OriginalOffset)
+ 
+ 	case *pql.VectorSelector:
+-		// Align offset to stepSize.
+-		n.Offset = adjustOffset(n.OriginalOffset, p.stepSize)
++		n.Offset = n.OriginalOffset
+ 		operation, err := NewSelectorFromVector(n, p.tagOpts)
+ 		if err != nil {
+ 			return err
+@@ -227,9 +238,26 @@ func (p *parseState) walk(node pql.Node) error {
+ 			parser.NewTransformFromOperation(operation, p.transformLen()),
+ 		)
+ 
+-		return p.addLazyOffsetTransform(n.OriginalOffset)
++		if err := p.addLazyOffsetTransform(n.OriginalOffset); err != nil {
++			return err
++		}
++
++		p.addAtTransform(n)
++		return nil
+ 
+ 	case *pql.Call:
++		if n.Func.Name == unconsolidated.TimestampType && len(n.Args) == 1 {
++			// NB: timestamp() of a pinned selector is the time of the sample
++			// used at the pinned time, which the @ transform reads from the
++			// fetched samples.
++			if vs, ok := unwrapParenExpr(n.Args[0]).(*pql.VectorSelector); ok &&
++				(vs.Timestamp != nil || vs.StartOrEnd != 0) {
++				p.pinnedTimestamps = true
++				defer func() { p.pinnedTimestamps = false }()
++				return p.walk(vs)
++			}
++		}
++
+ 		if n.Func.Name == scalar.VectorType {
+ 			if len(n.Args) != 1 {
+ 				return fmt.Errorf(
+@@ -334,19 +362,26 @@ func (p *parseState) walk(node pql.Node) error {
+ 			return err
+ 		}
+ 
+-		if !ok {
+-			return nil
++		if ok {
++			opTransform := parser.NewTransformFromOperation(op, p.transformLen())
++			if op.OpType() != scalar.TimeType {
++				p.edges = append(p.edges, parser.Edge{
++					ParentID: p.lastTransformID(),
++					ChildID:  opTransform.ID,
++				})
++			}
++
++			p.transforms = append(p.transforms, opTransform)
+ 		}
+ 
+-		opTransform := parser.NewTransformFromOperation(op, p.transformLen())
+-		if op.OpType() != scalar.TimeType {
+-			p.edges = append(p.edges, parser.Edge{
+-				ParentID: p.lastTransformID(),
+-				ChildID:  opTransform.ID,
+-			})
++		// NB: the @ modifier of a range selector applies to the function
++		// result, which is computed from the samples around that time.
++		for _, expr := range expressions {
++			if e, ok := expr.(*pql.MatrixSelector); ok {
++				p.addAtTransform(e.VectorSelector.(*pql.VectorSelector))
++			}
+ 		}
+ 
+-		p.transforms = append(p.transforms, opTransform)
+ 		return nil
+ 
+ 	case *pql.BinaryExpr:
+diff --git a/src/query/plan/physical.go b/src/query/plan/physical.go
+index 9a2cceb..a46cb80 100644
+--- a/src/query/plan/physical.go
++++ b/src/query/plan/physical.go
+@@ -65,10 +65,13 @@ func NewPhysicalPlan(
+ 		steps:    cloned.Steps,
+ 		pipeline: cloned.Pipeline,
+ 		TimeSpec: transform.TimeSpec{
+-			Start: params.Start,
+-			End:   params.ExclusiveEnd(),
+-			Now:   params.Now,
+-			Step:  params.Step,
++			Start:      params.Start,
++			End:        params.ExclusiveEnd(),
++			Now:        params.Now,
++			Step:       params.Step,
++			QueryStart: params.Start,
++			QueryEnd:   params.End,
++			Lookback:   params.LookbackDuration,
+ 		},
+ 		Debug:            params.Debug,
+ 		BlockType:        params.BlockType,
+@@ -96,6 +99,10 @@ func (p PhysicalPlan) shiftTime() PhysicalPlan {
+ 		}
+ 
+ 		spec := boundOp.Bounds()
++		// NB: an instant selector needs the lookback before the first step.
++		if spec.Range == 0 {
++			spec.Range = p.LookbackDuration
++		}
+ 
+ 		if spec.Range > maxRange {
+ 			maxRange = spec.Range
+diff --git a/src/query/server/query.go b/src/query/server/query.go
+index 684e99f..4926307 100644
+--- a/src/query/server/query.go
++++ b/src/query/server/query.go
+@@ -1383,6 +1383,8 @@ func newPromQLEngine(
+ 			NoStepSubqueryIntervalFn: func(rangeMillis int64) int64 {
+ 				return durationMilliseconds(1 * time.Minute)
+ 			},
++			EnableAtModifier:     true,
++			EnableNegativeOffset: true,
+ 		}
+ 	)
+ 	return prometheuspromql.NewEngine(opts), nil
+diff --git a/src/query/storage/prometheus/prometheus_storage.go b/src/query/storage/prometheus/prometheus_storage.go
+index a963555..d16b930 100644
+--- a/src/query/storage/prometheus/prometheus_storage.go
++++ b/src/query/storage/prometheus/prometheus_storage.go
+@@ -125,7 +125,7 @@ func (q *querier) Select(
+ 	query := &storage.FetchQuery{
+ 		TagMatchers: matchers,
+ 		Start:       time.Unix(0, hints.Start*int64(time.Millisecond)),
+-		End:         time.Unix(0, hints.End*int64(time.Millisecond)),
++		End:         time.Unix(0, (hints.End+1)*int64(time.Millisecond)), // NB: hints.End is inclusive.
+ 		Interval:    time.Duration(hints.Step) * time.Millisecond,
+ 	}
+ 
